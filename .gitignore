@@ -1,0 +1,15 @@
+# Compiled executable
+/xmp-linux
+
+# Generated GTK resource source
+/xmp-resources.c
+
+# Historical source and Makefile snapshots
+/main.c.before-*
+/main.c.working-*
+/Makefile.before-*
+/Makefile.working-*
+
+# Editor and build artifacts
+*~
+*.o
