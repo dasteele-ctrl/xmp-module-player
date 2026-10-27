@@ -4,6 +4,8 @@ A native Linux tracker module player built with **GTK3, SDL2, and libxmp**.
 
 XMP Module Player brings classic tracker music playback to the Linux desktop, with a graphical interface, real-time audio visualization, and detailed module and sample information.
 
+![XMP Module Player running on Linux](Screenshot_2026-10-26_19-02-39.png)
+
 ## Features
 
 - 🎵 **Tracker module playback** powered by libxmp
