@@ -5,11 +5,19 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include "ffmpeg_audio.h"
 
 #define AUDIO_RATE 44100
 #define SCOPE_ROW_HEIGHT 76
 #define SCOPE_MARGIN 8
 
+typedef enum {
+    PLAYBACK_NONE,
+    PLAYBACK_MODULE,
+    PLAYBACK_FFMPEG
+} PlaybackMode;
+
+static PlaybackMode playback_mode = PLAYBACK_NONE;
 static xmp_context ctx;
 static SDL_AudioDeviceID audio_device;
 static int module_loaded = 0;
@@ -18,6 +26,7 @@ static int playing = 0;
 static int stopped = 0;
 static int audio_ended = 0;
 static int updating_seek = 0;
+static int master_volume = 100;
 
 static GtkWidget *window;
 static GtkWidget *title_label;
@@ -25,6 +34,7 @@ static GtkWidget *format_label;
 static GtkWidget *status_label;
 static GtkWidget *time_label;
 static GtkWidget *seek_scale;
+static GtkWidget *volume_scale;
 static GtkWidget *play_button;
 static GtkWidget *channels_label;
 static GtkWidget *details_label;
@@ -40,13 +50,136 @@ static GtkWidget *visualizer_area;
 #define VIZ_BANDS 32
 #define VIZ_FFT_SIZE 1024
 #define VIZ_RING_SIZE 8192
+#define AUDIO_BUFFER_FRAMES (AUDIO_RATE * 2)
 
 static int16_t viz_ring[VIZ_RING_SIZE];
+
+/* Shared PCM buffer: decoder thread produces; SDL callback consumes. */
+static int16_t audio_ring[AUDIO_BUFFER_FRAMES * 2];
+static unsigned int audio_ring_read_pos;
+static unsigned int audio_ring_write_pos;
+static SDL_Thread *decoder_thread;
+static SDL_atomic_t decoder_stop;
+static FfmpegAudio *ffmpeg_audio;
+static SDL_atomic_t ffmpeg_decode_finished;
+static SDL_atomic_t ffmpeg_decode_error;
+static int64_t ffmpeg_position_frames;
+static int64_t ffmpeg_duration_ms;
+static SDL_atomic_t ffmpeg_seek_requested;
+static int64_t ffmpeg_seek_target_ms;
+static SDL_atomic_t ffmpeg_seek_generation;
 static unsigned int viz_write_pos;
 static double viz_levels[VIZ_BANDS];
 static double viz_peaks[VIZ_BANDS];
 static double viz_spectrum[VIZ_BANDS];
 static int selected_sample = 0;
+static int decoder_thread_fn(void *unused)
+{
+    (void)unused;
+
+    int16_t chunk[4096 * 2];
+
+    while (!SDL_AtomicGet(&decoder_stop)) {
+        if (SDL_AtomicGet(&ffmpeg_seek_requested)) {
+            SDL_LockAudioDevice(audio_device);
+            int64_t target_ms = ffmpeg_seek_target_ms;
+            SDL_AtomicSet(&ffmpeg_seek_requested, 0);
+            SDL_UnlockAudioDevice(audio_device);
+
+            if (ffmpeg_audio_seek(ffmpeg_audio, target_ms) < 0) {
+                SDL_AtomicSet(&ffmpeg_decode_error, 1);
+                SDL_AtomicSet(&ffmpeg_decode_finished, 1);
+                break;
+            }
+
+            SDL_LockAudioDevice(audio_device);
+            audio_ring_read_pos = 0;
+            audio_ring_write_pos = 0;
+            ffmpeg_position_frames = target_ms * AUDIO_RATE / 1000;
+            SDL_UnlockAudioDevice(audio_device);
+
+            SDL_AtomicSet(&ffmpeg_decode_finished, 0);
+            SDL_AtomicSet(&ffmpeg_decode_error, 0);
+        }
+
+        SDL_LockAudioDevice(audio_device);
+        unsigned int read_pos = audio_ring_read_pos;
+        unsigned int write_pos = audio_ring_write_pos;
+        unsigned int used =
+            (write_pos + AUDIO_BUFFER_FRAMES - read_pos) %
+            AUDIO_BUFFER_FRAMES;
+        unsigned int free_frames = AUDIO_BUFFER_FRAMES - used - 1;
+        SDL_UnlockAudioDevice(audio_device);
+
+        if (free_frames == 0) {
+            SDL_Delay(5);
+            continue;
+        }
+
+        int generation = SDL_AtomicGet(&ffmpeg_seek_generation);
+        int request = free_frames > 4096 ? 4096 : (int)free_frames;
+        int got = ffmpeg_audio_read(ffmpeg_audio, chunk, request);
+
+        if (generation != SDL_AtomicGet(&ffmpeg_seek_generation))
+            continue;
+
+        if (got < 0) {
+            SDL_AtomicSet(&ffmpeg_decode_error, 1);
+            SDL_AtomicSet(&ffmpeg_decode_finished, 1);
+            break;
+        }
+
+        if (got == 0) {
+            SDL_AtomicSet(&ffmpeg_decode_finished, 1);
+            break;
+        }
+
+        SDL_LockAudioDevice(audio_device);
+
+        if (generation == SDL_AtomicGet(&ffmpeg_seek_generation) &&
+            !SDL_AtomicGet(&ffmpeg_seek_requested)) {
+            for (int i = 0; i < got; i++) {
+                unsigned int slot = audio_ring_write_pos;
+                audio_ring[slot * 2] = chunk[i * 2];
+                audio_ring[slot * 2 + 1] = chunk[i * 2 + 1];
+                audio_ring_write_pos = (slot + 1) % AUDIO_BUFFER_FRAMES;
+            }
+        }
+
+        SDL_UnlockAudioDevice(audio_device);
+    }
+
+    return 0;
+}
+
+static void stop_ffmpeg_decoder(void)
+{
+    /* Ask the producer to exit, then join it before freeing its decoder. */
+    SDL_AtomicSet(&decoder_stop, 1);
+
+    if (decoder_thread) {
+        SDL_WaitThread(decoder_thread, NULL);
+        decoder_thread = NULL;
+    }
+
+    if (ffmpeg_audio) {
+        ffmpeg_audio_close(ffmpeg_audio);
+        ffmpeg_audio = NULL;
+    }
+
+    if (audio_device) {
+        SDL_PauseAudioDevice(audio_device, 1);
+        SDL_LockAudioDevice(audio_device);
+        audio_ring_read_pos = 0;
+        audio_ring_write_pos = 0;
+        SDL_UnlockAudioDevice(audio_device);
+    }
+
+    SDL_AtomicSet(&ffmpeg_decode_finished, 0);
+    SDL_AtomicSet(&ffmpeg_decode_error, 0);
+    ffmpeg_position_frames = 0;
+    ffmpeg_duration_ms = 0;
+}
 
 static char current_file[4096] = "";
 static GtkListStore *playlist_store;
@@ -57,24 +190,71 @@ static void audio_callback(void *userdata, Uint8 *stream, int len)
     (void)userdata;
     memset(stream, 0, len);
 
-    if (!module_loaded || !player_started || !playing || audio_ended)
+    if (!playing || audio_ended)
         return;
 
-    int rc = xmp_play_buffer(ctx, stream, len, 0);
+    if (playback_mode == PLAYBACK_MODULE) {
+        if (!module_loaded || !player_started)
+            return;
+
+        int rc = xmp_play_buffer(ctx, stream, len, 0);
+
+        if (rc == -XMP_END) {
+            audio_ended = 1;
+            playing = 0;
+        }
+    } else if (playback_mode == PLAYBACK_FFMPEG) {
+        int16_t *out = (int16_t *)stream;
+        int requested_frames = len / (int)(2 * sizeof(int16_t));
+        int copied_frames = 0;
+
+        while (copied_frames < requested_frames &&
+               audio_ring_read_pos != audio_ring_write_pos) {
+            unsigned int slot = audio_ring_read_pos;
+            out[copied_frames * 2] = audio_ring[slot * 2];
+            out[copied_frames * 2 + 1] = audio_ring[slot * 2 + 1];
+            audio_ring_read_pos = (slot + 1) % AUDIO_BUFFER_FRAMES;
+            copied_frames++;
+        }
+
+        ffmpeg_position_frames += copied_frames;
+
+        if (copied_frames < requested_frames &&
+            SDL_AtomicGet(&ffmpeg_decode_finished) &&
+            audio_ring_read_pos == audio_ring_write_pos) {
+            audio_ended = 1;
+            playing = 0;
+        }
+    } else {
+        return;
+    }
+
+    /* Apply master volume to both module and FFmpeg audio output. */
+    int16_t *volume_pcm = (int16_t *)stream;
+    int pcm_samples = len / (int)sizeof(int16_t);
+    if (master_volume < 100) {
+        for (int i = 0; i < pcm_samples; i++)
+            volume_pcm[i] = (int16_t)(((int32_t)volume_pcm[i] * master_volume) / 100);
+    }
 
     /* Capture mono samples for the visualizer; audio is S16 stereo. */
     const int16_t *pcm = (const int16_t *)stream;
     int sample_count = len / (int)(2 * sizeof(int16_t));
+
     for (int i = 0; i < sample_count; i++) {
         int mono = ((int)pcm[i * 2] + (int)pcm[i * 2 + 1]) / 2;
         viz_ring[viz_write_pos] = (int16_t)mono;
         viz_write_pos = (viz_write_pos + 1) % VIZ_RING_SIZE;
     }
+}
 
-    if (rc == -XMP_END) {
-        audio_ended = 1;
-        playing = 0;
-    }
+static void on_volume_changed(GtkRange *range, gpointer user_data)
+{
+    (void)user_data;
+    int volume = (int)gtk_range_get_value(range);
+    if (audio_device) SDL_LockAudioDevice(audio_device);
+    master_volume = volume;
+    if (audio_device) SDL_UnlockAudioDevice(audio_device);
 }
 
 static void update_play_button(void)
@@ -309,14 +489,102 @@ static void populate_sample_browser(void)
     }
 }
 
-static void open_module(const char *filename)
+static int open_ffmpeg_audio(const char *filename)
 {
+    char error_text[512] = "";
+
+    if (!filename || !*filename || !audio_device || !ctx)
+        return 0;
+
+    stop_ffmpeg_decoder();
     SDL_PauseAudioDevice(audio_device, 1);
     SDL_LockAudioDevice(audio_device);
 
     playing = 0;
     audio_ended = 0;
     stopped = 0;
+    playback_mode = PLAYBACK_NONE;
+
+    if (player_started) {
+        xmp_end_player(ctx);
+        player_started = 0;
+    }
+
+    if (module_loaded) {
+        xmp_release_module(ctx);
+        module_loaded = 0;
+    }
+
+    SDL_UnlockAudioDevice(audio_device);
+
+    ffmpeg_audio = ffmpeg_audio_open(filename, error_text,
+                                     sizeof(error_text));
+    if (!ffmpeg_audio) {
+        set_status(error_text[0] ? error_text : "Unsupported audio file.");
+        gtk_label_set_text(GTK_LABEL(title_label), "Unable to open audio");
+        update_play_button();
+        return 0;
+    }
+
+    ffmpeg_duration_ms = ffmpeg_audio_duration_ms(ffmpeg_audio);
+    ffmpeg_position_frames = 0;
+    SDL_AtomicSet(&decoder_stop, 0);
+    SDL_AtomicSet(&ffmpeg_decode_finished, 0);
+    SDL_AtomicSet(&ffmpeg_decode_error, 0);
+
+    decoder_thread = SDL_CreateThread(decoder_thread_fn,
+                                      "ffmpeg-decoder", NULL);
+    if (!decoder_thread) {
+        snprintf(error_text, sizeof(error_text),
+                 "Could not start decoder thread: %s", SDL_GetError());
+        ffmpeg_audio_close(ffmpeg_audio);
+        ffmpeg_audio = NULL;
+        set_status(error_text);
+        return 0;
+    }
+
+    playback_mode = PLAYBACK_FFMPEG;
+    g_strlcpy(current_file, filename, sizeof(current_file));
+
+    char *base = g_path_get_basename(filename);
+    gtk_label_set_text(GTK_LABEL(title_label), base ? base : "Audio file");
+    gtk_label_set_text(GTK_LABEL(format_label), "Audio file (FFmpeg)");
+    gtk_label_set_text(GTK_LABEL(channels_label), "Stereo    44100 Hz");
+    gtk_label_set_text(GTK_LABEL(details_label), filename);
+    gtk_label_set_text(GTK_LABEL(time_label), "00:00");
+
+    gtk_widget_set_sensitive(seek_scale, TRUE);
+    updating_seek = 1;
+    gtk_range_set_range(GTK_RANGE(seek_scale), 0,
+                        ffmpeg_duration_ms > 0 ? ffmpeg_duration_ms : 1);
+    gtk_range_set_value(GTK_RANGE(seek_scale), 0);
+    updating_seek = 0;
+
+    if (base)
+        g_free(base);
+
+    if (scope_area)
+        gtk_widget_queue_draw(scope_area);
+    if (pattern_area)
+        gtk_widget_queue_draw(pattern_area);
+    if (visualizer_area)
+        gtk_widget_queue_draw(visualizer_area);
+
+    update_play_button();
+    set_status("Audio file loaded");
+    return 1;
+}
+
+static void open_module(const char *filename)
+{
+    stop_ffmpeg_decoder();
+    SDL_PauseAudioDevice(audio_device, 1);
+    SDL_LockAudioDevice(audio_device);
+
+    playing = 0;
+    audio_ended = 0;
+    stopped = 0;
+    playback_mode = PLAYBACK_NONE;
 
     if (player_started) {
         xmp_end_player(ctx);
@@ -350,6 +618,7 @@ static void open_module(const char *filename)
 
     module_loaded = 1;
     player_started = 1;
+    playback_mode = PLAYBACK_MODULE;
     g_strlcpy(current_file, filename, sizeof(current_file));
 
     char title[512];
@@ -377,6 +646,7 @@ static void open_module(const char *filename)
 
     struct xmp_frame_info fi;
     xmp_get_frame_info(ctx, &fi);
+    gtk_widget_set_sensitive(seek_scale, TRUE);
     updating_seek = 1;
     gtk_range_set_range(GTK_RANGE(seek_scale), 0,
                         fi.total_time > 0 ? fi.total_time : 1);
@@ -395,6 +665,47 @@ static void open_module(const char *filename)
     set_status("Module loaded");
 }
 
+static char *get_last_folder_file(void)
+{
+    return g_build_filename(g_get_user_config_dir(),
+                            "xmp-module-player",
+                            "last-folder", NULL);
+}
+
+static void restore_last_folder(GtkWidget *dialog)
+{
+    char *settings_file = get_last_folder_file();
+    char *folder = NULL;
+
+    if (g_file_get_contents(settings_file, &folder, NULL, NULL)) {
+        g_strstrip(folder);
+        if (*folder && g_file_test(folder, G_FILE_TEST_IS_DIR))
+            gtk_file_chooser_set_current_folder(
+                GTK_FILE_CHOOSER(dialog), folder);
+    }
+
+    g_free(folder);
+    g_free(settings_file);
+}
+
+static void remember_last_folder(GtkWidget *dialog)
+{
+    char *folder = gtk_file_chooser_get_current_folder(
+        GTK_FILE_CHOOSER(dialog));
+
+    if (folder) {
+        char *settings_file = get_last_folder_file();
+        char *settings_dir = g_path_get_dirname(settings_file);
+
+        g_mkdir_with_parents(settings_dir, 0700);
+        g_file_set_contents(settings_file, folder, -1, NULL);
+
+        g_free(settings_dir);
+        g_free(settings_file);
+        g_free(folder);
+    }
+}
+
 static void on_open(GtkButton *button, gpointer data)
 {
     (void)button;
@@ -405,17 +716,39 @@ static void on_open(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER_ACTION_OPEN,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Open", GTK_RESPONSE_ACCEPT, NULL);
+    restore_last_folder(dialog);
 
     GtkFileFilter *filter = gtk_file_filter_new();
-    gtk_file_filter_set_name(filter, "Tracker modules and music files");
-    gtk_file_filter_add_pattern(filter, "*");
+    gtk_file_filter_set_name(filter, "Audio and tracker files");
+
+    const char *patterns[] = {
+        "*.mod", "*.MOD", "*.xm", "*.XM", "*.it", "*.IT",
+        "*.s3m", "*.S3M", "*.mptm", "*.MPTM", "*.mtm", "*.MTM",
+        "*.669", "*.amf", "*.med", "*.okt", "*.ult",
+        "*.mp3", "*.MP3", "*.wav", "*.WAV", "*.m4a", "*.M4A",
+        "*.aac", "*.AAC", "*.ogg", "*.OGG", "*.oga", "*.OGA", "*.opus", "*.OPUS",
+        "*.flac", "*.FLAC", "*.webm", "*.WEBM", "*.mka", "*.MKA",
+        "*.aiff", "*.aif", "*.wma", "*.mp4", "*.MP4"
+    };
+
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
+        gtk_file_filter_add_pattern(filter, patterns[i]);
+
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
 
+    GtkFileFilter *all_filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(all_filter, "All files");
+    gtk_file_filter_add_pattern(all_filter, "*");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), all_filter);
+
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        remember_last_folder(dialog);
         char *filename =
             gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
         if (filename) {
             open_module(filename);
+            if (!module_loaded)
+                open_ffmpeg_audio(filename);
             g_free(filename);
         }
     }
@@ -428,14 +761,22 @@ static void on_play(GtkButton *button, gpointer data)
     (void)button;
     (void)data;
 
-    if (!module_loaded)
+    if (playback_mode == PLAYBACK_NONE)
         return;
+
+    if (playback_mode == PLAYBACK_FFMPEG &&
+        (stopped || audio_ended || !ffmpeg_audio)) {
+        char filename[sizeof(current_file)];
+        g_strlcpy(filename, current_file, sizeof(filename));
+        if (!filename[0] || !open_ffmpeg_audio(filename))
+            return;
+    }
 
     if (playing) {
         SDL_PauseAudioDevice(audio_device, 1);
         playing = 0;
         set_status("Paused");
-    } else {
+    } else if (playback_mode == PLAYBACK_MODULE) {
         SDL_LockAudioDevice(audio_device);
         if (stopped || audio_ended) {
             xmp_restart_module(ctx);
@@ -446,7 +787,14 @@ static void on_play(GtkButton *button, gpointer data)
         SDL_UnlockAudioDevice(audio_device);
         SDL_PauseAudioDevice(audio_device, 0);
         set_status("Playing");
+    } else if (playback_mode == PLAYBACK_FFMPEG) {
+        stopped = 0;
+        audio_ended = 0;
+        playing = 1;
+        SDL_PauseAudioDevice(audio_device, 0);
+        set_status("Playing");
     }
+
     update_play_button();
 }
 
@@ -455,16 +803,22 @@ static void on_stop(GtkButton *button, gpointer data)
     (void)button;
     (void)data;
 
-    if (!module_loaded)
+    if (playback_mode == PLAYBACK_NONE)
         return;
 
     SDL_PauseAudioDevice(audio_device, 1);
-    SDL_LockAudioDevice(audio_device);
-    xmp_stop_module(ctx);
+
+    if (playback_mode == PLAYBACK_MODULE) {
+        SDL_LockAudioDevice(audio_device);
+        xmp_stop_module(ctx);
+        SDL_UnlockAudioDevice(audio_device);
+    } else if (playback_mode == PLAYBACK_FFMPEG) {
+        stop_ffmpeg_decoder();
+    }
+
     playing = 0;
     stopped = 1;
     audio_ended = 0;
-    SDL_UnlockAudioDevice(audio_device);
 
     update_play_button();
     set_status("Stopped");
@@ -495,15 +849,27 @@ static void on_next(GtkButton *button, gpointer data)
 static void on_seek(GtkRange *range, gpointer data)
 {
     (void)data;
-    if (!module_loaded || updating_seek)
+
+    if (updating_seek)
         return;
 
     int ms = (int)gtk_range_get_value(range);
-    SDL_LockAudioDevice(audio_device);
-    xmp_seek_time(ctx, ms);
-    audio_ended = 0;
-    stopped = 0;
-    SDL_UnlockAudioDevice(audio_device);
+
+    if (playback_mode == PLAYBACK_MODULE && module_loaded) {
+        SDL_LockAudioDevice(audio_device);
+        xmp_seek_time(ctx, ms);
+        audio_ended = 0;
+        stopped = 0;
+        SDL_UnlockAudioDevice(audio_device);
+    } else if (playback_mode == PLAYBACK_FFMPEG && ffmpeg_audio) {
+        SDL_LockAudioDevice(audio_device);
+        ffmpeg_seek_target_ms = ms;
+        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
+        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
+        audio_ended = 0;
+        stopped = 0;
+        SDL_UnlockAudioDevice(audio_device);
+    }
 }
 
 
@@ -591,7 +957,9 @@ static gboolean draw_visualizer(GtkWidget *widget, cairo_t *cr,
 static void update_visualizer_spectrum(void)
 {
     /* Let the bars and peak markers settle while playback is stopped. */
-    if (!module_loaded || !playing || audio_ended) {
+    if ((playback_mode != PLAYBACK_MODULE &&
+         playback_mode != PLAYBACK_FFMPEG) ||
+        !playing || audio_ended) {
         for (int i = 0; i < VIZ_BANDS; i++) {
             viz_levels[i] *= 0.82;
             viz_peaks[i] *= 0.96;
@@ -932,7 +1300,13 @@ static void play_playlist_file(const char *filename)
         return;
 
     open_module(filename);
-    if (module_loaded)
+
+    if (module_loaded) {
+        on_play(NULL, NULL);
+        return;
+    }
+
+    if (open_ffmpeg_audio(filename))
         on_play(NULL, NULL);
 }
 
@@ -947,12 +1321,13 @@ static void on_playlist_load_m3u(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER_ACTION_OPEN,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Open", GTK_RESPONSE_ACCEPT, NULL);
+    restore_last_folder(dialog);
 
     if (gtk_dialog_run(GTK_DIALOG(dialog)) != GTK_RESPONSE_ACCEPT) {
         gtk_widget_destroy(dialog);
         return;
     }
-
+    remember_last_folder(dialog);
     char *filename = gtk_file_chooser_get_filename(
         GTK_FILE_CHOOSER(dialog));
     gtk_widget_destroy(dialog);
@@ -1025,12 +1400,13 @@ static void on_playlist_save_m3u(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER(dialog), TRUE);
     gtk_file_chooser_set_current_name(
         GTK_FILE_CHOOSER(dialog), "playlist.m3u");
+    restore_last_folder(dialog);
 
     if (gtk_dialog_run(GTK_DIALOG(dialog)) != GTK_RESPONSE_ACCEPT) {
         gtk_widget_destroy(dialog);
         return;
     }
-
+    remember_last_folder(dialog);
     char *filename = gtk_file_chooser_get_filename(
         GTK_FILE_CHOOSER(dialog));
     gtk_widget_destroy(dialog);
@@ -1079,15 +1455,35 @@ static void on_playlist_add(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER_ACTION_OPEN,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Add", GTK_RESPONSE_ACCEPT, NULL);
+    restore_last_folder(dialog);
 
     gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(dialog), TRUE);
 
     GtkFileFilter *filter = gtk_file_filter_new();
-    gtk_file_filter_set_name(filter, "Tracker modules and music files");
-    gtk_file_filter_add_pattern(filter, "*");
+    gtk_file_filter_set_name(filter, "Audio and tracker files");
+
+    const char *patterns[] = {
+        "*.mod", "*.MOD", "*.xm", "*.XM", "*.it", "*.IT",
+        "*.s3m", "*.S3M", "*.mptm", "*.MPTM", "*.mtm", "*.MTM",
+        "*.669", "*.amf", "*.med", "*.okt", "*.ult",
+        "*.mp3", "*.MP3", "*.wav", "*.WAV", "*.m4a", "*.M4A",
+        "*.aac", "*.AAC", "*.ogg", "*.OGG", "*.oga", "*.OGA", "*.opus", "*.OPUS",
+        "*.flac", "*.FLAC", "*.webm", "*.WEBM", "*.mka", "*.MKA",
+        "*.aiff", "*.aif", "*.wma", "*.mp4", "*.MP4"
+    };
+
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
+        gtk_file_filter_add_pattern(filter, patterns[i]);
+
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
 
+    GtkFileFilter *all_filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(all_filter, "All files");
+    gtk_file_filter_add_pattern(all_filter, "*");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), all_filter);
+
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        remember_last_folder(dialog);
         GSList *files =
             gtk_file_chooser_get_filenames(GTK_FILE_CHOOSER(dialog));
 
@@ -1178,7 +1574,7 @@ static gboolean playlist_advance(void)
             if (next_file) {
                 play_playlist_file(next_file);
                 g_free(next_file);
-                return module_loaded && playing;
+                return playback_mode != PLAYBACK_NONE && playing;
             }
             return FALSE;
         }
@@ -1386,42 +1782,78 @@ static gboolean update_display(gpointer data)
 {
     (void)data;
 
-    if (!module_loaded)
+    if (playback_mode == PLAYBACK_NONE)
         return G_SOURCE_CONTINUE;
 
-    struct xmp_frame_info fi;
-    SDL_LockAudioDevice(audio_device);
-    xmp_get_frame_info(ctx, &fi);
-    int ended = audio_ended;
-    int is_playing = playing;
-    SDL_UnlockAudioDevice(audio_device);
+    int ended;
+    int is_playing;
+    int current;
+    int total;
 
-    int total = fi.total_time > 0 ? fi.total_time : 1;
-    int current = fi.time;
-    if (current < 0) current = 0;
-    if (current > total) current = total;
+    if (playback_mode == PLAYBACK_FFMPEG) {
+        SDL_LockAudioDevice(audio_device);
+        int64_t position_frames = ffmpeg_position_frames;
+        int64_t duration_ms = ffmpeg_duration_ms;
+        ended = audio_ended;
+        is_playing = playing;
+        SDL_UnlockAudioDevice(audio_device);
 
-    if (is_playing || ended) {
-        updating_seek = 1;
-        gtk_range_set_range(GTK_RANGE(seek_scale), 0, total);
-        gtk_range_set_value(GTK_RANGE(seek_scale), current);
-        updating_seek = 0;
+        current = (int)(position_frames * 1000 / AUDIO_RATE);
+        total = duration_ms > 0 ? (int)duration_ms : 1;
+        if (current < 0) current = 0;
+        if (current > total) current = total;
+
+        if (is_playing || ended) {
+            updating_seek = 1;
+            gtk_range_set_value(GTK_RANGE(seek_scale), current);
+            updating_seek = 0;
+        }
+
+        char time_text[80];
+        snprintf(time_text, sizeof(time_text), "%02d:%02d / %02d:%02d",
+                 current / 60000, (current / 1000) % 60,
+                 total / 60000, (total / 1000) % 60);
+        gtk_label_set_text(GTK_LABEL(time_label), time_text);
+
+        if (is_playing)
+            set_status("Playing audio file");
+        else if (ended)
+            set_status("Playback finished");
+    } else {
+        struct xmp_frame_info fi;
+        SDL_LockAudioDevice(audio_device);
+        xmp_get_frame_info(ctx, &fi);
+        ended = audio_ended;
+        is_playing = playing;
+        SDL_UnlockAudioDevice(audio_device);
+
+        total = fi.total_time > 0 ? fi.total_time : 1;
+        current = fi.time;
+        if (current < 0) current = 0;
+        if (current > total) current = total;
+
+        if (is_playing || ended) {
+            updating_seek = 1;
+            gtk_range_set_range(GTK_RANGE(seek_scale), 0, total);
+            gtk_range_set_value(GTK_RANGE(seek_scale), current);
+            updating_seek = 0;
+        }
+
+        char time_text[80];
+        snprintf(time_text, sizeof(time_text), "%02d:%02d / %02d:%02d",
+                 current / 60000, (current / 1000) % 60,
+                 total / 60000, (total / 1000) % 60);
+        gtk_label_set_text(GTK_LABEL(time_label), time_text);
+
+        char status[160];
+        snprintf(status, sizeof(status),
+                 "Order %d    Pattern %d    Row %d    Speed %d    BPM %d",
+                 fi.pos, fi.pattern, fi.row, fi.speed, fi.bpm);
+        if (is_playing)
+            gtk_label_set_text(GTK_LABEL(status_label), status);
+        else if (ended)
+            set_status("Playback finished");
     }
-
-    char time_text[80];
-    snprintf(time_text, sizeof(time_text), "%02d:%02d / %02d:%02d",
-             current / 60000, (current / 1000) % 60,
-             total / 60000, (total / 1000) % 60);
-    gtk_label_set_text(GTK_LABEL(time_label), time_text);
-
-    char status[160];
-    snprintf(status, sizeof(status),
-             "Order %d    Pattern %d    Row %d    Speed %d    BPM %d",
-             fi.pos, fi.pattern, fi.row, fi.speed, fi.bpm);
-    if (playing)
-        gtk_label_set_text(GTK_LABEL(status_label), status);
-    else if (ended)
-        set_status("Playback finished");
 
     if (ended && !playlist_advance())
         update_play_button();
@@ -1430,10 +1862,8 @@ static gboolean update_display(gpointer data)
 
     if (scope_area)
         gtk_widget_queue_draw(scope_area);
-
     if (pattern_area)
         gtk_widget_queue_draw(pattern_area);
-
     if (visualizer_area)
         gtk_widget_queue_draw(visualizer_area);
 
@@ -1484,6 +1914,8 @@ static void on_destroy(GtkWidget *widget, gpointer data)
 {
     (void)widget;
     (void)data;
+
+    stop_ffmpeg_decoder();
 
     if (audio_device) {
         SDL_PauseAudioDevice(audio_device, 1);
@@ -1583,7 +2015,7 @@ int main(int argc, char **argv)
                                 "module-title");
     gtk_box_pack_start(GTK_BOX(info), title_label, FALSE, FALSE, 0);
 
-    format_label = gtk_label_new("Open a tracker module to begin");
+    format_label = gtk_label_new("Open a music file to begin");
     gtk_label_set_xalign(GTK_LABEL(format_label), 0);
     gtk_box_pack_start(GTK_BOX(info), format_label, FALSE, FALSE, 0);
 
@@ -1603,7 +2035,7 @@ int main(int argc, char **argv)
     gtk_box_pack_start(GTK_BOX(outer), controls, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(controls),
-        make_button("Open module…", G_CALLBACK(on_open)), FALSE, FALSE, 0);
+        make_button("Open File…", G_CALLBACK(on_open)), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(controls),
         make_button("|◀", G_CALLBACK(on_previous)), FALSE, FALSE, 0);
 
@@ -1616,9 +2048,22 @@ int main(int argc, char **argv)
     gtk_box_pack_start(GTK_BOX(controls),
         make_button("▶|", G_CALLBACK(on_next)), FALSE, FALSE, 0);
 
-    /* Playlist */
-    GtkWidget *playlist_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_box_pack_start(GTK_BOX(outer), playlist_box, FALSE, FALSE, 0);
+    GtkWidget *volume_label = gtk_label_new("Volume");
+    gtk_box_pack_start(GTK_BOX(controls), volume_label, FALSE, FALSE, 0);
+    volume_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 100, 1);
+    gtk_scale_set_draw_value(GTK_SCALE(volume_scale), TRUE);
+    gtk_scale_set_value_pos(GTK_SCALE(volume_scale), GTK_POS_RIGHT);
+    gtk_widget_set_size_request(volume_scale, 140, -1);
+    gtk_range_set_value(GTK_RANGE(volume_scale), master_volume);
+    g_signal_connect(volume_scale, "value-changed", G_CALLBACK(on_volume_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(controls), volume_scale, FALSE, FALSE, 0);
+
+   /* Adjustable playlist and pattern sections */
+GtkWidget *content_pane = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
+gtk_box_pack_start(GTK_BOX(outer), content_pane, TRUE, TRUE, 0);
+
+/* Playlist */
+GtkWidget *playlist_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
 
     GtkWidget *playlist_controls =
         gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
@@ -1667,10 +2112,11 @@ int main(int argc, char **argv)
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(playlist_scroll),
                                    GTK_POLICY_AUTOMATIC,
                                    GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(playlist_scroll, -1, 110);
+    gtk_widget_set_size_request(playlist_scroll, -1, 60);
     gtk_container_add(GTK_CONTAINER(playlist_scroll), playlist_view);
-    gtk_box_pack_start(GTK_BOX(playlist_box), playlist_scroll,
-                       FALSE, TRUE, 0);
+   gtk_box_pack_start(GTK_BOX(playlist_box), playlist_scroll,
+                   TRUE, TRUE, 0);
+gtk_paned_pack1(GTK_PANED(content_pane), playlist_box, TRUE, TRUE);
 
     seek_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 1, 100);
     gtk_scale_set_draw_value(GTK_SCALE(seek_scale), FALSE);
@@ -1679,30 +2125,46 @@ int main(int argc, char **argv)
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(pattern_scroll),
                                    GTK_POLICY_AUTOMATIC,
                                    GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(pattern_scroll, -1, 230);
+    gtk_widget_set_size_request(pattern_scroll, -1, 60);
 
     pattern_area = gtk_drawing_area_new();
     gtk_widget_set_size_request(pattern_area, 900, 270);
     g_signal_connect(pattern_area, "draw", G_CALLBACK(draw_pattern), NULL);
     gtk_container_add(GTK_CONTAINER(pattern_scroll), pattern_area);
 
+    GtkWidget *pattern_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+
     GtkWidget *pattern_heading = gtk_label_new("Pattern View");
     gtk_widget_set_halign(pattern_heading, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(outer), pattern_heading,
-                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(pattern_box), pattern_heading,
+                   FALSE, FALSE, 0);
 
-    gtk_box_pack_start(GTK_BOX(outer), pattern_scroll, FALSE, TRUE, 0);
+gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
+                   TRUE, TRUE, 0);
+
+    /* Put pattern view and scopes together below the playlist. */
+    GtkWidget *lower_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+
+    gtk_box_pack_start(GTK_BOX(lower_box), pattern_box,
+                       TRUE, TRUE, 0);
 
     GtkWidget *scope_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scope_scroll),
                                    GTK_POLICY_AUTOMATIC,
                                    GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(scope_scroll, -1, 140);
+    gtk_widget_set_size_request(scope_scroll, -1, 60);
+
     scope_area = gtk_drawing_area_new();
     gtk_widget_set_size_request(scope_area, 620, 180);
     g_signal_connect(scope_area, "draw", G_CALLBACK(draw_scopes), NULL);
     gtk_container_add(GTK_CONTAINER(scope_scroll), scope_area);
-    gtk_box_pack_start(GTK_BOX(outer), scope_scroll, TRUE, TRUE, 0);
+
+    gtk_box_pack_start(GTK_BOX(lower_box), scope_scroll,
+                       TRUE, TRUE, 0);
+
+    /* One divider: playlist above, pattern and scopes below. */
+    gtk_paned_pack2(GTK_PANED(content_pane), lower_box, TRUE, TRUE);
+    gtk_paned_set_position(GTK_PANED(content_pane), 230);
 
     gtk_box_pack_start(GTK_BOX(outer), seek_scale, FALSE, FALSE, 0);
 
@@ -1803,13 +2265,13 @@ int main(int argc, char **argv)
     gtk_box_pack_start(GTK_BOX(about_page), about_icon,
                        FALSE, FALSE, 0);
 
-    GtkWidget *about_title = gtk_label_new("XMP Module Player");
+    GtkWidget *about_title = gtk_label_new("XMP Module Player 0.2.0");
     gtk_widget_set_name(about_title, "about-title");
     gtk_box_pack_start(GTK_BOX(about_page), about_title,
                        FALSE, FALSE, 0);
 
     GtkWidget *about_description = gtk_label_new(
-        "A native Linux tracker module player built with GTK3, SDL2, and libxmp.");
+        "A native Linux music player built with GTK3 and SDL2.\n"       "Plays tracker modules with libxmp and regular audio files with FFmpeg,\n"       "including MP3, WAV, M4A/AAC, Ogg Vorbis, Opus, and FLAC.");
     gtk_label_set_line_wrap(GTK_LABEL(about_description), TRUE);
     gtk_label_set_justify(GTK_LABEL(about_description), GTK_JUSTIFY_CENTER);
     gtk_widget_set_size_request(about_description, 420, -1);
