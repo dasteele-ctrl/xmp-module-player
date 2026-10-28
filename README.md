@@ -9,9 +9,11 @@ XMP Module Player brings classic tracker music playback to the Linux desktop, wi
 ## Features
 
 - 🎵 **Tracker module playback** powered by libxmp
-- 🎵 **MP3, WAV, FLAC, OGG, and M4A playback** via FFmpeg 
+- 🎵 **MP3, WAV, FLAC, OGG, and M4A playback** via FFmpeg
+- 🎵 **Commodore 64 SID music playback powered by libsidplayfp**
 - 🎚️ **Playback controls** with seeking and track timing
 - 📃 **Playlist management** with add, remove, clear, and drag-and-drop support
+ -📃 **High Voltage SID Collection (HVSC) browsing and integrated downloader**
 - 🔁 **Automatic track advancement**
 - 📂 **M3U playlist loading and saving**
 - 📊 **Real-time audio spectrum visualizer** with peak hold
