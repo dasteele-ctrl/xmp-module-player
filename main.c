@@ -6,6 +6,8 @@
 #include <stdint.h>
 #include <math.h>
 #include "ffmpeg_audio.h"
+#include "sid_audio.h"
+#include "hvsc_download.h"
 
 #define AUDIO_RATE 44100
 #define SCOPE_ROW_HEIGHT 76
@@ -14,7 +16,8 @@
 typedef enum {
     PLAYBACK_NONE,
     PLAYBACK_MODULE,
-    PLAYBACK_FFMPEG
+    PLAYBACK_FFMPEG,
+    PLAYBACK_SID
 } PlaybackMode;
 
 static PlaybackMode playback_mode = PLAYBACK_NONE;
@@ -61,6 +64,7 @@ static unsigned int audio_ring_write_pos;
 static SDL_Thread *decoder_thread;
 static SDL_atomic_t decoder_stop;
 static FfmpegAudio *ffmpeg_audio;
+static SidAudio *sid_audio;
 static SDL_atomic_t ffmpeg_decode_finished;
 static SDL_atomic_t ffmpeg_decode_error;
 static int64_t ffmpeg_position_frames;
@@ -222,6 +226,15 @@ static void audio_callback(void *userdata, Uint8 *stream, int len)
         if (copied_frames < requested_frames &&
             SDL_AtomicGet(&ffmpeg_decode_finished) &&
             audio_ring_read_pos == audio_ring_write_pos) {
+            audio_ended = 1;
+            playing = 0;
+        }
+    } else if (playback_mode == PLAYBACK_SID) {
+        int requested_frames = len / (int)(2 * sizeof(int16_t));
+        int got = sid_audio ? sid_audio_read(sid_audio,
+                                              (int16_t *)stream,
+                                              requested_frames) : 0;
+        if (got <= 0) {
             audio_ended = 1;
             playing = 0;
         }
@@ -514,6 +527,10 @@ static int open_ffmpeg_audio(const char *filename)
         xmp_release_module(ctx);
         module_loaded = 0;
     }
+    if (sid_audio) {
+        sid_audio_close(sid_audio);
+        sid_audio = NULL;
+    }
 
     SDL_UnlockAudioDevice(audio_device);
 
@@ -595,6 +612,10 @@ static void open_module(const char *filename)
         xmp_release_module(ctx);
         module_loaded = 0;
     }
+    if (sid_audio) {
+        sid_audio_close(sid_audio);
+        sid_audio = NULL;
+    }
 
     int rc = xmp_load_module(ctx, filename);
     if (rc < 0) {
@@ -665,6 +686,87 @@ static void open_module(const char *filename)
     set_status("Module loaded");
 }
 
+static int open_sid(const char *filename)
+{
+    char error_text[512] = "";
+
+    if (!filename || !*filename || !audio_device)
+        return 0;
+
+    stop_ffmpeg_decoder();
+    SDL_PauseAudioDevice(audio_device, 1);
+    SDL_LockAudioDevice(audio_device);
+
+    playing = 0;
+    audio_ended = 0;
+    stopped = 0;
+    playback_mode = PLAYBACK_NONE;
+
+    if (player_started) {
+        xmp_end_player(ctx);
+        player_started = 0;
+    }
+    if (module_loaded) {
+        xmp_release_module(ctx);
+        module_loaded = 0;
+    }
+    if (sid_audio) {
+        sid_audio_close(sid_audio);
+        sid_audio = NULL;
+    }
+    SDL_UnlockAudioDevice(audio_device);
+
+    sid_audio = sid_audio_open(filename, error_text, sizeof(error_text));
+    if (!sid_audio) {
+        if (error_text[0])
+            set_status(error_text);
+        return 0;
+    }
+
+    SDL_LockAudioDevice(audio_device);
+    playback_mode = PLAYBACK_SID;
+    SDL_UnlockAudioDevice(audio_device);
+
+    g_strlcpy(current_file, filename, sizeof(current_file));
+
+    const char *sid_title = sid_audio_title(sid_audio);
+    const char *sid_author = sid_audio_author(sid_audio);
+    const char *sid_release = sid_audio_release_info(sid_audio);
+    char title[512];
+    char details[1024];
+    snprintf(title, sizeof(title), "%s",
+             sid_title && sid_title[0] ? sid_title : "Untitled SID tune");
+    snprintf(details, sizeof(details), "%s%s%s%s%s",
+             filename,
+             sid_author && sid_author[0] ? "\nAuthor: " : "",
+             sid_author && sid_author[0] ? sid_author : "",
+             sid_release && sid_release[0] ? "\nRelease: " : "",
+             sid_release && sid_release[0] ? sid_release : "");
+
+    gtk_label_set_text(GTK_LABEL(title_label), title);
+    gtk_label_set_text(GTK_LABEL(format_label), "Commodore 64 SID (sidplayfp)");
+    gtk_label_set_text(GTK_LABEL(channels_label), "Stereo    44100 Hz");
+    gtk_label_set_text(GTK_LABEL(details_label), details);
+    gtk_label_set_text(GTK_LABEL(time_label), "SID tune");
+    gtk_widget_set_sensitive(seek_scale, FALSE);
+    updating_seek = 1;
+    gtk_range_set_range(GTK_RANGE(seek_scale), 0, 1);
+    gtk_range_set_value(GTK_RANGE(seek_scale), 0);
+    updating_seek = 0;
+
+    populate_sample_browser();
+    if (scope_area)
+        gtk_widget_queue_draw(scope_area);
+    if (pattern_area)
+        gtk_widget_queue_draw(pattern_area);
+    if (visualizer_area)
+        gtk_widget_queue_draw(visualizer_area);
+
+    update_play_button();
+    set_status("SID tune loaded");
+    return 1;
+}
+
 static char *get_last_folder_file(void)
 {
     return g_build_filename(g_get_user_config_dir(),
@@ -706,6 +808,279 @@ static void remember_last_folder(GtkWidget *dialog)
     }
 }
 
+
+static char *get_hvsc_folder_file(void)
+{
+    return g_build_filename(g_get_user_config_dir(),
+                            "xmp-module-player",
+                            "hvsc-folder", NULL);
+}
+
+static void on_hvsc_folder_changed(GtkFileChooserButton *chooser,
+                                   gpointer data)
+{
+    (void)data;
+    char *folder = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+    if (!folder) return;
+
+    char *settings_file = get_hvsc_folder_file();
+    char *settings_dir = g_path_get_dirname(settings_file);
+
+    g_mkdir_with_parents(settings_dir, 0700);
+    g_file_set_contents(settings_file, folder, -1, NULL);
+
+    g_free(settings_dir);
+    g_free(settings_file);
+    g_free(folder);
+}
+
+
+
+/* HVSC waveform progress indicator.
+   The fraction will later be updated by the download worker. */
+
+static gboolean hvsc_waveform_draw(GtkWidget *widget,
+                                  cairo_t *cr,
+                                  gpointer data)
+{
+    (void)data;
+
+    GtkAllocation area;
+    gtk_widget_get_allocation(widget, &area);
+
+    double width = area.width;
+    double height = area.height;
+
+    double fraction = gtk_progress_bar_get_fraction(
+        GTK_PROGRESS_BAR(
+            g_object_get_data(G_OBJECT(widget), "progress")));
+
+    fraction = CLAMP(fraction, 0.0, 1.0);
+
+    cairo_set_source_rgb(cr, 0.082, 0.110, 0.153);
+    cairo_rectangle(cr, 0, 0, width, height);
+    cairo_fill(cr);
+
+    double center = height / 2.0;
+    double step = 4.0;
+
+    for (int i = 0; i < (int)(width / step); i++) {
+        double x = i * step + 1.0;
+
+        double amplitude =
+            5.0 +
+            fabs(sin(i * 1.71) * cos(i * 0.31)) * 28.0 +
+            fabs(sin(i * 0.18)) * 7.0;
+
+        amplitude = MIN(amplitude, height - 8.0);
+
+        if (x < width * fraction)
+            cairo_set_source_rgb(cr, 0.212, 0.769, 0.847);
+        else
+            cairo_set_source_rgb(cr, 0.278, 0.333, 0.412);
+
+        cairo_rectangle(cr, x, center - amplitude / 2.0,
+                        2.6, amplitude);
+        cairo_fill(cr);
+    }
+
+    cairo_set_source_rgba(cr, 0.51, 0.57, 0.65, 0.45);
+    cairo_set_line_width(cr, 0.5);
+    cairo_move_to(cr, 0, center);
+    cairo_line_to(cr, width, center);
+    cairo_stroke(cr);
+
+    if (fraction > 0.0) {
+        cairo_set_source_rgb(cr, 0.90, 0.98, 1.0);
+        cairo_set_line_width(cr, 1.5);
+        cairo_move_to(cr, width * fraction, 0);
+        cairo_line_to(cr, width * fraction, height);
+        cairo_stroke(cr);
+    }
+
+    return FALSE;
+}
+
+
+typedef struct {
+    GtkWidget *button;
+    GtkWidget *progress;
+    GtkWidget *waveform;
+    GtkWidget *status;
+    GtkWidget *collection_folder;
+    char *install_parent;
+} HvscUI;
+
+static void on_hvsc_progress(double fraction,
+                             const char *status,
+                             gpointer user_data)
+{
+    HvscUI *ui = user_data;
+
+    gboolean finished = (fraction == 2.0 || fraction == -2.0);
+
+    if (!finished && !hvsc_download_is_running())
+        return;
+
+    gtk_progress_bar_set_fraction(
+        GTK_PROGRESS_BAR(ui->progress),
+        fraction == 2.0 ? 1.0 :
+        fraction < 0.0 ? 0.0 : CLAMP(fraction, 0.0, 1.0));
+
+    gtk_widget_queue_draw(ui->waveform);
+
+    gtk_label_set_text(
+        GTK_LABEL(ui->status), status);
+
+    if (fraction == 2.0 &&
+        g_str_has_prefix(status, "HVSC installation completed") &&
+        ui->install_parent) {
+        char *folder = g_build_filename(
+            ui->install_parent, "HVSC", "C64Music", NULL);
+
+        if (g_file_test(folder, G_FILE_TEST_IS_DIR)) {
+            gtk_file_chooser_set_filename(
+                GTK_FILE_CHOOSER(ui->collection_folder), folder);
+
+            on_hvsc_folder_changed(
+                GTK_FILE_CHOOSER_BUTTON(ui->collection_folder), NULL);
+        }
+
+        g_free(folder);
+        g_clear_pointer(&ui->install_parent, g_free);
+    }
+
+    if (finished) {
+        gtk_button_set_label(
+            GTK_BUTTON(ui->button), "Download & Install HVSC");
+        gtk_widget_set_sensitive(ui->button, TRUE);
+    }
+}
+
+static void on_hvsc_download_clicked(GtkButton *button,
+                                     gpointer user_data)
+{
+    GtkWidget **widgets = user_data;
+
+    if (hvsc_download_is_running()) {
+        hvsc_download_cancel();
+        gtk_widget_set_sensitive(GTK_WIDGET(button), FALSE);
+        return;
+    }
+
+    GtkWidget *chooser = widgets[0];
+    HvscUI *ui = (HvscUI *)widgets[1];
+
+    char *parent = gtk_file_chooser_get_filename(
+        GTK_FILE_CHOOSER(chooser));
+
+    if (!parent)
+        return;
+
+    char *destination = g_build_filename(parent, "HVSC", NULL);
+
+    if (g_file_test(destination, G_FILE_TEST_EXISTS) ||
+        g_file_test(destination, G_FILE_TEST_IS_SYMLINK)) {
+        gtk_label_set_text(
+            GTK_LABEL(ui->status),
+            "Installation refused: HVSC already exists.");
+        g_free(destination);
+        g_free(parent);
+        return;
+    }
+
+    gtk_button_set_label(GTK_BUTTON(button), "Cancel Download");
+    gtk_widget_set_sensitive(GTK_WIDGET(button), TRUE);
+
+    gtk_progress_bar_set_fraction(
+        GTK_PROGRESS_BAR(ui->progress), 0.0);
+    gtk_widget_queue_draw(ui->waveform);
+
+    gtk_label_set_text(
+        GTK_LABEL(ui->status),
+        "Starting HVSC download...");
+
+    g_free(ui->install_parent);
+    ui->install_parent = g_strdup(parent);
+
+    hvsc_download_async(parent, on_hvsc_progress, ui);
+
+    g_free(destination);
+    g_free(parent);
+}
+
+static void on_hvsc_check_destination(GtkButton *button, gpointer data)
+{
+    (void)button;
+
+    GtkFileChooser *chooser = GTK_FILE_CHOOSER(data);
+    char *parent = gtk_file_chooser_get_filename(chooser);
+
+    if (!parent) {
+        GtkWidget *dialog = gtk_message_dialog_new(
+            GTK_WINDOW(window), GTK_DIALOG_MODAL,
+            GTK_MESSAGE_WARNING, GTK_BUTTONS_CLOSE,
+            "Please select an installation directory.");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
+
+    char *destination = g_build_filename(parent, "HVSC", NULL);
+    char *message = NULL;
+    GtkMessageType type;
+
+    if (!g_file_test(parent, G_FILE_TEST_IS_DIR)) {
+        message = g_strdup("The selected parent directory does not exist.");
+        type = GTK_MESSAGE_ERROR;
+    } else if (g_file_test(destination, G_FILE_TEST_EXISTS) ||
+               g_file_test(destination, G_FILE_TEST_IS_SYMLINK)) {
+        message = g_strdup_printf(
+            "Installation refused.\n\n%s already exists.\n"
+            "No files have been changed.", destination);
+        type = GTK_MESSAGE_WARNING;
+    } else {
+        message = g_strdup_printf(
+            "Destination is available:\n\n%s\n\n"
+            "No files have been changed.\n"
+            "Downloading will be enabled in the next stage.",
+            destination);
+        type = GTK_MESSAGE_INFO;
+    }
+
+    GtkWidget *dialog = gtk_message_dialog_new(
+        GTK_WINDOW(window), GTK_DIALOG_MODAL,
+        type, GTK_BUTTONS_CLOSE, "%s", message);
+
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+
+    g_free(message);
+    g_free(destination);
+    g_free(parent);
+}
+
+static void on_hvsc_open_folder(GtkButton *button, gpointer data)
+{
+    (void)button;
+
+    GtkFileChooser *chooser = GTK_FILE_CHOOSER(data);
+    char *folder = gtk_file_chooser_get_filename(chooser);
+    if (!folder) return;
+
+    GError *error = NULL;
+    char *argv[] = { "xdg-open", folder, NULL };
+
+    if (!g_spawn_async(NULL, argv, NULL,
+                       G_SPAWN_SEARCH_PATH,
+                       NULL, NULL, NULL, &error)) {
+        g_warning("Cannot open HVSC folder: %s", error->message);
+        g_clear_error(&error);
+    }
+
+    g_free(folder);
+}
+
 static void on_open(GtkButton *button, gpointer data)
 {
     (void)button;
@@ -724,7 +1099,7 @@ static void on_open(GtkButton *button, gpointer data)
     const char *patterns[] = {
         "*.mod", "*.MOD", "*.xm", "*.XM", "*.it", "*.IT",
         "*.s3m", "*.S3M", "*.mptm", "*.MPTM", "*.mtm", "*.MTM",
-        "*.669", "*.amf", "*.med", "*.okt", "*.ult",
+        "*.669", "*.amf", "*.med", "*.okt", "*.ult", "*.sid", "*.SID",
         "*.mp3", "*.MP3", "*.wav", "*.WAV", "*.m4a", "*.M4A",
         "*.aac", "*.AAC", "*.ogg", "*.OGG", "*.oga", "*.OGA", "*.opus", "*.OPUS",
         "*.flac", "*.FLAC", "*.webm", "*.WEBM", "*.mka", "*.MKA",
@@ -747,7 +1122,7 @@ static void on_open(GtkButton *button, gpointer data)
             gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
         if (filename) {
             open_module(filename);
-            if (!module_loaded)
+            if (!module_loaded && !open_sid(filename))
                 open_ffmpeg_audio(filename);
             g_free(filename);
         }
@@ -787,6 +1162,22 @@ static void on_play(GtkButton *button, gpointer data)
         SDL_UnlockAudioDevice(audio_device);
         SDL_PauseAudioDevice(audio_device, 0);
         set_status("Playing");
+    } else if (playback_mode == PLAYBACK_SID) {
+        SDL_LockAudioDevice(audio_device);
+        if (stopped || audio_ended) {
+            unsigned int song = sid_audio_current_song(sid_audio);
+            if (!sid_audio || sid_audio_select_song(sid_audio, song) < 0) {
+                SDL_UnlockAudioDevice(audio_device);
+                set_status("Could not restart SID tune.");
+                return;
+            }
+            stopped = 0;
+            audio_ended = 0;
+        }
+        playing = 1;
+        SDL_UnlockAudioDevice(audio_device);
+        SDL_PauseAudioDevice(audio_device, 0);
+        set_status("Playing SID tune");
     } else if (playback_mode == PLAYBACK_FFMPEG) {
         stopped = 0;
         audio_ended = 0;
@@ -814,6 +1205,10 @@ static void on_stop(GtkButton *button, gpointer data)
         SDL_UnlockAudioDevice(audio_device);
     } else if (playback_mode == PLAYBACK_FFMPEG) {
         stop_ffmpeg_decoder();
+    } else if (playback_mode == PLAYBACK_SID && sid_audio) {
+        SDL_LockAudioDevice(audio_device);
+        sid_audio_select_song(sid_audio, sid_audio_current_song(sid_audio));
+        SDL_UnlockAudioDevice(audio_device);
     }
 
     playing = 0;
@@ -828,6 +1223,18 @@ static void on_previous(GtkButton *button, gpointer data)
 {
     (void)button;
     (void)data;
+    if (playback_mode == PLAYBACK_SID && sid_audio) {
+        SDL_LockAudioDevice(audio_device);
+        unsigned int count = sid_audio_song_count(sid_audio);
+        unsigned int current = sid_audio_current_song(sid_audio);
+        unsigned int target = (count > 0 && current > 1) ? current - 1 : count;
+        if (count > 0 && sid_audio_select_song(sid_audio, target) > 0) {
+            stopped = 0;
+            audio_ended = 0;
+        }
+        SDL_UnlockAudioDevice(audio_device);
+        return;
+    }
     if (!module_loaded) return;
 
     SDL_LockAudioDevice(audio_device);
@@ -839,6 +1246,18 @@ static void on_next(GtkButton *button, gpointer data)
 {
     (void)button;
     (void)data;
+    if (playback_mode == PLAYBACK_SID && sid_audio) {
+        SDL_LockAudioDevice(audio_device);
+        unsigned int count = sid_audio_song_count(sid_audio);
+        unsigned int current = sid_audio_current_song(sid_audio);
+        unsigned int target = (count > 0 && current < count) ? current + 1 : 1;
+        if (count > 0 && sid_audio_select_song(sid_audio, target) > 0) {
+            stopped = 0;
+            audio_ended = 0;
+        }
+        SDL_UnlockAudioDevice(audio_device);
+        return;
+    }
     if (!module_loaded) return;
 
     SDL_LockAudioDevice(audio_device);
@@ -958,7 +1377,8 @@ static void update_visualizer_spectrum(void)
 {
     /* Let the bars and peak markers settle while playback is stopped. */
     if ((playback_mode != PLAYBACK_MODULE &&
-         playback_mode != PLAYBACK_FFMPEG) ||
+         playback_mode != PLAYBACK_FFMPEG &&
+         playback_mode != PLAYBACK_SID) ||
         !playing || audio_ended) {
         for (int i = 0; i < VIZ_BANDS; i++) {
             viz_levels[i] *= 0.82;
@@ -1306,6 +1726,11 @@ static void play_playlist_file(const char *filename)
         return;
     }
 
+    if (open_sid(filename)) {
+        on_play(NULL, NULL);
+        return;
+    }
+
     if (open_ffmpeg_audio(filename))
         on_play(NULL, NULL);
 }
@@ -1465,7 +1890,7 @@ static void on_playlist_add(GtkButton *button, gpointer data)
     const char *patterns[] = {
         "*.mod", "*.MOD", "*.xm", "*.XM", "*.it", "*.IT",
         "*.s3m", "*.S3M", "*.mptm", "*.MPTM", "*.mtm", "*.MTM",
-        "*.669", "*.amf", "*.med", "*.okt", "*.ult",
+        "*.669", "*.amf", "*.med", "*.okt", "*.ult", "*.sid", "*.SID",
         "*.mp3", "*.MP3", "*.wav", "*.WAV", "*.m4a", "*.M4A",
         "*.aac", "*.AAC", "*.ogg", "*.OGG", "*.oga", "*.OGA", "*.opus", "*.OPUS",
         "*.flac", "*.FLAC", "*.webm", "*.WEBM", "*.mka", "*.MKA",
@@ -1819,6 +2244,24 @@ static gboolean update_display(gpointer data)
             set_status("Playing audio file");
         else if (ended)
             set_status("Playback finished");
+    } else if (playback_mode == PLAYBACK_SID) {
+        SDL_LockAudioDevice(audio_device);
+        unsigned int song = sid_audio ? sid_audio_current_song(sid_audio) : 0;
+        unsigned int count = sid_audio ? sid_audio_song_count(sid_audio) : 0;
+        ended = audio_ended;
+        is_playing = playing;
+        SDL_UnlockAudioDevice(audio_device);
+
+        char sid_status[128];
+        snprintf(sid_status, sizeof(sid_status), "SID subtune %u / %u",
+                 song, count);
+        gtk_label_set_text(GTK_LABEL(time_label), "SID tune");
+        if (is_playing)
+            gtk_label_set_text(GTK_LABEL(status_label), sid_status);
+        else if (ended)
+            set_status("SID playback finished");
+        current = 0;
+        total = 1;
     } else {
         struct xmp_frame_info fi;
         SDL_LockAudioDevice(audio_device);
@@ -1900,6 +2343,9 @@ static void apply_style(void)
         " min-height: 14px; }"
         ".module-title { font-size: 19px; font-weight: bold; }"
         "label#about-title { font-size: 24px; font-weight: bold; }"
+        "label#about-description { background-color: #20242c;"
+        " color: #e3e6ed; padding: 18px;"
+        " border: 1px solid #414754; border-radius: 6px; }"
         ".muted { color: #9ba4b4; }";
 
     GtkCssProvider *provider = gtk_css_provider_new();
@@ -1922,6 +2368,10 @@ static void on_destroy(GtkWidget *widget, gpointer data)
         SDL_LockAudioDevice(audio_device);
         if (player_started) xmp_end_player(ctx);
         if (module_loaded) xmp_release_module(ctx);
+        if (sid_audio) {
+            sid_audio_close(sid_audio);
+            sid_audio = NULL;
+        }
         player_started = 0;
         module_loaded = 0;
         SDL_UnlockAudioDevice(audio_device);
@@ -2253,6 +2703,174 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         GTK_NOTEBOOK(notebook), samples_page,
         gtk_label_new("Samples & Notes"));
 
+
+    /* High Voltage SID Collection */
+    GtkWidget *hvsc_page =
+        gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    gtk_container_set_border_width(GTK_CONTAINER(hvsc_page), 24);
+
+    GtkWidget *hvsc_title =
+        gtk_label_new("High Voltage SID Collection");
+    gtk_widget_set_halign(hvsc_title, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(hvsc_title), "title");
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_title,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *hvsc_description = gtk_label_new(
+        "Download or manage the High Voltage SID Collection (HVSC),\n"
+        "an extensive archive of Commodore 64 SID music.");
+    gtk_label_set_xalign(GTK_LABEL(hvsc_description), 0);
+    gtk_label_set_line_wrap(GTK_LABEL(hvsc_description), TRUE);
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_description,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *hvsc_folder_label =
+        gtk_label_new("Collection folder:");
+    gtk_widget_set_halign(hvsc_folder_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_folder_label,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *hvsc_folder = gtk_file_chooser_button_new(
+        "Choose HVSC Collection Folder",
+        GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER);
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_folder,
+                       FALSE, FALSE, 0);
+
+    char *hvsc_settings_file = get_hvsc_folder_file();
+    char *saved_hvsc_folder = NULL;
+
+    if (g_file_get_contents(hvsc_settings_file,
+                            &saved_hvsc_folder, NULL, NULL)) {
+        g_strstrip(saved_hvsc_folder);
+        if (g_file_test(saved_hvsc_folder, G_FILE_TEST_IS_DIR))
+            gtk_file_chooser_set_filename(
+                GTK_FILE_CHOOSER(hvsc_folder), saved_hvsc_folder);
+    }
+
+    g_free(saved_hvsc_folder);
+    g_free(hvsc_settings_file);
+
+    g_signal_connect(hvsc_folder, "file-set",
+                     G_CALLBACK(on_hvsc_folder_changed), NULL);
+
+
+
+    /* Separate installation destination: never use the existing
+       collection selector as the download destination. */
+    GtkWidget *hvsc_install_label = gtk_label_new(
+        "Install a new HVSC collection into:");
+    gtk_widget_set_halign(hvsc_install_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_install_label,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *hvsc_install_folder =
+        gtk_file_chooser_button_new(
+            "Choose Installation Parent Folder",
+            GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER);
+
+    char *hvsc_default_parent =
+        g_build_filename(g_get_home_dir(), "Music", NULL);
+
+    if (g_file_test(hvsc_default_parent, G_FILE_TEST_IS_DIR))
+        gtk_file_chooser_set_filename(
+            GTK_FILE_CHOOSER(hvsc_install_folder),
+            hvsc_default_parent);
+    else
+        gtk_file_chooser_set_filename(
+            GTK_FILE_CHOOSER(hvsc_install_folder),
+            g_get_home_dir());
+
+    g_free(hvsc_default_parent);
+
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_install_folder,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *hvsc_install_hint = gtk_label_new(
+        "A new HVSC folder will be created inside the selected directory.\n"
+        "Existing files and collections will never be overwritten.");
+    gtk_label_set_xalign(GTK_LABEL(hvsc_install_hint), 0);
+    gtk_label_set_line_wrap(GTK_LABEL(hvsc_install_hint), TRUE);
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_install_hint,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *hvsc_buttons =
+        gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_buttons,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *hvsc_download =
+        gtk_button_new_with_label("Download HVSC");
+    gtk_box_pack_start(GTK_BOX(hvsc_buttons), hvsc_download,
+                       FALSE, FALSE, 0);
+
+    gtk_button_set_label(
+        GTK_BUTTON(hvsc_download), "Check Installation Destination");
+
+    g_signal_connect(
+        hvsc_download, "clicked",
+        G_CALLBACK(on_hvsc_check_destination),
+        hvsc_install_folder);
+
+    GtkWidget *hvsc_open_folder =
+        gtk_button_new_with_label("Open HVSC Folder");
+    gtk_box_pack_start(GTK_BOX(hvsc_buttons), hvsc_open_folder,
+                       FALSE, FALSE, 0);
+
+    g_signal_connect(hvsc_open_folder, "clicked",
+                     G_CALLBACK(on_hvsc_open_folder), hvsc_folder);
+
+
+    GtkWidget *hvsc_progress = gtk_progress_bar_new();
+
+    GtkWidget *hvsc_waveform = gtk_drawing_area_new();
+    gtk_widget_set_size_request(hvsc_waveform, -1, 76);
+
+    g_object_set_data(G_OBJECT(hvsc_waveform),
+                      "progress", hvsc_progress);
+
+    g_signal_connect(hvsc_waveform, "draw",
+                     G_CALLBACK(hvsc_waveform_draw), NULL);
+
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_waveform,
+                       FALSE, FALSE, 0);
+
+    /* Retain the progress object as our numeric progress state,
+       but hide its ordinary GTK visual representation. */
+    gtk_widget_set_no_show_all(hvsc_progress, TRUE);
+    gtk_widget_hide(hvsc_progress);
+
+    GtkWidget *hvsc_status =
+        gtk_label_new("Ready to download or select an existing collection.");
+    gtk_label_set_xalign(GTK_LABEL(hvsc_status), 0);
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_status,
+                       FALSE, FALSE, 0);
+    GtkWidget *hvsc_auto_button =
+        gtk_button_new_with_label("Download & Install HVSC");
+
+    gtk_box_pack_start(GTK_BOX(hvsc_buttons),
+                       hvsc_auto_button, FALSE, FALSE, 0);
+
+    HvscUI *hvsc_ui = g_new0(HvscUI, 1);
+    hvsc_ui->button = hvsc_auto_button;
+    hvsc_ui->progress = hvsc_progress;
+    hvsc_ui->waveform = hvsc_waveform;
+    hvsc_ui->status = hvsc_status;
+    hvsc_ui->collection_folder = hvsc_folder;
+
+    GtkWidget **hvsc_data = g_new0(GtkWidget *, 2);
+    hvsc_data[0] = hvsc_install_folder;
+    hvsc_data[1] = (GtkWidget *)hvsc_ui;
+
+    g_signal_connect(hvsc_auto_button, "clicked",
+                     G_CALLBACK(on_hvsc_download_clicked),
+                     hvsc_data);
+
+
+    gtk_notebook_append_page(
+        GTK_NOTEBOOK(notebook), hvsc_page,
+        gtk_label_new("HVSC"));
+
     /* About page */
     GtkWidget *about_page =
         gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
@@ -2265,13 +2883,22 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_box_pack_start(GTK_BOX(about_page), about_icon,
                        FALSE, FALSE, 0);
 
-    GtkWidget *about_title = gtk_label_new("XMP Module Player 0.2.0");
+    GtkWidget *about_title = gtk_label_new("XMP Module Player 1.0");
     gtk_widget_set_name(about_title, "about-title");
     gtk_box_pack_start(GTK_BOX(about_page), about_title,
                        FALSE, FALSE, 0);
 
     GtkWidget *about_description = gtk_label_new(
-        "A native Linux music player built with GTK3 and SDL2.\n"       "Plays tracker modules with libxmp and regular audio files with FFmpeg,\n"       "including MP3, WAV, M4A/AAC, Ogg Vorbis, Opus, and FLAC.");
+        "A native Linux music player built with GTK3 and SDL2.\n"
+        "\n"
+        "Tracker modules powered by libxmp\n"
+        "Commodore 64 SID music powered by libsidplayfp\n"
+        "Digital audio powered by FFmpeg\n"
+        "MP3, WAV, M4A/AAC, Ogg Vorbis, Opus, FLAC and more\n"
+        "\n"
+        "High Voltage SID Collection (HVSC) browsing\n"
+        "and integrated collection downloader.");
+    gtk_widget_set_name(about_description, "about-description");
     gtk_label_set_line_wrap(GTK_LABEL(about_description), TRUE);
     gtk_label_set_justify(GTK_LABEL(about_description), GTK_JUSTIFY_CENTER);
     gtk_widget_set_size_request(about_description, 420, -1);
@@ -2289,8 +2916,11 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     g_timeout_add(33, update_display, NULL);
 
-    if (argc > 1)
+    if (argc > 1) {
         open_module(argv[1]);
+        if (!module_loaded && !open_sid(argv[1]))
+            open_ffmpeg_audio(argv[1]);
+    }
 
     gtk_widget_show_all(window);
     gtk_main();
