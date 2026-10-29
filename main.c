@@ -3566,7 +3566,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_box_pack_start(GTK_BOX(about_page), about_icon,
                        FALSE, FALSE, 0);
 
-    GtkWidget *about_title = gtk_label_new("XMP Module Player 1.0");
+    GtkWidget *about_title = gtk_label_new("XMP Module Player 1.1");
     gtk_widget_set_name(about_title, "about-title");
     gtk_box_pack_start(GTK_BOX(about_page), about_title,
                        FALSE, FALSE, 0);
