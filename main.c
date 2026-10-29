@@ -1,4 +1,6 @@
 #include <gtk/gtk.h>
+#include <gio/gio.h>
+#include <glib/gstdio.h>
 #include <SDL.h>
 #include <xmp.h>
 #include <stdio.h>
@@ -8,6 +10,9 @@
 #include "ffmpeg_audio.h"
 #include "sid_audio.h"
 #include "hvsc_download.h"
+#ifdef ENABLE_ZXTUNE_NATIVE
+#include "zx_audio.h"
+#endif
 
 #define AUDIO_RATE 44100
 #define SCOPE_ROW_HEIGHT 76
@@ -17,7 +22,8 @@ typedef enum {
     PLAYBACK_NONE,
     PLAYBACK_MODULE,
     PLAYBACK_FFMPEG,
-    PLAYBACK_SID
+    PLAYBACK_SID,
+    PLAYBACK_ZX
 } PlaybackMode;
 
 static PlaybackMode playback_mode = PLAYBACK_NONE;
@@ -30,6 +36,23 @@ static int stopped = 0;
 static int audio_ended = 0;
 static int updating_seek = 0;
 static int master_volume = 100;
+
+/* ZX tunes are converted by zxtune123 and played through the existing
+ * FFmpeg / SDL pipeline. No additional audio device or decoder thread. */
+typedef struct {
+    GSubprocess *process;
+    char *directory;
+    char *wav_path;
+    char *source_path;
+    unsigned generation;
+    int autoplay;
+} ZxConversion;
+static ZxConversion *zx_pending;
+static unsigned zx_generation;
+static char *zx_active_directory;
+static char *zx_active_wav;
+static char *zx_active_source;
+static int zx_autoplay_request;
 
 static GtkWidget *window;
 static GtkWidget *title_label;
@@ -65,6 +88,9 @@ static SDL_Thread *decoder_thread;
 static SDL_atomic_t decoder_stop;
 static FfmpegAudio *ffmpeg_audio;
 static SidAudio *sid_audio;
+#ifdef ENABLE_ZXTUNE_NATIVE
+static ZxAudio *zx_audio;
+#endif
 static SDL_atomic_t ffmpeg_decode_finished;
 static SDL_atomic_t ffmpeg_decode_error;
 static int64_t ffmpeg_position_frames;
@@ -90,7 +116,14 @@ static int decoder_thread_fn(void *unused)
             SDL_AtomicSet(&ffmpeg_seek_requested, 0);
             SDL_UnlockAudioDevice(audio_device);
 
-            if (ffmpeg_audio_seek(ffmpeg_audio, target_ms) < 0) {
+            int seek_result;
+#ifdef ENABLE_ZXTUNE_NATIVE
+            if (zx_audio)
+                seek_result = zx_audio_seek(zx_audio, target_ms);
+            else
+#endif
+                seek_result = ffmpeg_audio_seek(ffmpeg_audio, target_ms);
+            if (seek_result < 0) {
                 SDL_AtomicSet(&ffmpeg_decode_error, 1);
                 SDL_AtomicSet(&ffmpeg_decode_finished, 1);
                 break;
@@ -122,7 +155,13 @@ static int decoder_thread_fn(void *unused)
 
         int generation = SDL_AtomicGet(&ffmpeg_seek_generation);
         int request = free_frames > 4096 ? 4096 : (int)free_frames;
-        int got = ffmpeg_audio_read(ffmpeg_audio, chunk, request);
+        int got;
+#ifdef ENABLE_ZXTUNE_NATIVE
+        if (zx_audio)
+            got = zx_audio_read(zx_audio, chunk, request);
+        else
+#endif
+            got = ffmpeg_audio_read(ffmpeg_audio, chunk, request);
 
         if (generation != SDL_AtomicGet(&ffmpeg_seek_generation))
             continue;
@@ -158,7 +197,7 @@ static int decoder_thread_fn(void *unused)
 
 static void stop_ffmpeg_decoder(void)
 {
-    /* Ask the producer to exit, then join it before freeing its decoder. */
+    /* Stop the shared PCM producer (FFmpeg or native ZXTune) before freeing it. */
     SDL_AtomicSet(&decoder_stop, 1);
 
     if (decoder_thread) {
@@ -170,6 +209,12 @@ static void stop_ffmpeg_decoder(void)
         ffmpeg_audio_close(ffmpeg_audio);
         ffmpeg_audio = NULL;
     }
+#ifdef ENABLE_ZXTUNE_NATIVE
+    if (zx_audio) {
+        zx_audio_close(zx_audio);
+        zx_audio = NULL;
+    }
+#endif
 
     if (audio_device) {
         SDL_PauseAudioDevice(audio_device, 1);
@@ -181,8 +226,67 @@ static void stop_ffmpeg_decoder(void)
 
     SDL_AtomicSet(&ffmpeg_decode_finished, 0);
     SDL_AtomicSet(&ffmpeg_decode_error, 0);
+    SDL_AtomicSet(&ffmpeg_seek_requested, 0);
     ffmpeg_position_frames = 0;
     ffmpeg_duration_ms = 0;
+}
+
+static void zx_free_conversion(ZxConversion *job)
+{
+    if (!job)
+        return;
+    if (job->wav_path)
+        g_unlink(job->wav_path);
+    if (job->directory)
+        g_rmdir(job->directory);
+    g_clear_object(&job->process);
+    g_free(job->directory);
+    g_free(job->wav_path);
+    g_free(job->source_path);
+    g_free(job);
+}
+
+static void zx_cancel_pending(void)
+{
+    ++zx_generation;
+    if (zx_pending) {
+        /* The async completion callback owns the cancelled job. */
+        g_subprocess_force_exit(zx_pending->process);
+        if (zx_pending->wav_path)
+            g_unlink(zx_pending->wav_path);
+        if (zx_pending->directory)
+            g_rmdir(zx_pending->directory);
+        zx_pending = NULL;
+    }
+}
+
+static void zx_remove_active(void)
+{
+    /* Always stop_ffmpeg_decoder() before unlinking its backing WAV. */
+    if (zx_active_wav)
+        g_unlink(zx_active_wav);
+    if (zx_active_directory)
+        g_rmdir(zx_active_directory);
+    g_clear_pointer(&zx_active_wav, g_free);
+    g_clear_pointer(&zx_active_directory, g_free);
+    g_clear_pointer(&zx_active_source, g_free);
+}
+
+static gboolean zx_is_music_path(const char *filename)
+{
+    static const char *extensions[] = {
+        ".ay", ".ayc", ".asc", ".chi", ".dmm", ".dst", ".ftc",
+        ".gtr", ".psc", ".psg", ".pt1", ".pt2", ".pt3",
+        ".sqt", ".st1", ".st3", ".stc", ".stp", ".str",
+        ".tfc", ".tfd", ".tfe", ".vtx", ".ym", NULL
+    };
+    const char *extension = strrchr(filename, '.');
+    if (!extension)
+        return FALSE;
+    for (int i = 0; extensions[i]; ++i)
+        if (g_ascii_strcasecmp(extension, extensions[i]) == 0)
+            return TRUE;
+    return FALSE;
 }
 
 static char current_file[4096] = "";
@@ -207,7 +311,8 @@ static void audio_callback(void *userdata, Uint8 *stream, int len)
             audio_ended = 1;
             playing = 0;
         }
-    } else if (playback_mode == PLAYBACK_FFMPEG) {
+    } else if (playback_mode == PLAYBACK_FFMPEG ||
+               playback_mode == PLAYBACK_ZX) {
         int16_t *out = (int16_t *)stream;
         int requested_frames = len / (int)(2 * sizeof(int16_t));
         int copied_frames = 0;
@@ -592,9 +697,182 @@ static int open_ffmpeg_audio(const char *filename)
     return 1;
 }
 
+static void on_play(GtkButton *button, gpointer data);
+
+static void zx_apply_labels(void)
+{
+    if (!zx_active_source)
+        return;
+
+    char *base = g_path_get_basename(zx_active_source);
+    g_strlcpy(current_file, zx_active_source, sizeof(current_file));
+    gtk_label_set_text(GTK_LABEL(title_label), base);
+    gtk_label_set_text(GTK_LABEL(format_label),
+                       playback_mode == PLAYBACK_ZX ?
+                       "ZX Spectrum / AY-YM (ZXTune native)" :
+                       "ZX Spectrum / AY-YM (ZXTune)");
+    gtk_label_set_text(GTK_LABEL(channels_label),
+                       "Stereo mixed output    44100 Hz");
+    gtk_label_set_text(GTK_LABEL(details_label), zx_active_source);
+    populate_sample_browser();
+    if (scope_area) {
+        gtk_widget_set_size_request(scope_area, 620, SCOPE_ROW_HEIGHT);
+        gtk_widget_queue_draw(scope_area);
+    }
+    if (pattern_area)
+        gtk_widget_queue_draw(pattern_area);
+    g_free(base);
+}
+
+static void zx_conversion_complete(GObject *object, GAsyncResult *result,
+                                   gpointer user_data)
+{
+    ZxConversion *job = user_data;
+    GError *error = NULL;
+    gboolean waited = g_subprocess_wait_finish(G_SUBPROCESS(object),
+                                                result, &error);
+    gboolean current = zx_pending == job &&
+                       job->generation == zx_generation;
+    if (current)
+        zx_pending = NULL;
+
+    if (current && waited && g_subprocess_get_successful(job->process) &&
+        g_file_test(job->wav_path, G_FILE_TEST_IS_REGULAR) &&
+        open_ffmpeg_audio(job->wav_path)) {
+        /* FFmpeg owns an open handle; preserve the WAV for Stop/Play restart. */
+        zx_active_directory = g_steal_pointer(&job->directory);
+        zx_active_wav = g_steal_pointer(&job->wav_path);
+        zx_active_source = g_strdup(job->source_path);
+        zx_apply_labels();
+        set_status("ZX Spectrum tune loaded");
+        if (job->autoplay)
+            on_play(NULL, NULL);
+    } else if (current) {
+        gtk_label_set_text(GTK_LABEL(title_label), "Unable to load ZX tune");
+        set_status("ZXTune could not render this tune.");
+    }
+
+    g_clear_error(&error);
+    zx_free_conversion(job);
+}
+
+static void zx_start_conversion(const char *filename)
+{
+    char *executable = g_find_program_in_path("zxtune123");
+    if (!executable) {
+        char *local = g_build_filename(g_get_home_dir(), "zxtune", "bin",
+                                       "linux", "release", "zxtune123", NULL);
+        if (g_file_test(local, G_FILE_TEST_IS_EXECUTABLE))
+            executable = g_strdup(local);
+        g_free(local);
+    }
+    if (!executable) {
+        gtk_label_set_text(GTK_LABEL(title_label), "ZXTune CLI not found");
+        set_status("Build/install zxtune123 to play ZX tunes.");
+        return;
+    }
+
+    GError *error = NULL;
+    ZxConversion *job = g_new0(ZxConversion, 1);
+    job->directory = g_dir_make_tmp("xmp-zx-XXXXXX", &error);
+    if (!job->directory) {
+        set_status(error ? error->message : "Cannot create temporary folder.");
+        g_clear_error(&error);
+        zx_free_conversion(job);
+        g_free(executable);
+        return;
+    }
+
+    job->source_path = g_strdup(filename);
+    job->wav_path = g_build_filename(job->directory, "track.wav", NULL);
+    job->generation = zx_generation;
+    job->autoplay = zx_autoplay_request;
+    char *wav_option = g_strdup_printf("filename=%s", job->wav_path);
+    const char *argv[] = {executable, "--frequency", "44100", "--wav",
+                          wav_option, filename, NULL};
+    job->process = g_subprocess_newv(argv,
+                                    G_SUBPROCESS_FLAGS_STDOUT_SILENCE |
+                                    G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+                                    &error);
+    g_free(wav_option);
+    g_free(executable);
+
+    if (!job->process) {
+        set_status(error ? error->message : "Cannot start zxtune123.");
+        g_clear_error(&error);
+        zx_free_conversion(job);
+        return;
+    }
+
+    zx_pending = job;
+    gtk_label_set_text(GTK_LABEL(title_label), "Rendering ZX Spectrum tune…");
+    gtk_label_set_text(GTK_LABEL(format_label), "ZXTune");
+    gtk_label_set_text(GTK_LABEL(channels_label), "");
+    gtk_label_set_text(GTK_LABEL(time_label), "00:00 / 00:00");
+    set_status("Converting ZX tune to audio…");
+    g_subprocess_wait_async(job->process, NULL, zx_conversion_complete, job);
+}
+
+#ifdef ENABLE_ZXTUNE_NATIVE
+static int open_zx_native(const char *filename)
+{
+    char error_text[512] = "";
+    if (!filename || !*filename || !audio_device)
+        return 0;
+
+    /* Decoder work must finish before we replace the renderer. */
+    stop_ffmpeg_decoder();
+    SDL_PauseAudioDevice(audio_device, 1);
+
+    zx_audio = zx_audio_open(filename, error_text, sizeof(error_text));
+    if (!zx_audio) {
+        set_status(error_text[0] ? error_text :
+                   "Could not open native ZXTune renderer.");
+        return 0;
+    }
+
+    ffmpeg_duration_ms = zx_audio_duration_ms(zx_audio);
+    ffmpeg_position_frames = 0;
+    SDL_AtomicSet(&decoder_stop, 0);
+    SDL_AtomicSet(&ffmpeg_decode_finished, 0);
+    SDL_AtomicSet(&ffmpeg_decode_error, 0);
+    SDL_AtomicSet(&ffmpeg_seek_requested, 0);
+
+    decoder_thread = SDL_CreateThread(decoder_thread_fn,
+                                      "zxtune-native-renderer", NULL);
+    if (!decoder_thread) {
+        set_status("Could not start native ZXTune audio thread.");
+        zx_audio_close(zx_audio);
+        zx_audio = NULL;
+        return 0;
+    }
+
+    playback_mode = PLAYBACK_ZX;
+    playing = 0;
+    stopped = 0;
+    audio_ended = 0;
+    g_free(zx_active_source);
+    zx_active_source = g_strdup(filename);
+
+    gtk_widget_set_sensitive(seek_scale, TRUE);
+    updating_seek = 1;
+    gtk_range_set_range(GTK_RANGE(seek_scale), 0,
+                        ffmpeg_duration_ms > 0 ? ffmpeg_duration_ms : 1);
+    gtk_range_set_value(GTK_RANGE(seek_scale), 0);
+    updating_seek = 0;
+    gtk_label_set_text(GTK_LABEL(time_label), "00:00");
+    zx_apply_labels();
+    update_play_button();
+    set_status("ZX Spectrum tune loaded (native audio)");
+    return 1;
+}
+#endif
+
 static void open_module(const char *filename)
 {
     stop_ffmpeg_decoder();
+    zx_cancel_pending();
+    zx_remove_active();
     SDL_PauseAudioDevice(audio_device, 1);
     SDL_LockAudioDevice(audio_device);
 
@@ -615,6 +893,21 @@ static void open_module(const char *filename)
     if (sid_audio) {
         sid_audio_close(sid_audio);
         sid_audio = NULL;
+    }
+
+    if (zx_is_music_path(filename)) {
+        SDL_UnlockAudioDevice(audio_device);
+        current_file[0] = '\0';
+        update_play_button();
+#ifdef ENABLE_ZXTUNE_NATIVE
+        if (open_zx_native(filename)) {
+            if (zx_autoplay_request)
+                on_play(NULL, NULL);
+            return;
+        }
+#endif
+        zx_start_conversion(filename);
+        return;
     }
 
     int rc = xmp_load_module(ctx, filename);
@@ -1103,7 +1396,10 @@ static void on_open(GtkButton *button, gpointer data)
         "*.mp3", "*.MP3", "*.wav", "*.WAV", "*.m4a", "*.M4A",
         "*.aac", "*.AAC", "*.ogg", "*.OGG", "*.oga", "*.OGA", "*.opus", "*.OPUS",
         "*.flac", "*.FLAC", "*.webm", "*.WEBM", "*.mka", "*.MKA",
-        "*.aiff", "*.aif", "*.wma", "*.mp4", "*.MP4"
+        "*.aiff", "*.aif", "*.wma", "*.mp4", "*.MP4",
+        "*.pt3", "*.PT3", "*.pt2", "*.PT2", "*.ay", "*.AY",
+        "*.vtx", "*.VTX", "*.ym", "*.YM", "*.stc", "*.STC",
+        "*.sqt", "*.SQT", "*.psg", "*.PSG", "*.asc", "*.ASC"
     };
 
     for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
@@ -1122,7 +1418,8 @@ static void on_open(GtkButton *button, gpointer data)
             gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
         if (filename) {
             open_module(filename);
-            if (!module_loaded && !open_sid(filename))
+            if (!zx_is_music_path(filename) && !module_loaded &&
+                !open_sid(filename))
                 open_ffmpeg_audio(filename);
             g_free(filename);
         }
@@ -1136,16 +1433,33 @@ static void on_play(GtkButton *button, gpointer data)
     (void)button;
     (void)data;
 
+    if (playback_mode == PLAYBACK_NONE && zx_pending) {
+        zx_pending->autoplay = 1;
+        set_status("Will play after ZX rendering finishes");
+        return;
+    }
     if (playback_mode == PLAYBACK_NONE)
         return;
 
     if (playback_mode == PLAYBACK_FFMPEG &&
         (stopped || audio_ended || !ffmpeg_audio)) {
         char filename[sizeof(current_file)];
-        g_strlcpy(filename, current_file, sizeof(filename));
+        g_strlcpy(filename, zx_active_wav ? zx_active_wav : current_file,
+                  sizeof(filename));
         if (!filename[0] || !open_ffmpeg_audio(filename))
             return;
+        if (zx_active_wav)
+            zx_apply_labels();
     }
+#ifdef ENABLE_ZXTUNE_NATIVE
+    if (playback_mode == PLAYBACK_ZX &&
+        (stopped || audio_ended || !zx_audio)) {
+        char filename[sizeof(current_file)];
+        g_strlcpy(filename, current_file, sizeof(filename));
+        if (!filename[0] || !open_zx_native(filename))
+            return;
+    }
+#endif
 
     if (playing) {
         SDL_PauseAudioDevice(audio_device, 1);
@@ -1184,6 +1498,12 @@ static void on_play(GtkButton *button, gpointer data)
         playing = 1;
         SDL_PauseAudioDevice(audio_device, 0);
         set_status("Playing");
+    } else if (playback_mode == PLAYBACK_ZX) {
+        stopped = 0;
+        audio_ended = 0;
+        playing = 1;
+        SDL_PauseAudioDevice(audio_device, 0);
+        set_status("Playing ZX Spectrum tune");
     }
 
     update_play_button();
@@ -1194,6 +1514,12 @@ static void on_stop(GtkButton *button, gpointer data)
     (void)button;
     (void)data;
 
+    if (playback_mode == PLAYBACK_NONE && zx_pending) {
+        zx_cancel_pending();
+        gtk_label_set_text(GTK_LABEL(title_label), "No module loaded");
+        set_status("ZX rendering cancelled");
+        return;
+    }
     if (playback_mode == PLAYBACK_NONE)
         return;
 
@@ -1203,7 +1529,8 @@ static void on_stop(GtkButton *button, gpointer data)
         SDL_LockAudioDevice(audio_device);
         xmp_stop_module(ctx);
         SDL_UnlockAudioDevice(audio_device);
-    } else if (playback_mode == PLAYBACK_FFMPEG) {
+    } else if (playback_mode == PLAYBACK_FFMPEG ||
+               playback_mode == PLAYBACK_ZX) {
         stop_ffmpeg_decoder();
     } else if (playback_mode == PLAYBACK_SID && sid_audio) {
         SDL_LockAudioDevice(audio_device);
@@ -1235,6 +1562,26 @@ static void on_previous(GtkButton *button, gpointer data)
         SDL_UnlockAudioDevice(audio_device);
         return;
     }
+    if (zx_active_wav && playback_mode == PLAYBACK_FFMPEG && ffmpeg_audio) {
+        SDL_LockAudioDevice(audio_device);
+        ffmpeg_seek_target_ms = 0;
+        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
+        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
+        audio_ended = 0;
+        SDL_UnlockAudioDevice(audio_device);
+        return;
+    }
+#ifdef ENABLE_ZXTUNE_NATIVE
+    if (playback_mode == PLAYBACK_ZX && zx_audio) {
+        SDL_LockAudioDevice(audio_device);
+        ffmpeg_seek_target_ms = 0;
+        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
+        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
+        audio_ended = 0;
+        SDL_UnlockAudioDevice(audio_device);
+        return;
+    }
+#endif
     if (!module_loaded) return;
 
     SDL_LockAudioDevice(audio_device);
@@ -1258,6 +1605,24 @@ static void on_next(GtkButton *button, gpointer data)
         SDL_UnlockAudioDevice(audio_device);
         return;
     }
+    if (zx_active_wav && playback_mode == PLAYBACK_FFMPEG && ffmpeg_audio) {
+        SDL_LockAudioDevice(audio_device);
+        ffmpeg_seek_target_ms = ffmpeg_duration_ms;
+        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
+        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
+        SDL_UnlockAudioDevice(audio_device);
+        return;
+    }
+#ifdef ENABLE_ZXTUNE_NATIVE
+    if (playback_mode == PLAYBACK_ZX && zx_audio) {
+        SDL_LockAudioDevice(audio_device);
+        ffmpeg_seek_target_ms = ffmpeg_duration_ms;
+        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
+        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
+        SDL_UnlockAudioDevice(audio_device);
+        return;
+    }
+#endif
     if (!module_loaded) return;
 
     SDL_LockAudioDevice(audio_device);
@@ -1280,7 +1645,11 @@ static void on_seek(GtkRange *range, gpointer data)
         audio_ended = 0;
         stopped = 0;
         SDL_UnlockAudioDevice(audio_device);
-    } else if (playback_mode == PLAYBACK_FFMPEG && ffmpeg_audio) {
+    } else if ((playback_mode == PLAYBACK_FFMPEG && ffmpeg_audio)
+#ifdef ENABLE_ZXTUNE_NATIVE
+               || (playback_mode == PLAYBACK_ZX && zx_audio)
+#endif
+               ) {
         SDL_LockAudioDevice(audio_device);
         ffmpeg_seek_target_ms = ms;
         SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
@@ -1376,7 +1745,8 @@ static gboolean draw_visualizer(GtkWidget *widget, cairo_t *cr,
 static void update_visualizer_spectrum(void)
 {
     /* Let the bars and peak markers settle while playback is stopped. */
-    if ((playback_mode != PLAYBACK_MODULE &&
+    if ((playback_mode != PLAYBACK_ZX &&
+         playback_mode != PLAYBACK_MODULE &&
          playback_mode != PLAYBACK_FFMPEG &&
          playback_mode != PLAYBACK_SID) ||
         !playing || audio_ended) {
@@ -1484,6 +1854,37 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
 
     cairo_set_source_rgb(cr, 0.055, 0.065, 0.080);
     cairo_paint(cr);
+
+    if (((zx_active_wav && playback_mode == PLAYBACK_FFMPEG) ||
+         playback_mode == PLAYBACK_ZX) &&
+        width >= 80 && height >= 20) {
+        /* Both ZX backends expose mixed output. Do not represent this
+         * waveform as separate AY chip channels. */
+        int16_t waveform[2048];
+        SDL_LockAudioDevice(audio_device);
+        unsigned int start = (viz_write_pos + VIZ_RING_SIZE - 2048) %
+                             VIZ_RING_SIZE;
+        for (unsigned i = 0; i < 2048; ++i)
+            waveform[i] = viz_ring[(start + i) % VIZ_RING_SIZE];
+        SDL_UnlockAudioDevice(audio_device);
+
+        cairo_set_source_rgb(cr, 0.73, 0.78, 0.84);
+        cairo_move_to(cr, 12, 17);
+        cairo_show_text(cr, "ZX Spectrum - mixed audio waveform");
+        cairo_set_source_rgb(cr, 0.35, 0.90, 0.65);
+        cairo_set_line_width(cr, 1.0);
+        for (int x = 0; x < width; ++x) {
+            int idx = (int)((int64_t)x * 2048 / width);
+            double y = height * 0.56 - waveform[idx] / 32768.0 *
+                       (height * 0.35);
+            if (x == 0)
+                cairo_move_to(cr, x, y);
+            else
+                cairo_line_to(cr, x, y);
+        }
+        cairo_stroke(cr);
+        return FALSE;
+    }
 
     if (!module_loaded || !player_started || width < 80 || height < 20)
         return FALSE;
@@ -1719,7 +2120,12 @@ static void play_playlist_file(const char *filename)
     if (!filename || !*filename)
         return;
 
+    zx_autoplay_request = 1;
     open_module(filename);
+    zx_autoplay_request = 0;
+
+    if (zx_is_music_path(filename))
+        return;
 
     if (module_loaded) {
         on_play(NULL, NULL);
@@ -1894,7 +2300,10 @@ static void on_playlist_add(GtkButton *button, gpointer data)
         "*.mp3", "*.MP3", "*.wav", "*.WAV", "*.m4a", "*.M4A",
         "*.aac", "*.AAC", "*.ogg", "*.OGG", "*.oga", "*.OGA", "*.opus", "*.OPUS",
         "*.flac", "*.FLAC", "*.webm", "*.WEBM", "*.mka", "*.MKA",
-        "*.aiff", "*.aif", "*.wma", "*.mp4", "*.MP4"
+        "*.aiff", "*.aif", "*.wma", "*.mp4", "*.MP4",
+        "*.pt3", "*.PT3", "*.pt2", "*.PT2", "*.ay", "*.AY",
+        "*.vtx", "*.VTX", "*.ym", "*.YM", "*.stc", "*.STC",
+        "*.sqt", "*.SQT", "*.psg", "*.PSG", "*.asc", "*.ASC"
     };
 
     for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
@@ -1999,7 +2408,8 @@ static gboolean playlist_advance(void)
             if (next_file) {
                 play_playlist_file(next_file);
                 g_free(next_file);
-                return playback_mode != PLAYBACK_NONE && playing;
+                return (playback_mode != PLAYBACK_NONE && playing) ||
+                       zx_pending != NULL;
             }
             return FALSE;
         }
@@ -2033,7 +2443,9 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
     if (!module_loaded) {
         cairo_set_source_rgb(cr, 0.70, 0.73, 0.78);
         cairo_move_to(cr, 12, 24);
-        cairo_show_text(cr, "Load a module to view its pattern.");
+        cairo_show_text(cr, zx_active_source ?
+                        "ZX tunes do not expose XMP pattern data." :
+                        "Load a module to view its pattern.");
         return FALSE;
     }
 
@@ -2215,7 +2627,8 @@ static gboolean update_display(gpointer data)
     int current;
     int total;
 
-    if (playback_mode == PLAYBACK_FFMPEG) {
+    if (playback_mode == PLAYBACK_FFMPEG ||
+        playback_mode == PLAYBACK_ZX) {
         SDL_LockAudioDevice(audio_device);
         int64_t position_frames = ffmpeg_position_frames;
         int64_t duration_ms = ffmpeg_duration_ms;
@@ -2241,7 +2654,8 @@ static gboolean update_display(gpointer data)
         gtk_label_set_text(GTK_LABEL(time_label), time_text);
 
         if (is_playing)
-            set_status("Playing audio file");
+            set_status(zx_active_source ? "Playing ZX Spectrum tune" :
+                       "Playing audio file");
         else if (ended)
             set_status("Playback finished");
     } else if (playback_mode == PLAYBACK_SID) {
@@ -2362,6 +2776,8 @@ static void on_destroy(GtkWidget *widget, gpointer data)
     (void)data;
 
     stop_ffmpeg_decoder();
+    zx_cancel_pending();
+    zx_remove_active();
 
     if (audio_device) {
         SDL_PauseAudioDevice(audio_device, 1);
@@ -2918,7 +3334,8 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     if (argc > 1) {
         open_module(argv[1]);
-        if (!module_loaded && !open_sid(argv[1]))
+        if (!zx_is_music_path(argv[1]) && !module_loaded &&
+            !open_sid(argv[1]))
             open_ffmpeg_audio(argv[1]);
     }
 
