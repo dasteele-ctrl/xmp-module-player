@@ -22,7 +22,7 @@ XMP Module Player brings classic tracker music and regular audio playback to the
 - 🌊 **Channel scopes** for visualizing audio activity
 - 🧩 **Pattern viewer** for tracker data
 - 🔊 **Sample browser** with waveform visualization, sample details, loop information, and module comments
-- 📂 Offline WAV export: Render supported music to WAV without waiting through real-time playback. Export includes a progress dialog, cancellation, and confirmation before replacing an existing file.
+- 📂 Offline WAV export: Render supported music to WAV without waiting through real-time playback.
 - 🖥️ **Native GTK3 interface** with SDL2 audio output
 
 ## Download
