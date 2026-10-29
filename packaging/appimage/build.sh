@@ -50,7 +50,17 @@ fi
         --executable "$project_dir/xmp-zx-helper" \
         --desktop-file "$script_dir/xmp-module-player.desktop" \
         --icon-file "$project_dir/icons/xmp.png" \
-        --plugin gtk \
+        --plugin gtk
+)
+
+# Stage the notices after linuxdeploy has collected libraries, but before
+# producing the compressed AppImage.
+bash "$script_dir/bundle-licenses.sh" "$appdir" "$project_dir"
+
+(
+    cd -- "$dist_dir"
+    LDAI_OUTPUT="$output_name" "$linuxdeploy" \
+        --appdir "$appdir" \
         --output appimage
 )
 
