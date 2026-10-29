@@ -1,10 +1,19 @@
 #include "sid_audio.h"
 
+#ifdef XMP_USE_ZXTUNE_SID_HEADERS
+/* Match the ABI of ZXTune's statically linked libsidplayfp. */
+#include "sidplayfp/SidConfig.h"
+#include "sidplayfp/SidTune.h"
+#include "sidplayfp/SidTuneInfo.h"
+#include "sidplayfp/sidplayfp.h"
+#include "builders/residfp-builder/residfp.h"
+#else
 #include <sidplayfp/SidConfig.h>
 #include <sidplayfp/SidTune.h>
 #include <sidplayfp/SidTuneInfo.h>
 #include <sidplayfp/sidplayfp.h>
 #include <sidplayfp/builders/residfp.h>
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -75,11 +84,14 @@ extern "C" SidAudio *sid_audio_open(const char *filename,
     audio->author = tune_text(info, 1);
     audio->release = tune_text(info, 2);
 
+#ifndef XMP_USE_ZXTUNE_SID_HEADERS
+    /* Preserve the established system-libsidplayfp initialization path. */
     if (!audio->player.load(audio->tune.get())) {
         copy_error(error_text, error_text_size,
                    audio->player.error());
         return nullptr;
     }
+#endif
 
     if (audio->builder.create(1) == 0) {
         copy_error(error_text, error_text_size,
@@ -98,6 +110,15 @@ extern "C" SidAudio *sid_audio_open(const char *filename,
                    audio->player.error());
         return nullptr;
     }
+
+#ifdef XMP_USE_ZXTUNE_SID_HEADERS
+    /* ZXTune's bundled SID library expects config/builder before load. */
+    if (!audio->player.load(audio->tune.get())) {
+        copy_error(error_text, error_text_size,
+                   audio->player.error());
+        return nullptr;
+    }
+#endif
 
     copy_error(error_text, error_text_size, "");
     return audio.release();

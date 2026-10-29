@@ -10,6 +10,9 @@
 #include "ffmpeg_audio.h"
 #include "sid_audio.h"
 #include "hvsc_download.h"
+#ifdef ENABLE_WAV_EXPORT
+#include "export_wav.h"
+#endif
 #ifdef ENABLE_ZXTUNE_NATIVE
 #include "zx_audio.h"
 #endif
@@ -103,6 +106,23 @@ static double viz_levels[VIZ_BANDS];
 static double viz_peaks[VIZ_BANDS];
 static double viz_spectrum[VIZ_BANDS];
 static int selected_sample = 0;
+#ifdef ENABLE_WAV_EXPORT
+typedef struct {
+    ExportWavRequest request;
+    gchar *source;
+    gchar *destination;
+    GtkWidget *dialog;
+    GtkWidget *progress_bar;
+    GThread *thread;
+    guint progress_timer;
+    volatile gint progress;
+    volatile gint cancel;
+    volatile gint finished;
+    int succeeded;
+    char error[512];
+} WavExportTask;
+static WavExportTask *active_wav_export;
+#endif
 static int decoder_thread_fn(void *unused)
 {
     (void)unused;
@@ -1427,6 +1447,236 @@ static void on_open(GtkButton *button, gpointer data)
 
     gtk_widget_destroy(dialog);
 }
+
+#ifdef ENABLE_WAV_EXPORT
+static void free_wav_export_task(WavExportTask *task)
+{
+    if (!task) return;
+    g_free(task->source);
+    g_free(task->destination);
+    g_free(task);
+}
+
+static gpointer wav_export_worker(gpointer data)
+{
+    WavExportTask *task = data;
+    task->succeeded = export_wav_render(&task->request, &task->progress,
+                                       &task->cancel,
+                                       task->error, sizeof(task->error));
+    g_atomic_int_set(&task->finished, 1);
+    return NULL;
+}
+
+static void on_wav_export_response(GtkDialog *dialog, gint response,
+                                   gpointer data)
+{
+    WavExportTask *task = data;
+    if (response != GTK_RESPONSE_CANCEL &&
+        response != GTK_RESPONSE_DELETE_EVENT)
+        return;
+
+    g_atomic_int_set(&task->cancel, 1);
+    gtk_dialog_set_response_sensitive(dialog, GTK_RESPONSE_CANCEL, FALSE);
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(task->progress_bar),
+                              "Cancelling export…");
+}
+
+static gboolean on_wav_export_delete(GtkWidget *dialog, GdkEvent *event,
+                                     gpointer data)
+{
+    (void)dialog;
+    (void)event;
+    WavExportTask *task = data;
+    g_atomic_int_set(&task->cancel, 1);
+    return TRUE; /* Keep the dialog alive until the worker has exited. */
+}
+
+static gboolean update_wav_export_dialog(gpointer data)
+{
+    WavExportTask *task = data;
+
+    if (g_atomic_int_get(&task->finished)) {
+        g_thread_join(task->thread);
+        task->progress_timer = 0;
+        active_wav_export = NULL;
+        gtk_widget_destroy(task->dialog);
+
+        if (task->succeeded) {
+            set_status("WAV export completed successfully");
+            GtkWidget *message = gtk_message_dialog_new(
+                GTK_WINDOW(window), GTK_DIALOG_MODAL,
+                GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE,
+                "WAV exported successfully:\n%s", task->destination);
+            gtk_dialog_run(GTK_DIALOG(message));
+            gtk_widget_destroy(message);
+        } else if (!g_atomic_int_get(&task->cancel)) {
+            set_status(task->error[0] ? task->error : "WAV export failed");
+            GtkWidget *message = gtk_message_dialog_new(
+                GTK_WINDOW(window), GTK_DIALOG_MODAL,
+                GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+                "WAV export failed:\n%s", task->error);
+            gtk_dialog_run(GTK_DIALOG(message));
+            gtk_widget_destroy(message);
+        } else {
+            set_status("WAV export cancelled");
+        }
+
+        free_wav_export_task(task);
+        return G_SOURCE_REMOVE;
+    }
+
+    int progress = g_atomic_int_get(&task->progress);
+    if (progress < 0) {
+        gtk_progress_bar_pulse(GTK_PROGRESS_BAR(task->progress_bar));
+    } else {
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(task->progress_bar),
+                                      progress / 100.0);
+        if (!g_atomic_int_get(&task->cancel)) {
+            char message[64];
+            g_snprintf(message, sizeof(message), "Rendering… %d%%", progress);
+            gtk_progress_bar_set_text(GTK_PROGRESS_BAR(task->progress_bar),
+                                      message);
+        }
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void on_export_wav(GtkButton *button, gpointer data)
+{
+    (void)button;
+    (void)data;
+
+    if (active_wav_export) {
+        set_status("A WAV export is already running");
+        return;
+    }
+    if (playback_mode == PLAYBACK_NONE || !current_file[0]) {
+        set_status("Open a music file before exporting it");
+        return;
+    }
+
+    ExportWavFormat format = EXPORT_WAV_FFMPEG;
+    unsigned int sid_subtune = 0;
+    const char *source = current_file;
+    if (playback_mode == PLAYBACK_MODULE) {
+        format = EXPORT_WAV_XMP;
+    } else if (playback_mode == PLAYBACK_SID) {
+        format = EXPORT_WAV_SID;
+        SDL_LockAudioDevice(audio_device);
+        if (sid_audio) sid_subtune = sid_audio_current_song(sid_audio);
+        SDL_UnlockAudioDevice(audio_device);
+    } else if (playback_mode == PLAYBACK_ZX ||
+               (playback_mode == PLAYBACK_FFMPEG && zx_active_wav)) {
+        format = EXPORT_WAV_ZXTUNE;
+        if (zx_active_source) source = zx_active_source;
+    }
+
+    GtkWidget *chooser = gtk_file_chooser_dialog_new(
+        "Export audio to WAV", GTK_WINDOW(window),
+        GTK_FILE_CHOOSER_ACTION_SAVE,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Export", GTK_RESPONSE_ACCEPT, NULL);
+
+    gchar *base = g_path_get_basename(source);
+    char *extension = strrchr(base, '.');
+    if (extension) *extension = '\0';
+    gchar *suggested = g_strconcat(base, ".wav", NULL);
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(chooser), suggested);
+    g_free(suggested);
+    g_free(base);
+
+    gchar *destination = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(chooser)) == GTK_RESPONSE_ACCEPT)
+        destination = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+    gtk_widget_destroy(chooser);
+    if (!destination) return;
+
+    const char *dot = strrchr(destination, '.');
+    if (!dot || g_ascii_strcasecmp(dot, ".wav") != 0) {
+        gchar *with_extension = g_strconcat(destination, ".wav", NULL);
+        g_free(destination);
+        destination = with_extension;
+    }
+
+    /* Confirm the final path, including any appended .wav extension. The
+     * file chooser may only have checked the name without that extension. */
+    if (g_file_test(destination, G_FILE_TEST_EXISTS) ||
+        g_file_test(destination, G_FILE_TEST_IS_SYMLINK)) {
+        GtkWidget *replace_dialog = gtk_message_dialog_new(
+            GTK_WINDOW(window), GTK_DIALOG_MODAL,
+            GTK_MESSAGE_WARNING, GTK_BUTTONS_NONE,
+            "This file already exists:\n%s\n\nReplace it with the exported WAV?",
+            destination);
+        gtk_dialog_add_buttons(GTK_DIALOG(replace_dialog),
+                               "_Cancel", GTK_RESPONSE_CANCEL,
+                               "_Replace", GTK_RESPONSE_ACCEPT, NULL);
+        gboolean replace = gtk_dialog_run(GTK_DIALOG(replace_dialog)) ==
+                           GTK_RESPONSE_ACCEPT;
+        gtk_widget_destroy(replace_dialog);
+        if (!replace) {
+            g_free(destination);
+            return;
+        }
+    }
+
+    unsigned int sid_seconds = 180;
+    if (format == EXPORT_WAV_SID) {
+        GtkWidget *duration_dialog = gtk_dialog_new_with_buttons(
+            "SID export duration", GTK_WINDOW(window), GTK_DIALOG_MODAL,
+            "_Cancel", GTK_RESPONSE_CANCEL,
+            "_Continue", GTK_RESPONSE_ACCEPT, NULL);
+        GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(duration_dialog));
+        GtkWidget *description = gtk_label_new(
+            "SID files do not contain a fixed duration.\n"
+            "How many seconds should be exported?");
+        GtkWidget *seconds = gtk_spin_button_new_with_range(1, 3600, 5);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(seconds), 180);
+        gtk_box_pack_start(GTK_BOX(area), description, FALSE, FALSE, 8);
+        gtk_box_pack_start(GTK_BOX(area), seconds, FALSE, FALSE, 8);
+        gtk_widget_show_all(duration_dialog);
+        gboolean accepted = gtk_dialog_run(GTK_DIALOG(duration_dialog)) ==
+                            GTK_RESPONSE_ACCEPT;
+        if (accepted)
+            sid_seconds = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(seconds));
+        gtk_widget_destroy(duration_dialog);
+        if (!accepted) {
+            g_free(destination);
+            return;
+        }
+    }
+
+    WavExportTask *task = g_new0(WavExportTask, 1);
+    task->source = g_strdup(source);
+    task->destination = destination;
+    task->request.source = task->source;
+    task->request.destination = task->destination;
+    task->request.format = format;
+    task->request.sid_seconds = sid_seconds;
+    task->request.sid_subtune = sid_subtune;
+    task->dialog = gtk_dialog_new_with_buttons(
+        "Exporting WAV", GTK_WINDOW(window), GTK_DIALOG_MODAL,
+        "_Cancel Export", GTK_RESPONSE_CANCEL, NULL);
+    gtk_window_set_default_size(GTK_WINDOW(task->dialog), 420, -1);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(task->dialog));
+    GtkWidget *description = gtk_label_new(
+        "Rendering the music as fast as possible, without playback.");
+    gtk_box_pack_start(GTK_BOX(area), description, FALSE, FALSE, 8);
+    task->progress_bar = gtk_progress_bar_new();
+    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(task->progress_bar), TRUE);
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(task->progress_bar), "Starting…");
+    gtk_box_pack_start(GTK_BOX(area), task->progress_bar, FALSE, FALSE, 8);
+    g_signal_connect(task->dialog, "response",
+                     G_CALLBACK(on_wav_export_response), task);
+    g_signal_connect(task->dialog, "delete-event",
+                     G_CALLBACK(on_wav_export_delete), task);
+
+    active_wav_export = task;
+    task->thread = g_thread_new("wav-export", wav_export_worker, task);
+    task->progress_timer = g_timeout_add(100, update_wav_export_dialog, task);
+    gtk_widget_show_all(task->dialog);
+    set_status("Exporting audio to WAV in the background");
+}
+#endif
 
 static void on_play(GtkButton *button, gpointer data)
 {
@@ -2775,6 +3025,19 @@ static void on_destroy(GtkWidget *widget, gpointer data)
     (void)widget;
     (void)data;
 
+#ifdef ENABLE_WAV_EXPORT
+    if (active_wav_export) {
+        WavExportTask *task = active_wav_export;
+        g_atomic_int_set(&task->cancel, 1);
+        if (task->progress_timer)
+            g_source_remove(task->progress_timer);
+        g_thread_join(task->thread);
+        gtk_widget_destroy(task->dialog);
+        active_wav_export = NULL;
+        free_wav_export_task(task);
+    }
+#endif
+
     stop_ffmpeg_decoder();
     zx_cancel_pending();
     zx_remove_active();
@@ -2902,6 +3165,10 @@ int main(int argc, char **argv)
 
     gtk_box_pack_start(GTK_BOX(controls),
         make_button("Open File…", G_CALLBACK(on_open)), FALSE, FALSE, 0);
+#ifdef ENABLE_WAV_EXPORT
+    gtk_box_pack_start(GTK_BOX(controls),
+        make_button("Export WAV…", G_CALLBACK(on_export_wav)), FALSE, FALSE, 0);
+#endif
     gtk_box_pack_start(GTK_BOX(controls),
         make_button("|◀", G_CALLBACK(on_previous)), FALSE, FALSE, 0);
 
