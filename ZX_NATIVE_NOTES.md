@@ -1,9 +1,9 @@
-# Experimental native ZX Spectrum playback
+# Native ZX Spectrum playback
 
-The normal `xmp-linux` executable remains unchanged: it uses the established
-`zxtune123` to render temporary WAV files. The optional `xmp-zx-native` build
-uses ZXTune's C++ renderer directly, generating stereo PCM into the existing
-SDL2 audio ring without launching ZXTune or writing temporary files.
+The standard `xmp-linux` executable now uses ZXTune's C++ renderer directly,
+generating stereo PCM into the existing SDL2 audio ring without launching
+ZXTune or writing temporary files for files it can decode. The older
+`zxtune123` -> WAV implementation remains available as a fallback.
 
 ## Build
 
@@ -16,14 +16,15 @@ make platform=linux system.zlib=1 -C ~/zxtune/apps/zxtune123 -j4
 Then, inside your XMP Module Player source directory:
 
 ```bash
-make -j4 xmp-zx-native
-./xmp-zx-native
+make -j4
+./xmp-linux
 ```
 
 If ZXTune lives elsewhere, pass `ZX_ROOT=/path/to/zxtune` to `make`.
-`xmp-zx-native` is a separate executable; neither the original binary nor its
-source has to be deleted or replaced. The native build links against the static
-libraries already built by ZXTune, so it may be larger than `xmp-linux`.
+`make -j4 xmp-zx-native` also builds the native version under its earlier
+name. Use `make -j4 xmp-zx-wav` to build the original WAV-based player
+separately. The native executable links the static libraries built by ZXTune,
+so it may be larger than the legacy executable.
 
 ## Test
 
@@ -32,8 +33,10 @@ Open a known-good `.pt3` file, preferably the same one used in the native
 playlist advancement, switching to MP3/SID/XMP, and closing the window.
 
 If the native renderer fails to open a ZX tune, the player tries its original
-`zxtune123` -> WAV workflow. The XMP tracker/SID/FFmpeg paths are otherwise
-unchanged.
+`zxtune123` -> WAV workflow, provided that CLI is available. The XMP
+tracker/SID/FFmpeg paths are otherwise unchanged. ZX formats do not display
+tracker patterns in the libxmp pattern viewer.
 
-This is a Linux proof of concept, not a packaged AppImage release. The helper
-library ABI and AppImage bundling need additional work before general release.
+Native ZX playback is working in development source builds, but its static
+library dependencies and AppImage packaging still need verification before
+a general release.
