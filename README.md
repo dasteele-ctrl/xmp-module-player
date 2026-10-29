@@ -40,37 +40,46 @@ Download the latest Linux AppImage from the project's **[Releases](../../release
 
 The AppImage bundles many of its required libraries. Compatibility with Linux distributions other than the development system has not yet been fully tested.
 
-### ZX Spectrum playback (development source builds)
+### ZX Spectrum playback
 
-The standard `xmp-linux` build uses ZXTune's native C++ renderer for ZX
-Spectrum and related chiptune formats. It sends decoded stereo PCM directly
-to the SDL2 audio engine without spawning a separate player or creating a
-temporary WAV file. Seeking, volume, spectrum, waveform, and playlist controls
-work through the normal player interface.
+XMP Module Player 1.1 includes native ZX Spectrum playback powered
+by ZXTune.
 
-Build ZXTune's static libraries first (the `zxtune123` target builds them):
+The Linux AppImage bundles the ZXTune playback engine and its required
+libraries. Users do not need to install ZXTune, compile libraries, or
+download additional components.
+
+For compatibility, ZXTune runs in a separate helper process called
+`xmp-zx-helper`. Decoded PCM audio is streamed directly to the main
+player's SDL2 audio engine without creating temporary WAV files.
+
+Supported formats include `.pt3`, `.pt2`, `.ay`, `.ym`, `.vtx`, `.stc`,
+`.sqt`, `.psg`, and other formats recognized by ZXTune.
+
+Volume, seeking, spectrum visualization, waveform display, and playlist
+controls are integrated into the player.
+
+Tracker pattern visualization remains available for supported libxmp
+formats, but is not currently available for ZX Spectrum files.
+
+#### Building from source
+
+Developers compiling XMP Module Player from source must first build
+ZXTune's static libraries:
 
 ```bash
 make platform=linux system.zlib=1 -C ~/zxtune/apps/zxtune123 -j4
 ```
 
-Then build and launch the native player:
+Then compile XMP Module Player:
 
 ```bash
 make -j4
 ./xmp-linux
 ```
 
-The integration recognizes `.pt3`, `.pt2`, `.ay`, `.ym`, `.vtx`, `.stc`,
-`.sqt`, `.psg`, and other supported formats. If native decoding cannot open
-a track, the player may fall back to `zxtune123` and a temporary WAV; it
-looks for that executable in `PATH` or
-`~/zxtune/bin/linux/release/zxtune123`.
-
-To build the older WAV-based executable separately, use
-`make -j4 xmp-zx-wav`. Tracker pattern display remains specific to formats
-supported by the libxmp pattern viewer; it is not provided for ZX files.
-Existing AppImage releases may not include the native ZXTune backend yet.
+The optional legacy `zxtune123` WAV-based fallback is not included
+in the distributed AppImage.
 
 ## Built With
 
@@ -78,11 +87,11 @@ Existing AppImage releases may not include the native ZXTune backend yet.
 - [SDL 2](https://www.libsdl.org/) — audio output
 - [libxmp](https://github.com/libxmp/libxmp) — tracker module playback
 - [FFmpeg](https://ffmpeg.org/) — decoding regular audio formats
-- [ZXTune](https://github.com/vitamin-caig/zxtune) — native ZX Spectrum/chiptune playback (source builds)
+- [ZXTune](https://github.com/vitamin-caig/zxtune) — native ZX Spectrum and chiptune playback
 
 ## Project Status
 
-**Early development — version 0.2.0**
+**Current version: 1.1**
 
 This project is actively being developed. Features and compatibility may change as development continues.
 
