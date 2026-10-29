@@ -6,16 +6,19 @@ LDLIBS += $(shell pkg-config --libs gtk+-3.0 sdl2 libxmp libavformat libavcodec 
 
 all: xmp-linux
 
-# Experimental native ZXTune build. The normal xmp-linux target remains
-# unchanged and keeps the proven zxtune123 -> WAV fallback.
-# Requires the static libraries built by ~/zxtune/apps/zxtune123.
+# Native ZX Spectrum playback is the default for xmp-linux. The original
+# zxtune123 -> temporary WAV implementation remains available as xmp-zx-wav.
+# Native linking requires the static libraries built by ZXTune.
 ZX_ROOT ?= $(HOME)/zxtune
 ZX_INCLUDE = -I$(ZX_ROOT) -I$(ZX_ROOT)/include -I$(ZX_ROOT)/src
 ZX_LIBRARIES = $(wildcard $(ZX_ROOT)/lib/linux/release/*.a)
+ZX_NATIVE_OBJECTS = main_zx_native.o zx_audio.o xmp-resources.o ffmpeg_audio.o sid_audio.o hvsc_download.o
+ZX_WAV_OBJECTS = main.o xmp-resources.o ffmpeg_audio.o sid_audio.o hvsc_download.o
 
-xmp-zx-native: main_zx_native.o zx_audio.o xmp-resources.o ffmpeg_audio.o sid_audio.o hvsc_download.o
+# Keep xmp-zx-native as a compatibility build name for the native backend.
+xmp-linux xmp-zx-native: $(ZX_NATIVE_OBJECTS) Makefile
 	@test -n "$(ZX_LIBRARIES)" || { echo "Build ~/zxtune/apps/zxtune123 first"; exit 1; }
-	$(CXX) -o $@ $^ -Wl,--start-group $(ZX_LIBRARIES) -Wl,--end-group \
+	$(CXX) -o $@ $(ZX_NATIVE_OBJECTS) -Wl,--start-group $(ZX_LIBRARIES) -Wl,--end-group \
 	    $(LDLIBS) -lboost_program_options -ldl -lpthread -lz
 
 main_zx_native.o: main.c ffmpeg_audio.h sid_audio.h zx_audio.h
@@ -24,8 +27,8 @@ main_zx_native.o: main.c ffmpeg_audio.h sid_audio.h zx_audio.h
 zx_audio.o: zx_audio.cpp zx_audio.h
 	$(CXX) $(CXXFLAGS) -std=c++20 $(ZX_INCLUDE) -c -o $@ zx_audio.cpp
 
-xmp-linux: main.o xmp-resources.o ffmpeg_audio.o sid_audio.o hvsc_download.o
-	$(CXX) -o $@ $^ $(LDLIBS)
+xmp-zx-wav: $(ZX_WAV_OBJECTS) Makefile
+	$(CXX) -o $@ $(ZX_WAV_OBJECTS) $(LDLIBS)
 
 main.o: main.c ffmpeg_audio.h sid_audio.h
 	$(CC) $(CFLAGS) -c -o $@ main.c
@@ -43,7 +46,7 @@ xmp-resources.c: xmp.gresource.xml icons/xmp.png
 	glib-compile-resources --generate-source --target=$@ $<
 
 clean:
-	rm -f xmp-linux xmp-zx-native main_zx_native.o zx_audio.o hvsc_download.o main.o xmp-resources.o ffmpeg_audio.o sid_audio.o xmp-resources.c
+	rm -f xmp-linux xmp-zx-native xmp-zx-wav main_zx_native.o zx_audio.o hvsc_download.o main.o xmp-resources.o ffmpeg_audio.o sid_audio.o xmp-resources.c
 
 .PHONY: all clean
 
