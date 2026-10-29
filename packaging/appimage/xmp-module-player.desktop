@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=XMP Module Player
+Comment=Tracker, SID, ZX Spectrum, and audio file player
+Exec=xmp-linux %f
+Icon=xmp
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupNotify=true

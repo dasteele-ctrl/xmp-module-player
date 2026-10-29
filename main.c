@@ -1,15 +1,35 @@
 #include <gtk/gtk.h>
+#include <gio/gio.h>
+#include <glib/gstdio.h>
 #include <SDL.h>
 #include <xmp.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include "ffmpeg_audio.h"
+#include "sid_audio.h"
+#include "hvsc_download.h"
+#ifdef ENABLE_WAV_EXPORT
+#include "export_wav.h"
+#endif
+#ifdef ENABLE_ZXTUNE_NATIVE
+#include "zx_audio.h"
+#endif
 
 #define AUDIO_RATE 44100
 #define SCOPE_ROW_HEIGHT 76
 #define SCOPE_MARGIN 8
 
+typedef enum {
+    PLAYBACK_NONE,
+    PLAYBACK_MODULE,
+    PLAYBACK_FFMPEG,
+    PLAYBACK_SID,
+    PLAYBACK_ZX
+} PlaybackMode;
+
+static PlaybackMode playback_mode = PLAYBACK_NONE;
 static xmp_context ctx;
 static SDL_AudioDeviceID audio_device;
 static int module_loaded = 0;
@@ -18,6 +38,24 @@ static int playing = 0;
 static int stopped = 0;
 static int audio_ended = 0;
 static int updating_seek = 0;
+static int master_volume = 100;
+
+/* ZX tunes are converted by zxtune123 and played through the existing
+ * FFmpeg / SDL pipeline. No additional audio device or decoder thread. */
+typedef struct {
+    GSubprocess *process;
+    char *directory;
+    char *wav_path;
+    char *source_path;
+    unsigned generation;
+    int autoplay;
+} ZxConversion;
+static ZxConversion *zx_pending;
+static unsigned zx_generation;
+static char *zx_active_directory;
+static char *zx_active_wav;
+static char *zx_active_source;
+static int zx_autoplay_request;
 
 static GtkWidget *window;
 static GtkWidget *title_label;
@@ -25,6 +63,7 @@ static GtkWidget *format_label;
 static GtkWidget *status_label;
 static GtkWidget *time_label;
 static GtkWidget *seek_scale;
+static GtkWidget *volume_scale;
 static GtkWidget *play_button;
 static GtkWidget *channels_label;
 static GtkWidget *details_label;
@@ -40,13 +79,235 @@ static GtkWidget *visualizer_area;
 #define VIZ_BANDS 32
 #define VIZ_FFT_SIZE 1024
 #define VIZ_RING_SIZE 8192
+#define AUDIO_BUFFER_FRAMES (AUDIO_RATE * 2)
 
 static int16_t viz_ring[VIZ_RING_SIZE];
+
+/* Shared PCM buffer: decoder thread produces; SDL callback consumes. */
+static int16_t audio_ring[AUDIO_BUFFER_FRAMES * 2];
+static unsigned int audio_ring_read_pos;
+static unsigned int audio_ring_write_pos;
+static SDL_Thread *decoder_thread;
+static SDL_atomic_t decoder_stop;
+static FfmpegAudio *ffmpeg_audio;
+static SidAudio *sid_audio;
+#ifdef ENABLE_ZXTUNE_NATIVE
+static ZxAudio *zx_audio;
+#endif
+static SDL_atomic_t ffmpeg_decode_finished;
+static SDL_atomic_t ffmpeg_decode_error;
+static int64_t ffmpeg_position_frames;
+static int64_t ffmpeg_duration_ms;
+static SDL_atomic_t ffmpeg_seek_requested;
+static int64_t ffmpeg_seek_target_ms;
+static SDL_atomic_t ffmpeg_seek_generation;
 static unsigned int viz_write_pos;
 static double viz_levels[VIZ_BANDS];
 static double viz_peaks[VIZ_BANDS];
 static double viz_spectrum[VIZ_BANDS];
 static int selected_sample = 0;
+#ifdef ENABLE_WAV_EXPORT
+typedef struct {
+    ExportWavRequest request;
+    gchar *source;
+    gchar *destination;
+    GtkWidget *dialog;
+    GtkWidget *progress_bar;
+    GThread *thread;
+    guint progress_timer;
+    volatile gint progress;
+    volatile gint cancel;
+    volatile gint finished;
+    int succeeded;
+    char error[512];
+} WavExportTask;
+static WavExportTask *active_wav_export;
+#endif
+static int decoder_thread_fn(void *unused)
+{
+    (void)unused;
+
+    int16_t chunk[4096 * 2];
+
+    while (!SDL_AtomicGet(&decoder_stop)) {
+        if (SDL_AtomicGet(&ffmpeg_seek_requested)) {
+            SDL_LockAudioDevice(audio_device);
+            int64_t target_ms = ffmpeg_seek_target_ms;
+            SDL_AtomicSet(&ffmpeg_seek_requested, 0);
+            SDL_UnlockAudioDevice(audio_device);
+
+            int seek_result;
+#ifdef ENABLE_ZXTUNE_NATIVE
+            if (zx_audio)
+                seek_result = zx_audio_seek(zx_audio, target_ms);
+            else
+#endif
+                seek_result = ffmpeg_audio_seek(ffmpeg_audio, target_ms);
+            if (seek_result < 0) {
+                SDL_AtomicSet(&ffmpeg_decode_error, 1);
+                SDL_AtomicSet(&ffmpeg_decode_finished, 1);
+                break;
+            }
+
+            SDL_LockAudioDevice(audio_device);
+            audio_ring_read_pos = 0;
+            audio_ring_write_pos = 0;
+            ffmpeg_position_frames = target_ms * AUDIO_RATE / 1000;
+            SDL_UnlockAudioDevice(audio_device);
+
+            SDL_AtomicSet(&ffmpeg_decode_finished, 0);
+            SDL_AtomicSet(&ffmpeg_decode_error, 0);
+        }
+
+        SDL_LockAudioDevice(audio_device);
+        unsigned int read_pos = audio_ring_read_pos;
+        unsigned int write_pos = audio_ring_write_pos;
+        unsigned int used =
+            (write_pos + AUDIO_BUFFER_FRAMES - read_pos) %
+            AUDIO_BUFFER_FRAMES;
+        unsigned int free_frames = AUDIO_BUFFER_FRAMES - used - 1;
+        SDL_UnlockAudioDevice(audio_device);
+
+        if (free_frames == 0) {
+            SDL_Delay(5);
+            continue;
+        }
+
+        int generation = SDL_AtomicGet(&ffmpeg_seek_generation);
+        int request = free_frames > 4096 ? 4096 : (int)free_frames;
+        int got;
+#ifdef ENABLE_ZXTUNE_NATIVE
+        if (zx_audio)
+            got = zx_audio_read(zx_audio, chunk, request);
+        else
+#endif
+            got = ffmpeg_audio_read(ffmpeg_audio, chunk, request);
+
+        if (generation != SDL_AtomicGet(&ffmpeg_seek_generation))
+            continue;
+
+        if (got < 0) {
+            SDL_AtomicSet(&ffmpeg_decode_error, 1);
+            SDL_AtomicSet(&ffmpeg_decode_finished, 1);
+            break;
+        }
+
+        if (got == 0) {
+            SDL_AtomicSet(&ffmpeg_decode_finished, 1);
+            break;
+        }
+
+        SDL_LockAudioDevice(audio_device);
+
+        if (generation == SDL_AtomicGet(&ffmpeg_seek_generation) &&
+            !SDL_AtomicGet(&ffmpeg_seek_requested)) {
+            for (int i = 0; i < got; i++) {
+                unsigned int slot = audio_ring_write_pos;
+                audio_ring[slot * 2] = chunk[i * 2];
+                audio_ring[slot * 2 + 1] = chunk[i * 2 + 1];
+                audio_ring_write_pos = (slot + 1) % AUDIO_BUFFER_FRAMES;
+            }
+        }
+
+        SDL_UnlockAudioDevice(audio_device);
+    }
+
+    return 0;
+}
+
+static void stop_ffmpeg_decoder(void)
+{
+    /* Stop the shared PCM producer (FFmpeg or native ZXTune) before freeing it. */
+    SDL_AtomicSet(&decoder_stop, 1);
+
+    if (decoder_thread) {
+        SDL_WaitThread(decoder_thread, NULL);
+        decoder_thread = NULL;
+    }
+
+    if (ffmpeg_audio) {
+        ffmpeg_audio_close(ffmpeg_audio);
+        ffmpeg_audio = NULL;
+    }
+#ifdef ENABLE_ZXTUNE_NATIVE
+    if (zx_audio) {
+        zx_audio_close(zx_audio);
+        zx_audio = NULL;
+    }
+#endif
+
+    if (audio_device) {
+        SDL_PauseAudioDevice(audio_device, 1);
+        SDL_LockAudioDevice(audio_device);
+        audio_ring_read_pos = 0;
+        audio_ring_write_pos = 0;
+        SDL_UnlockAudioDevice(audio_device);
+    }
+
+    SDL_AtomicSet(&ffmpeg_decode_finished, 0);
+    SDL_AtomicSet(&ffmpeg_decode_error, 0);
+    SDL_AtomicSet(&ffmpeg_seek_requested, 0);
+    ffmpeg_position_frames = 0;
+    ffmpeg_duration_ms = 0;
+}
+
+static void zx_free_conversion(ZxConversion *job)
+{
+    if (!job)
+        return;
+    if (job->wav_path)
+        g_unlink(job->wav_path);
+    if (job->directory)
+        g_rmdir(job->directory);
+    g_clear_object(&job->process);
+    g_free(job->directory);
+    g_free(job->wav_path);
+    g_free(job->source_path);
+    g_free(job);
+}
+
+static void zx_cancel_pending(void)
+{
+    ++zx_generation;
+    if (zx_pending) {
+        /* The async completion callback owns the cancelled job. */
+        g_subprocess_force_exit(zx_pending->process);
+        if (zx_pending->wav_path)
+            g_unlink(zx_pending->wav_path);
+        if (zx_pending->directory)
+            g_rmdir(zx_pending->directory);
+        zx_pending = NULL;
+    }
+}
+
+static void zx_remove_active(void)
+{
+    /* Always stop_ffmpeg_decoder() before unlinking its backing WAV. */
+    if (zx_active_wav)
+        g_unlink(zx_active_wav);
+    if (zx_active_directory)
+        g_rmdir(zx_active_directory);
+    g_clear_pointer(&zx_active_wav, g_free);
+    g_clear_pointer(&zx_active_directory, g_free);
+    g_clear_pointer(&zx_active_source, g_free);
+}
+
+static gboolean zx_is_music_path(const char *filename)
+{
+    static const char *extensions[] = {
+        ".ay", ".ayc", ".asc", ".chi", ".dmm", ".dst", ".ftc",
+        ".gtr", ".psc", ".psg", ".pt1", ".pt2", ".pt3",
+        ".sqt", ".st1", ".st3", ".stc", ".stp", ".str",
+        ".tfc", ".tfd", ".tfe", ".vtx", ".ym", NULL
+    };
+    const char *extension = strrchr(filename, '.');
+    if (!extension)
+        return FALSE;
+    for (int i = 0; extensions[i]; ++i)
+        if (g_ascii_strcasecmp(extension, extensions[i]) == 0)
+            return TRUE;
+    return FALSE;
+}
 
 static char current_file[4096] = "";
 static GtkListStore *playlist_store;
@@ -57,24 +318,81 @@ static void audio_callback(void *userdata, Uint8 *stream, int len)
     (void)userdata;
     memset(stream, 0, len);
 
-    if (!module_loaded || !player_started || !playing || audio_ended)
+    if (!playing || audio_ended)
         return;
 
-    int rc = xmp_play_buffer(ctx, stream, len, 0);
+    if (playback_mode == PLAYBACK_MODULE) {
+        if (!module_loaded || !player_started)
+            return;
+
+        int rc = xmp_play_buffer(ctx, stream, len, 0);
+
+        if (rc == -XMP_END) {
+            audio_ended = 1;
+            playing = 0;
+        }
+    } else if (playback_mode == PLAYBACK_FFMPEG ||
+               playback_mode == PLAYBACK_ZX) {
+        int16_t *out = (int16_t *)stream;
+        int requested_frames = len / (int)(2 * sizeof(int16_t));
+        int copied_frames = 0;
+
+        while (copied_frames < requested_frames &&
+               audio_ring_read_pos != audio_ring_write_pos) {
+            unsigned int slot = audio_ring_read_pos;
+            out[copied_frames * 2] = audio_ring[slot * 2];
+            out[copied_frames * 2 + 1] = audio_ring[slot * 2 + 1];
+            audio_ring_read_pos = (slot + 1) % AUDIO_BUFFER_FRAMES;
+            copied_frames++;
+        }
+
+        ffmpeg_position_frames += copied_frames;
+
+        if (copied_frames < requested_frames &&
+            SDL_AtomicGet(&ffmpeg_decode_finished) &&
+            audio_ring_read_pos == audio_ring_write_pos) {
+            audio_ended = 1;
+            playing = 0;
+        }
+    } else if (playback_mode == PLAYBACK_SID) {
+        int requested_frames = len / (int)(2 * sizeof(int16_t));
+        int got = sid_audio ? sid_audio_read(sid_audio,
+                                              (int16_t *)stream,
+                                              requested_frames) : 0;
+        if (got <= 0) {
+            audio_ended = 1;
+            playing = 0;
+        }
+    } else {
+        return;
+    }
+
+    /* Apply master volume to both module and FFmpeg audio output. */
+    int16_t *volume_pcm = (int16_t *)stream;
+    int pcm_samples = len / (int)sizeof(int16_t);
+    if (master_volume < 100) {
+        for (int i = 0; i < pcm_samples; i++)
+            volume_pcm[i] = (int16_t)(((int32_t)volume_pcm[i] * master_volume) / 100);
+    }
 
     /* Capture mono samples for the visualizer; audio is S16 stereo. */
     const int16_t *pcm = (const int16_t *)stream;
     int sample_count = len / (int)(2 * sizeof(int16_t));
+
     for (int i = 0; i < sample_count; i++) {
         int mono = ((int)pcm[i * 2] + (int)pcm[i * 2 + 1]) / 2;
         viz_ring[viz_write_pos] = (int16_t)mono;
         viz_write_pos = (viz_write_pos + 1) % VIZ_RING_SIZE;
     }
+}
 
-    if (rc == -XMP_END) {
-        audio_ended = 1;
-        playing = 0;
-    }
+static void on_volume_changed(GtkRange *range, gpointer user_data)
+{
+    (void)user_data;
+    int volume = (int)gtk_range_get_value(range);
+    if (audio_device) SDL_LockAudioDevice(audio_device);
+    master_volume = volume;
+    if (audio_device) SDL_UnlockAudioDevice(audio_device);
 }
 
 static void update_play_button(void)
@@ -309,14 +627,21 @@ static void populate_sample_browser(void)
     }
 }
 
-static void open_module(const char *filename)
+static int open_ffmpeg_audio(const char *filename)
 {
+    char error_text[512] = "";
+
+    if (!filename || !*filename || !audio_device || !ctx)
+        return 0;
+
+    stop_ffmpeg_decoder();
     SDL_PauseAudioDevice(audio_device, 1);
     SDL_LockAudioDevice(audio_device);
 
     playing = 0;
     audio_ended = 0;
     stopped = 0;
+    playback_mode = PLAYBACK_NONE;
 
     if (player_started) {
         xmp_end_player(ctx);
@@ -326,6 +651,283 @@ static void open_module(const char *filename)
     if (module_loaded) {
         xmp_release_module(ctx);
         module_loaded = 0;
+    }
+    if (sid_audio) {
+        sid_audio_close(sid_audio);
+        sid_audio = NULL;
+    }
+
+    SDL_UnlockAudioDevice(audio_device);
+
+    ffmpeg_audio = ffmpeg_audio_open(filename, error_text,
+                                     sizeof(error_text));
+    if (!ffmpeg_audio) {
+        set_status(error_text[0] ? error_text : "Unsupported audio file.");
+        gtk_label_set_text(GTK_LABEL(title_label), "Unable to open audio");
+        update_play_button();
+        return 0;
+    }
+
+    ffmpeg_duration_ms = ffmpeg_audio_duration_ms(ffmpeg_audio);
+    ffmpeg_position_frames = 0;
+    SDL_AtomicSet(&decoder_stop, 0);
+    SDL_AtomicSet(&ffmpeg_decode_finished, 0);
+    SDL_AtomicSet(&ffmpeg_decode_error, 0);
+
+    decoder_thread = SDL_CreateThread(decoder_thread_fn,
+                                      "ffmpeg-decoder", NULL);
+    if (!decoder_thread) {
+        snprintf(error_text, sizeof(error_text),
+                 "Could not start decoder thread: %s", SDL_GetError());
+        ffmpeg_audio_close(ffmpeg_audio);
+        ffmpeg_audio = NULL;
+        set_status(error_text);
+        return 0;
+    }
+
+    playback_mode = PLAYBACK_FFMPEG;
+    g_strlcpy(current_file, filename, sizeof(current_file));
+
+    char *base = g_path_get_basename(filename);
+    gtk_label_set_text(GTK_LABEL(title_label), base ? base : "Audio file");
+    gtk_label_set_text(GTK_LABEL(format_label), "Audio file (FFmpeg)");
+    gtk_label_set_text(GTK_LABEL(channels_label), "Stereo    44100 Hz");
+    gtk_label_set_text(GTK_LABEL(details_label), filename);
+    gtk_label_set_text(GTK_LABEL(time_label), "00:00");
+
+    gtk_widget_set_sensitive(seek_scale, TRUE);
+    updating_seek = 1;
+    gtk_range_set_range(GTK_RANGE(seek_scale), 0,
+                        ffmpeg_duration_ms > 0 ? ffmpeg_duration_ms : 1);
+    gtk_range_set_value(GTK_RANGE(seek_scale), 0);
+    updating_seek = 0;
+
+    if (base)
+        g_free(base);
+
+    if (scope_area)
+        gtk_widget_queue_draw(scope_area);
+    if (pattern_area)
+        gtk_widget_queue_draw(pattern_area);
+    if (visualizer_area)
+        gtk_widget_queue_draw(visualizer_area);
+
+    update_play_button();
+    set_status("Audio file loaded");
+    return 1;
+}
+
+static void on_play(GtkButton *button, gpointer data);
+
+static void zx_apply_labels(void)
+{
+    if (!zx_active_source)
+        return;
+
+    char *base = g_path_get_basename(zx_active_source);
+    g_strlcpy(current_file, zx_active_source, sizeof(current_file));
+    gtk_label_set_text(GTK_LABEL(title_label), base);
+    gtk_label_set_text(GTK_LABEL(format_label),
+                       playback_mode == PLAYBACK_ZX ?
+                       "ZX Spectrum / AY-YM (ZXTune native)" :
+                       "ZX Spectrum / AY-YM (ZXTune)");
+    gtk_label_set_text(GTK_LABEL(channels_label),
+                       "Stereo mixed output    44100 Hz");
+    gtk_label_set_text(GTK_LABEL(details_label), zx_active_source);
+    populate_sample_browser();
+    if (scope_area) {
+        gtk_widget_set_size_request(scope_area, 620, SCOPE_ROW_HEIGHT);
+        gtk_widget_queue_draw(scope_area);
+    }
+    if (pattern_area)
+        gtk_widget_queue_draw(pattern_area);
+    g_free(base);
+}
+
+static void zx_conversion_complete(GObject *object, GAsyncResult *result,
+                                   gpointer user_data)
+{
+    ZxConversion *job = user_data;
+    GError *error = NULL;
+    gboolean waited = g_subprocess_wait_finish(G_SUBPROCESS(object),
+                                                result, &error);
+    gboolean current = zx_pending == job &&
+                       job->generation == zx_generation;
+    if (current)
+        zx_pending = NULL;
+
+    if (current && waited && g_subprocess_get_successful(job->process) &&
+        g_file_test(job->wav_path, G_FILE_TEST_IS_REGULAR) &&
+        open_ffmpeg_audio(job->wav_path)) {
+        /* FFmpeg owns an open handle; preserve the WAV for Stop/Play restart. */
+        zx_active_directory = g_steal_pointer(&job->directory);
+        zx_active_wav = g_steal_pointer(&job->wav_path);
+        zx_active_source = g_strdup(job->source_path);
+        zx_apply_labels();
+        set_status("ZX Spectrum tune loaded");
+        if (job->autoplay)
+            on_play(NULL, NULL);
+    } else if (current) {
+        gtk_label_set_text(GTK_LABEL(title_label), "Unable to load ZX tune");
+        set_status("ZXTune could not render this tune.");
+    }
+
+    g_clear_error(&error);
+    zx_free_conversion(job);
+}
+
+static void zx_start_conversion(const char *filename)
+{
+    char *executable = g_find_program_in_path("zxtune123");
+    if (!executable) {
+        char *local = g_build_filename(g_get_home_dir(), "zxtune", "bin",
+                                       "linux", "release", "zxtune123", NULL);
+        if (g_file_test(local, G_FILE_TEST_IS_EXECUTABLE))
+            executable = g_strdup(local);
+        g_free(local);
+    }
+    if (!executable) {
+        gtk_label_set_text(GTK_LABEL(title_label), "ZXTune CLI not found");
+        set_status("Build/install zxtune123 to play ZX tunes.");
+        return;
+    }
+
+    GError *error = NULL;
+    ZxConversion *job = g_new0(ZxConversion, 1);
+    job->directory = g_dir_make_tmp("xmp-zx-XXXXXX", &error);
+    if (!job->directory) {
+        set_status(error ? error->message : "Cannot create temporary folder.");
+        g_clear_error(&error);
+        zx_free_conversion(job);
+        g_free(executable);
+        return;
+    }
+
+    job->source_path = g_strdup(filename);
+    job->wav_path = g_build_filename(job->directory, "track.wav", NULL);
+    job->generation = zx_generation;
+    job->autoplay = zx_autoplay_request;
+    char *wav_option = g_strdup_printf("filename=%s", job->wav_path);
+    const char *argv[] = {executable, "--frequency", "44100", "--wav",
+                          wav_option, filename, NULL};
+    job->process = g_subprocess_newv(argv,
+                                    G_SUBPROCESS_FLAGS_STDOUT_SILENCE |
+                                    G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+                                    &error);
+    g_free(wav_option);
+    g_free(executable);
+
+    if (!job->process) {
+        set_status(error ? error->message : "Cannot start zxtune123.");
+        g_clear_error(&error);
+        zx_free_conversion(job);
+        return;
+    }
+
+    zx_pending = job;
+    gtk_label_set_text(GTK_LABEL(title_label), "Rendering ZX Spectrum tune…");
+    gtk_label_set_text(GTK_LABEL(format_label), "ZXTune");
+    gtk_label_set_text(GTK_LABEL(channels_label), "");
+    gtk_label_set_text(GTK_LABEL(time_label), "00:00 / 00:00");
+    set_status("Converting ZX tune to audio…");
+    g_subprocess_wait_async(job->process, NULL, zx_conversion_complete, job);
+}
+
+#ifdef ENABLE_ZXTUNE_NATIVE
+static int open_zx_native(const char *filename)
+{
+    char error_text[512] = "";
+    if (!filename || !*filename || !audio_device)
+        return 0;
+
+    /* Decoder work must finish before we replace the renderer. */
+    stop_ffmpeg_decoder();
+    SDL_PauseAudioDevice(audio_device, 1);
+
+    zx_audio = zx_audio_open(filename, error_text, sizeof(error_text));
+    if (!zx_audio) {
+        set_status(error_text[0] ? error_text :
+                   "Could not open native ZXTune renderer.");
+        return 0;
+    }
+
+    ffmpeg_duration_ms = zx_audio_duration_ms(zx_audio);
+    ffmpeg_position_frames = 0;
+    SDL_AtomicSet(&decoder_stop, 0);
+    SDL_AtomicSet(&ffmpeg_decode_finished, 0);
+    SDL_AtomicSet(&ffmpeg_decode_error, 0);
+    SDL_AtomicSet(&ffmpeg_seek_requested, 0);
+
+    decoder_thread = SDL_CreateThread(decoder_thread_fn,
+                                      "zxtune-native-renderer", NULL);
+    if (!decoder_thread) {
+        set_status("Could not start native ZXTune audio thread.");
+        zx_audio_close(zx_audio);
+        zx_audio = NULL;
+        return 0;
+    }
+
+    playback_mode = PLAYBACK_ZX;
+    playing = 0;
+    stopped = 0;
+    audio_ended = 0;
+    g_free(zx_active_source);
+    zx_active_source = g_strdup(filename);
+
+    gtk_widget_set_sensitive(seek_scale, TRUE);
+    updating_seek = 1;
+    gtk_range_set_range(GTK_RANGE(seek_scale), 0,
+                        ffmpeg_duration_ms > 0 ? ffmpeg_duration_ms : 1);
+    gtk_range_set_value(GTK_RANGE(seek_scale), 0);
+    updating_seek = 0;
+    gtk_label_set_text(GTK_LABEL(time_label), "00:00");
+    zx_apply_labels();
+    update_play_button();
+    set_status("ZX Spectrum tune loaded (native audio)");
+    return 1;
+}
+#endif
+
+static void open_module(const char *filename)
+{
+    stop_ffmpeg_decoder();
+    zx_cancel_pending();
+    zx_remove_active();
+    SDL_PauseAudioDevice(audio_device, 1);
+    SDL_LockAudioDevice(audio_device);
+
+    playing = 0;
+    audio_ended = 0;
+    stopped = 0;
+    playback_mode = PLAYBACK_NONE;
+
+    if (player_started) {
+        xmp_end_player(ctx);
+        player_started = 0;
+    }
+
+    if (module_loaded) {
+        xmp_release_module(ctx);
+        module_loaded = 0;
+    }
+    if (sid_audio) {
+        sid_audio_close(sid_audio);
+        sid_audio = NULL;
+    }
+
+    if (zx_is_music_path(filename)) {
+        SDL_UnlockAudioDevice(audio_device);
+        current_file[0] = '\0';
+        update_play_button();
+#ifdef ENABLE_ZXTUNE_NATIVE
+        if (open_zx_native(filename)) {
+            if (zx_autoplay_request)
+                on_play(NULL, NULL);
+            return;
+        }
+#endif
+        zx_start_conversion(filename);
+        return;
     }
 
     int rc = xmp_load_module(ctx, filename);
@@ -350,6 +952,7 @@ static void open_module(const char *filename)
 
     module_loaded = 1;
     player_started = 1;
+    playback_mode = PLAYBACK_MODULE;
     g_strlcpy(current_file, filename, sizeof(current_file));
 
     char title[512];
@@ -377,6 +980,7 @@ static void open_module(const char *filename)
 
     struct xmp_frame_info fi;
     xmp_get_frame_info(ctx, &fi);
+    gtk_widget_set_sensitive(seek_scale, TRUE);
     updating_seek = 1;
     gtk_range_set_range(GTK_RANGE(seek_scale), 0,
                         fi.total_time > 0 ? fi.total_time : 1);
@@ -395,6 +999,401 @@ static void open_module(const char *filename)
     set_status("Module loaded");
 }
 
+static int open_sid(const char *filename)
+{
+    char error_text[512] = "";
+
+    if (!filename || !*filename || !audio_device)
+        return 0;
+
+    stop_ffmpeg_decoder();
+    SDL_PauseAudioDevice(audio_device, 1);
+    SDL_LockAudioDevice(audio_device);
+
+    playing = 0;
+    audio_ended = 0;
+    stopped = 0;
+    playback_mode = PLAYBACK_NONE;
+
+    if (player_started) {
+        xmp_end_player(ctx);
+        player_started = 0;
+    }
+    if (module_loaded) {
+        xmp_release_module(ctx);
+        module_loaded = 0;
+    }
+    if (sid_audio) {
+        sid_audio_close(sid_audio);
+        sid_audio = NULL;
+    }
+    SDL_UnlockAudioDevice(audio_device);
+
+    sid_audio = sid_audio_open(filename, error_text, sizeof(error_text));
+    if (!sid_audio) {
+        if (error_text[0])
+            set_status(error_text);
+        return 0;
+    }
+
+    SDL_LockAudioDevice(audio_device);
+    playback_mode = PLAYBACK_SID;
+    SDL_UnlockAudioDevice(audio_device);
+
+    g_strlcpy(current_file, filename, sizeof(current_file));
+
+    const char *sid_title = sid_audio_title(sid_audio);
+    const char *sid_author = sid_audio_author(sid_audio);
+    const char *sid_release = sid_audio_release_info(sid_audio);
+    char title[512];
+    char details[1024];
+    snprintf(title, sizeof(title), "%s",
+             sid_title && sid_title[0] ? sid_title : "Untitled SID tune");
+    snprintf(details, sizeof(details), "%s%s%s%s%s",
+             filename,
+             sid_author && sid_author[0] ? "\nAuthor: " : "",
+             sid_author && sid_author[0] ? sid_author : "",
+             sid_release && sid_release[0] ? "\nRelease: " : "",
+             sid_release && sid_release[0] ? sid_release : "");
+
+    gtk_label_set_text(GTK_LABEL(title_label), title);
+    gtk_label_set_text(GTK_LABEL(format_label), "Commodore 64 SID (sidplayfp)");
+    gtk_label_set_text(GTK_LABEL(channels_label), "Stereo    44100 Hz");
+    gtk_label_set_text(GTK_LABEL(details_label), details);
+    gtk_label_set_text(GTK_LABEL(time_label), "SID tune");
+    gtk_widget_set_sensitive(seek_scale, FALSE);
+    updating_seek = 1;
+    gtk_range_set_range(GTK_RANGE(seek_scale), 0, 1);
+    gtk_range_set_value(GTK_RANGE(seek_scale), 0);
+    updating_seek = 0;
+
+    populate_sample_browser();
+    if (scope_area)
+        gtk_widget_queue_draw(scope_area);
+    if (pattern_area)
+        gtk_widget_queue_draw(pattern_area);
+    if (visualizer_area)
+        gtk_widget_queue_draw(visualizer_area);
+
+    update_play_button();
+    set_status("SID tune loaded");
+    return 1;
+}
+
+static char *get_last_folder_file(void)
+{
+    return g_build_filename(g_get_user_config_dir(),
+                            "xmp-module-player",
+                            "last-folder", NULL);
+}
+
+static void restore_last_folder(GtkWidget *dialog)
+{
+    char *settings_file = get_last_folder_file();
+    char *folder = NULL;
+
+    if (g_file_get_contents(settings_file, &folder, NULL, NULL)) {
+        g_strstrip(folder);
+        if (*folder && g_file_test(folder, G_FILE_TEST_IS_DIR))
+            gtk_file_chooser_set_current_folder(
+                GTK_FILE_CHOOSER(dialog), folder);
+    }
+
+    g_free(folder);
+    g_free(settings_file);
+}
+
+static void remember_last_folder(GtkWidget *dialog)
+{
+    char *folder = gtk_file_chooser_get_current_folder(
+        GTK_FILE_CHOOSER(dialog));
+
+    if (folder) {
+        char *settings_file = get_last_folder_file();
+        char *settings_dir = g_path_get_dirname(settings_file);
+
+        g_mkdir_with_parents(settings_dir, 0700);
+        g_file_set_contents(settings_file, folder, -1, NULL);
+
+        g_free(settings_dir);
+        g_free(settings_file);
+        g_free(folder);
+    }
+}
+
+
+static char *get_hvsc_folder_file(void)
+{
+    return g_build_filename(g_get_user_config_dir(),
+                            "xmp-module-player",
+                            "hvsc-folder", NULL);
+}
+
+static void on_hvsc_folder_changed(GtkFileChooserButton *chooser,
+                                   gpointer data)
+{
+    (void)data;
+    char *folder = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+    if (!folder) return;
+
+    char *settings_file = get_hvsc_folder_file();
+    char *settings_dir = g_path_get_dirname(settings_file);
+
+    g_mkdir_with_parents(settings_dir, 0700);
+    g_file_set_contents(settings_file, folder, -1, NULL);
+
+    g_free(settings_dir);
+    g_free(settings_file);
+    g_free(folder);
+}
+
+
+
+/* HVSC waveform progress indicator.
+   The fraction will later be updated by the download worker. */
+
+static gboolean hvsc_waveform_draw(GtkWidget *widget,
+                                  cairo_t *cr,
+                                  gpointer data)
+{
+    (void)data;
+
+    GtkAllocation area;
+    gtk_widget_get_allocation(widget, &area);
+
+    double width = area.width;
+    double height = area.height;
+
+    double fraction = gtk_progress_bar_get_fraction(
+        GTK_PROGRESS_BAR(
+            g_object_get_data(G_OBJECT(widget), "progress")));
+
+    fraction = CLAMP(fraction, 0.0, 1.0);
+
+    cairo_set_source_rgb(cr, 0.082, 0.110, 0.153);
+    cairo_rectangle(cr, 0, 0, width, height);
+    cairo_fill(cr);
+
+    double center = height / 2.0;
+    double step = 4.0;
+
+    for (int i = 0; i < (int)(width / step); i++) {
+        double x = i * step + 1.0;
+
+        double amplitude =
+            5.0 +
+            fabs(sin(i * 1.71) * cos(i * 0.31)) * 28.0 +
+            fabs(sin(i * 0.18)) * 7.0;
+
+        amplitude = MIN(amplitude, height - 8.0);
+
+        if (x < width * fraction)
+            cairo_set_source_rgb(cr, 0.212, 0.769, 0.847);
+        else
+            cairo_set_source_rgb(cr, 0.278, 0.333, 0.412);
+
+        cairo_rectangle(cr, x, center - amplitude / 2.0,
+                        2.6, amplitude);
+        cairo_fill(cr);
+    }
+
+    cairo_set_source_rgba(cr, 0.51, 0.57, 0.65, 0.45);
+    cairo_set_line_width(cr, 0.5);
+    cairo_move_to(cr, 0, center);
+    cairo_line_to(cr, width, center);
+    cairo_stroke(cr);
+
+    if (fraction > 0.0) {
+        cairo_set_source_rgb(cr, 0.90, 0.98, 1.0);
+        cairo_set_line_width(cr, 1.5);
+        cairo_move_to(cr, width * fraction, 0);
+        cairo_line_to(cr, width * fraction, height);
+        cairo_stroke(cr);
+    }
+
+    return FALSE;
+}
+
+
+typedef struct {
+    GtkWidget *button;
+    GtkWidget *progress;
+    GtkWidget *waveform;
+    GtkWidget *status;
+    GtkWidget *collection_folder;
+    char *install_parent;
+} HvscUI;
+
+static void on_hvsc_progress(double fraction,
+                             const char *status,
+                             gpointer user_data)
+{
+    HvscUI *ui = user_data;
+
+    gboolean finished = (fraction == 2.0 || fraction == -2.0);
+
+    if (!finished && !hvsc_download_is_running())
+        return;
+
+    gtk_progress_bar_set_fraction(
+        GTK_PROGRESS_BAR(ui->progress),
+        fraction == 2.0 ? 1.0 :
+        fraction < 0.0 ? 0.0 : CLAMP(fraction, 0.0, 1.0));
+
+    gtk_widget_queue_draw(ui->waveform);
+
+    gtk_label_set_text(
+        GTK_LABEL(ui->status), status);
+
+    if (fraction == 2.0 &&
+        g_str_has_prefix(status, "HVSC installation completed") &&
+        ui->install_parent) {
+        char *folder = g_build_filename(
+            ui->install_parent, "HVSC", "C64Music", NULL);
+
+        if (g_file_test(folder, G_FILE_TEST_IS_DIR)) {
+            gtk_file_chooser_set_filename(
+                GTK_FILE_CHOOSER(ui->collection_folder), folder);
+
+            on_hvsc_folder_changed(
+                GTK_FILE_CHOOSER_BUTTON(ui->collection_folder), NULL);
+        }
+
+        g_free(folder);
+        g_clear_pointer(&ui->install_parent, g_free);
+    }
+
+    if (finished) {
+        gtk_button_set_label(
+            GTK_BUTTON(ui->button), "Download & Install HVSC");
+        gtk_widget_set_sensitive(ui->button, TRUE);
+    }
+}
+
+static void on_hvsc_download_clicked(GtkButton *button,
+                                     gpointer user_data)
+{
+    GtkWidget **widgets = user_data;
+
+    if (hvsc_download_is_running()) {
+        hvsc_download_cancel();
+        gtk_widget_set_sensitive(GTK_WIDGET(button), FALSE);
+        return;
+    }
+
+    GtkWidget *chooser = widgets[0];
+    HvscUI *ui = (HvscUI *)widgets[1];
+
+    char *parent = gtk_file_chooser_get_filename(
+        GTK_FILE_CHOOSER(chooser));
+
+    if (!parent)
+        return;
+
+    char *destination = g_build_filename(parent, "HVSC", NULL);
+
+    if (g_file_test(destination, G_FILE_TEST_EXISTS) ||
+        g_file_test(destination, G_FILE_TEST_IS_SYMLINK)) {
+        gtk_label_set_text(
+            GTK_LABEL(ui->status),
+            "Installation refused: HVSC already exists.");
+        g_free(destination);
+        g_free(parent);
+        return;
+    }
+
+    gtk_button_set_label(GTK_BUTTON(button), "Cancel Download");
+    gtk_widget_set_sensitive(GTK_WIDGET(button), TRUE);
+
+    gtk_progress_bar_set_fraction(
+        GTK_PROGRESS_BAR(ui->progress), 0.0);
+    gtk_widget_queue_draw(ui->waveform);
+
+    gtk_label_set_text(
+        GTK_LABEL(ui->status),
+        "Starting HVSC download...");
+
+    g_free(ui->install_parent);
+    ui->install_parent = g_strdup(parent);
+
+    hvsc_download_async(parent, on_hvsc_progress, ui);
+
+    g_free(destination);
+    g_free(parent);
+}
+
+static void on_hvsc_check_destination(GtkButton *button, gpointer data)
+{
+    (void)button;
+
+    GtkFileChooser *chooser = GTK_FILE_CHOOSER(data);
+    char *parent = gtk_file_chooser_get_filename(chooser);
+
+    if (!parent) {
+        GtkWidget *dialog = gtk_message_dialog_new(
+            GTK_WINDOW(window), GTK_DIALOG_MODAL,
+            GTK_MESSAGE_WARNING, GTK_BUTTONS_CLOSE,
+            "Please select an installation directory.");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
+
+    char *destination = g_build_filename(parent, "HVSC", NULL);
+    char *message = NULL;
+    GtkMessageType type;
+
+    if (!g_file_test(parent, G_FILE_TEST_IS_DIR)) {
+        message = g_strdup("The selected parent directory does not exist.");
+        type = GTK_MESSAGE_ERROR;
+    } else if (g_file_test(destination, G_FILE_TEST_EXISTS) ||
+               g_file_test(destination, G_FILE_TEST_IS_SYMLINK)) {
+        message = g_strdup_printf(
+            "Installation refused.\n\n%s already exists.\n"
+            "No files have been changed.", destination);
+        type = GTK_MESSAGE_WARNING;
+    } else {
+        message = g_strdup_printf(
+            "Destination is available:\n\n%s\n\n"
+            "No files have been changed.\n"
+            "Downloading will be enabled in the next stage.",
+            destination);
+        type = GTK_MESSAGE_INFO;
+    }
+
+    GtkWidget *dialog = gtk_message_dialog_new(
+        GTK_WINDOW(window), GTK_DIALOG_MODAL,
+        type, GTK_BUTTONS_CLOSE, "%s", message);
+
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+
+    g_free(message);
+    g_free(destination);
+    g_free(parent);
+}
+
+static void on_hvsc_open_folder(GtkButton *button, gpointer data)
+{
+    (void)button;
+
+    GtkFileChooser *chooser = GTK_FILE_CHOOSER(data);
+    char *folder = gtk_file_chooser_get_filename(chooser);
+    if (!folder) return;
+
+    GError *error = NULL;
+    char *argv[] = { "xdg-open", folder, NULL };
+
+    if (!g_spawn_async(NULL, argv, NULL,
+                       G_SPAWN_SEARCH_PATH,
+                       NULL, NULL, NULL, &error)) {
+        g_warning("Cannot open HVSC folder: %s", error->message);
+        g_clear_error(&error);
+    }
+
+    g_free(folder);
+}
+
 static void on_open(GtkButton *button, gpointer data)
 {
     (void)button;
@@ -405,17 +1404,43 @@ static void on_open(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER_ACTION_OPEN,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Open", GTK_RESPONSE_ACCEPT, NULL);
+    restore_last_folder(dialog);
 
     GtkFileFilter *filter = gtk_file_filter_new();
-    gtk_file_filter_set_name(filter, "Tracker modules and music files");
-    gtk_file_filter_add_pattern(filter, "*");
+    gtk_file_filter_set_name(filter, "Audio and tracker files");
+
+    const char *patterns[] = {
+        "*.mod", "*.MOD", "*.xm", "*.XM", "*.it", "*.IT",
+        "*.s3m", "*.S3M", "*.mptm", "*.MPTM", "*.mtm", "*.MTM",
+        "*.669", "*.amf", "*.med", "*.okt", "*.ult", "*.sid", "*.SID",
+        "*.mp3", "*.MP3", "*.wav", "*.WAV", "*.m4a", "*.M4A",
+        "*.aac", "*.AAC", "*.ogg", "*.OGG", "*.oga", "*.OGA", "*.opus", "*.OPUS",
+        "*.flac", "*.FLAC", "*.webm", "*.WEBM", "*.mka", "*.MKA",
+        "*.aiff", "*.aif", "*.wma", "*.mp4", "*.MP4",
+        "*.pt3", "*.PT3", "*.pt2", "*.PT2", "*.ay", "*.AY",
+        "*.vtx", "*.VTX", "*.ym", "*.YM", "*.stc", "*.STC",
+        "*.sqt", "*.SQT", "*.psg", "*.PSG", "*.asc", "*.ASC"
+    };
+
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
+        gtk_file_filter_add_pattern(filter, patterns[i]);
+
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
 
+    GtkFileFilter *all_filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(all_filter, "All files");
+    gtk_file_filter_add_pattern(all_filter, "*");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), all_filter);
+
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        remember_last_folder(dialog);
         char *filename =
             gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
         if (filename) {
             open_module(filename);
+            if (!zx_is_music_path(filename) && !module_loaded &&
+                !open_sid(filename))
+                open_ffmpeg_audio(filename);
             g_free(filename);
         }
     }
@@ -423,19 +1448,274 @@ static void on_open(GtkButton *button, gpointer data)
     gtk_widget_destroy(dialog);
 }
 
+#ifdef ENABLE_WAV_EXPORT
+static void free_wav_export_task(WavExportTask *task)
+{
+    if (!task) return;
+    g_free(task->source);
+    g_free(task->destination);
+    g_free(task);
+}
+
+static gpointer wav_export_worker(gpointer data)
+{
+    WavExportTask *task = data;
+    task->succeeded = export_wav_render(&task->request, &task->progress,
+                                       &task->cancel,
+                                       task->error, sizeof(task->error));
+    g_atomic_int_set(&task->finished, 1);
+    return NULL;
+}
+
+static void on_wav_export_response(GtkDialog *dialog, gint response,
+                                   gpointer data)
+{
+    WavExportTask *task = data;
+    if (response != GTK_RESPONSE_CANCEL &&
+        response != GTK_RESPONSE_DELETE_EVENT)
+        return;
+
+    g_atomic_int_set(&task->cancel, 1);
+    gtk_dialog_set_response_sensitive(dialog, GTK_RESPONSE_CANCEL, FALSE);
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(task->progress_bar),
+                              "Cancelling export…");
+}
+
+static gboolean on_wav_export_delete(GtkWidget *dialog, GdkEvent *event,
+                                     gpointer data)
+{
+    (void)dialog;
+    (void)event;
+    WavExportTask *task = data;
+    g_atomic_int_set(&task->cancel, 1);
+    return TRUE; /* Keep the dialog alive until the worker has exited. */
+}
+
+static gboolean update_wav_export_dialog(gpointer data)
+{
+    WavExportTask *task = data;
+
+    if (g_atomic_int_get(&task->finished)) {
+        g_thread_join(task->thread);
+        task->progress_timer = 0;
+        active_wav_export = NULL;
+        gtk_widget_destroy(task->dialog);
+
+        if (task->succeeded) {
+            set_status("WAV export completed successfully");
+            GtkWidget *message = gtk_message_dialog_new(
+                GTK_WINDOW(window), GTK_DIALOG_MODAL,
+                GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE,
+                "WAV exported successfully:\n%s", task->destination);
+            gtk_dialog_run(GTK_DIALOG(message));
+            gtk_widget_destroy(message);
+        } else if (!g_atomic_int_get(&task->cancel)) {
+            set_status(task->error[0] ? task->error : "WAV export failed");
+            GtkWidget *message = gtk_message_dialog_new(
+                GTK_WINDOW(window), GTK_DIALOG_MODAL,
+                GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+                "WAV export failed:\n%s", task->error);
+            gtk_dialog_run(GTK_DIALOG(message));
+            gtk_widget_destroy(message);
+        } else {
+            set_status("WAV export cancelled");
+        }
+
+        free_wav_export_task(task);
+        return G_SOURCE_REMOVE;
+    }
+
+    int progress = g_atomic_int_get(&task->progress);
+    if (progress < 0) {
+        gtk_progress_bar_pulse(GTK_PROGRESS_BAR(task->progress_bar));
+    } else {
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(task->progress_bar),
+                                      progress / 100.0);
+        if (!g_atomic_int_get(&task->cancel)) {
+            char message[64];
+            g_snprintf(message, sizeof(message), "Rendering… %d%%", progress);
+            gtk_progress_bar_set_text(GTK_PROGRESS_BAR(task->progress_bar),
+                                      message);
+        }
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void on_export_wav(GtkButton *button, gpointer data)
+{
+    (void)button;
+    (void)data;
+
+    if (active_wav_export) {
+        set_status("A WAV export is already running");
+        return;
+    }
+    if (playback_mode == PLAYBACK_NONE || !current_file[0]) {
+        set_status("Open a music file before exporting it");
+        return;
+    }
+
+    ExportWavFormat format = EXPORT_WAV_FFMPEG;
+    unsigned int sid_subtune = 0;
+    const char *source = current_file;
+    if (playback_mode == PLAYBACK_MODULE) {
+        format = EXPORT_WAV_XMP;
+    } else if (playback_mode == PLAYBACK_SID) {
+        format = EXPORT_WAV_SID;
+        SDL_LockAudioDevice(audio_device);
+        if (sid_audio) sid_subtune = sid_audio_current_song(sid_audio);
+        SDL_UnlockAudioDevice(audio_device);
+    } else if (playback_mode == PLAYBACK_ZX ||
+               (playback_mode == PLAYBACK_FFMPEG && zx_active_wav)) {
+        format = EXPORT_WAV_ZXTUNE;
+        if (zx_active_source) source = zx_active_source;
+    }
+
+    GtkWidget *chooser = gtk_file_chooser_dialog_new(
+        "Export audio to WAV", GTK_WINDOW(window),
+        GTK_FILE_CHOOSER_ACTION_SAVE,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Export", GTK_RESPONSE_ACCEPT, NULL);
+
+    gchar *base = g_path_get_basename(source);
+    char *extension = strrchr(base, '.');
+    if (extension) *extension = '\0';
+    gchar *suggested = g_strconcat(base, ".wav", NULL);
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(chooser), suggested);
+    g_free(suggested);
+    g_free(base);
+
+    gchar *destination = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(chooser)) == GTK_RESPONSE_ACCEPT)
+        destination = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+    gtk_widget_destroy(chooser);
+    if (!destination) return;
+
+    const char *dot = strrchr(destination, '.');
+    if (!dot || g_ascii_strcasecmp(dot, ".wav") != 0) {
+        gchar *with_extension = g_strconcat(destination, ".wav", NULL);
+        g_free(destination);
+        destination = with_extension;
+    }
+
+    /* Confirm the final path, including any appended .wav extension. The
+     * file chooser may only have checked the name without that extension. */
+    if (g_file_test(destination, G_FILE_TEST_EXISTS) ||
+        g_file_test(destination, G_FILE_TEST_IS_SYMLINK)) {
+        GtkWidget *replace_dialog = gtk_message_dialog_new(
+            GTK_WINDOW(window), GTK_DIALOG_MODAL,
+            GTK_MESSAGE_WARNING, GTK_BUTTONS_NONE,
+            "This file already exists:\n%s\n\nReplace it with the exported WAV?",
+            destination);
+        gtk_dialog_add_buttons(GTK_DIALOG(replace_dialog),
+                               "_Cancel", GTK_RESPONSE_CANCEL,
+                               "_Replace", GTK_RESPONSE_ACCEPT, NULL);
+        gboolean replace = gtk_dialog_run(GTK_DIALOG(replace_dialog)) ==
+                           GTK_RESPONSE_ACCEPT;
+        gtk_widget_destroy(replace_dialog);
+        if (!replace) {
+            g_free(destination);
+            return;
+        }
+    }
+
+    unsigned int sid_seconds = 180;
+    if (format == EXPORT_WAV_SID) {
+        GtkWidget *duration_dialog = gtk_dialog_new_with_buttons(
+            "SID export duration", GTK_WINDOW(window), GTK_DIALOG_MODAL,
+            "_Cancel", GTK_RESPONSE_CANCEL,
+            "_Continue", GTK_RESPONSE_ACCEPT, NULL);
+        GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(duration_dialog));
+        GtkWidget *description = gtk_label_new(
+            "SID files do not contain a fixed duration.\n"
+            "How many seconds should be exported?");
+        GtkWidget *seconds = gtk_spin_button_new_with_range(1, 3600, 5);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(seconds), 180);
+        gtk_box_pack_start(GTK_BOX(area), description, FALSE, FALSE, 8);
+        gtk_box_pack_start(GTK_BOX(area), seconds, FALSE, FALSE, 8);
+        gtk_widget_show_all(duration_dialog);
+        gboolean accepted = gtk_dialog_run(GTK_DIALOG(duration_dialog)) ==
+                            GTK_RESPONSE_ACCEPT;
+        if (accepted)
+            sid_seconds = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(seconds));
+        gtk_widget_destroy(duration_dialog);
+        if (!accepted) {
+            g_free(destination);
+            return;
+        }
+    }
+
+    WavExportTask *task = g_new0(WavExportTask, 1);
+    task->source = g_strdup(source);
+    task->destination = destination;
+    task->request.source = task->source;
+    task->request.destination = task->destination;
+    task->request.format = format;
+    task->request.sid_seconds = sid_seconds;
+    task->request.sid_subtune = sid_subtune;
+    task->dialog = gtk_dialog_new_with_buttons(
+        "Exporting WAV", GTK_WINDOW(window), GTK_DIALOG_MODAL,
+        "_Cancel Export", GTK_RESPONSE_CANCEL, NULL);
+    gtk_window_set_default_size(GTK_WINDOW(task->dialog), 420, -1);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(task->dialog));
+    GtkWidget *description = gtk_label_new(
+        "Rendering the music as fast as possible, without playback.");
+    gtk_box_pack_start(GTK_BOX(area), description, FALSE, FALSE, 8);
+    task->progress_bar = gtk_progress_bar_new();
+    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(task->progress_bar), TRUE);
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(task->progress_bar), "Starting…");
+    gtk_box_pack_start(GTK_BOX(area), task->progress_bar, FALSE, FALSE, 8);
+    g_signal_connect(task->dialog, "response",
+                     G_CALLBACK(on_wav_export_response), task);
+    g_signal_connect(task->dialog, "delete-event",
+                     G_CALLBACK(on_wav_export_delete), task);
+
+    active_wav_export = task;
+    task->thread = g_thread_new("wav-export", wav_export_worker, task);
+    task->progress_timer = g_timeout_add(100, update_wav_export_dialog, task);
+    gtk_widget_show_all(task->dialog);
+    set_status("Exporting audio to WAV in the background");
+}
+#endif
+
 static void on_play(GtkButton *button, gpointer data)
 {
     (void)button;
     (void)data;
 
-    if (!module_loaded)
+    if (playback_mode == PLAYBACK_NONE && zx_pending) {
+        zx_pending->autoplay = 1;
+        set_status("Will play after ZX rendering finishes");
         return;
+    }
+    if (playback_mode == PLAYBACK_NONE)
+        return;
+
+    if (playback_mode == PLAYBACK_FFMPEG &&
+        (stopped || audio_ended || !ffmpeg_audio)) {
+        char filename[sizeof(current_file)];
+        g_strlcpy(filename, zx_active_wav ? zx_active_wav : current_file,
+                  sizeof(filename));
+        if (!filename[0] || !open_ffmpeg_audio(filename))
+            return;
+        if (zx_active_wav)
+            zx_apply_labels();
+    }
+#ifdef ENABLE_ZXTUNE_NATIVE
+    if (playback_mode == PLAYBACK_ZX &&
+        (stopped || audio_ended || !zx_audio)) {
+        char filename[sizeof(current_file)];
+        g_strlcpy(filename, current_file, sizeof(filename));
+        if (!filename[0] || !open_zx_native(filename))
+            return;
+    }
+#endif
 
     if (playing) {
         SDL_PauseAudioDevice(audio_device, 1);
         playing = 0;
         set_status("Paused");
-    } else {
+    } else if (playback_mode == PLAYBACK_MODULE) {
         SDL_LockAudioDevice(audio_device);
         if (stopped || audio_ended) {
             xmp_restart_module(ctx);
@@ -446,7 +1726,36 @@ static void on_play(GtkButton *button, gpointer data)
         SDL_UnlockAudioDevice(audio_device);
         SDL_PauseAudioDevice(audio_device, 0);
         set_status("Playing");
+    } else if (playback_mode == PLAYBACK_SID) {
+        SDL_LockAudioDevice(audio_device);
+        if (stopped || audio_ended) {
+            unsigned int song = sid_audio_current_song(sid_audio);
+            if (!sid_audio || sid_audio_select_song(sid_audio, song) < 0) {
+                SDL_UnlockAudioDevice(audio_device);
+                set_status("Could not restart SID tune.");
+                return;
+            }
+            stopped = 0;
+            audio_ended = 0;
+        }
+        playing = 1;
+        SDL_UnlockAudioDevice(audio_device);
+        SDL_PauseAudioDevice(audio_device, 0);
+        set_status("Playing SID tune");
+    } else if (playback_mode == PLAYBACK_FFMPEG) {
+        stopped = 0;
+        audio_ended = 0;
+        playing = 1;
+        SDL_PauseAudioDevice(audio_device, 0);
+        set_status("Playing");
+    } else if (playback_mode == PLAYBACK_ZX) {
+        stopped = 0;
+        audio_ended = 0;
+        playing = 1;
+        SDL_PauseAudioDevice(audio_device, 0);
+        set_status("Playing ZX Spectrum tune");
     }
+
     update_play_button();
 }
 
@@ -455,16 +1764,33 @@ static void on_stop(GtkButton *button, gpointer data)
     (void)button;
     (void)data;
 
-    if (!module_loaded)
+    if (playback_mode == PLAYBACK_NONE && zx_pending) {
+        zx_cancel_pending();
+        gtk_label_set_text(GTK_LABEL(title_label), "No module loaded");
+        set_status("ZX rendering cancelled");
+        return;
+    }
+    if (playback_mode == PLAYBACK_NONE)
         return;
 
     SDL_PauseAudioDevice(audio_device, 1);
-    SDL_LockAudioDevice(audio_device);
-    xmp_stop_module(ctx);
+
+    if (playback_mode == PLAYBACK_MODULE) {
+        SDL_LockAudioDevice(audio_device);
+        xmp_stop_module(ctx);
+        SDL_UnlockAudioDevice(audio_device);
+    } else if (playback_mode == PLAYBACK_FFMPEG ||
+               playback_mode == PLAYBACK_ZX) {
+        stop_ffmpeg_decoder();
+    } else if (playback_mode == PLAYBACK_SID && sid_audio) {
+        SDL_LockAudioDevice(audio_device);
+        sid_audio_select_song(sid_audio, sid_audio_current_song(sid_audio));
+        SDL_UnlockAudioDevice(audio_device);
+    }
+
     playing = 0;
     stopped = 1;
     audio_ended = 0;
-    SDL_UnlockAudioDevice(audio_device);
 
     update_play_button();
     set_status("Stopped");
@@ -474,6 +1800,38 @@ static void on_previous(GtkButton *button, gpointer data)
 {
     (void)button;
     (void)data;
+    if (playback_mode == PLAYBACK_SID && sid_audio) {
+        SDL_LockAudioDevice(audio_device);
+        unsigned int count = sid_audio_song_count(sid_audio);
+        unsigned int current = sid_audio_current_song(sid_audio);
+        unsigned int target = (count > 0 && current > 1) ? current - 1 : count;
+        if (count > 0 && sid_audio_select_song(sid_audio, target) > 0) {
+            stopped = 0;
+            audio_ended = 0;
+        }
+        SDL_UnlockAudioDevice(audio_device);
+        return;
+    }
+    if (zx_active_wav && playback_mode == PLAYBACK_FFMPEG && ffmpeg_audio) {
+        SDL_LockAudioDevice(audio_device);
+        ffmpeg_seek_target_ms = 0;
+        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
+        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
+        audio_ended = 0;
+        SDL_UnlockAudioDevice(audio_device);
+        return;
+    }
+#ifdef ENABLE_ZXTUNE_NATIVE
+    if (playback_mode == PLAYBACK_ZX && zx_audio) {
+        SDL_LockAudioDevice(audio_device);
+        ffmpeg_seek_target_ms = 0;
+        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
+        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
+        audio_ended = 0;
+        SDL_UnlockAudioDevice(audio_device);
+        return;
+    }
+#endif
     if (!module_loaded) return;
 
     SDL_LockAudioDevice(audio_device);
@@ -485,6 +1843,36 @@ static void on_next(GtkButton *button, gpointer data)
 {
     (void)button;
     (void)data;
+    if (playback_mode == PLAYBACK_SID && sid_audio) {
+        SDL_LockAudioDevice(audio_device);
+        unsigned int count = sid_audio_song_count(sid_audio);
+        unsigned int current = sid_audio_current_song(sid_audio);
+        unsigned int target = (count > 0 && current < count) ? current + 1 : 1;
+        if (count > 0 && sid_audio_select_song(sid_audio, target) > 0) {
+            stopped = 0;
+            audio_ended = 0;
+        }
+        SDL_UnlockAudioDevice(audio_device);
+        return;
+    }
+    if (zx_active_wav && playback_mode == PLAYBACK_FFMPEG && ffmpeg_audio) {
+        SDL_LockAudioDevice(audio_device);
+        ffmpeg_seek_target_ms = ffmpeg_duration_ms;
+        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
+        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
+        SDL_UnlockAudioDevice(audio_device);
+        return;
+    }
+#ifdef ENABLE_ZXTUNE_NATIVE
+    if (playback_mode == PLAYBACK_ZX && zx_audio) {
+        SDL_LockAudioDevice(audio_device);
+        ffmpeg_seek_target_ms = ffmpeg_duration_ms;
+        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
+        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
+        SDL_UnlockAudioDevice(audio_device);
+        return;
+    }
+#endif
     if (!module_loaded) return;
 
     SDL_LockAudioDevice(audio_device);
@@ -495,15 +1883,31 @@ static void on_next(GtkButton *button, gpointer data)
 static void on_seek(GtkRange *range, gpointer data)
 {
     (void)data;
-    if (!module_loaded || updating_seek)
+
+    if (updating_seek)
         return;
 
     int ms = (int)gtk_range_get_value(range);
-    SDL_LockAudioDevice(audio_device);
-    xmp_seek_time(ctx, ms);
-    audio_ended = 0;
-    stopped = 0;
-    SDL_UnlockAudioDevice(audio_device);
+
+    if (playback_mode == PLAYBACK_MODULE && module_loaded) {
+        SDL_LockAudioDevice(audio_device);
+        xmp_seek_time(ctx, ms);
+        audio_ended = 0;
+        stopped = 0;
+        SDL_UnlockAudioDevice(audio_device);
+    } else if ((playback_mode == PLAYBACK_FFMPEG && ffmpeg_audio)
+#ifdef ENABLE_ZXTUNE_NATIVE
+               || (playback_mode == PLAYBACK_ZX && zx_audio)
+#endif
+               ) {
+        SDL_LockAudioDevice(audio_device);
+        ffmpeg_seek_target_ms = ms;
+        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
+        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
+        audio_ended = 0;
+        stopped = 0;
+        SDL_UnlockAudioDevice(audio_device);
+    }
 }
 
 
@@ -591,7 +1995,11 @@ static gboolean draw_visualizer(GtkWidget *widget, cairo_t *cr,
 static void update_visualizer_spectrum(void)
 {
     /* Let the bars and peak markers settle while playback is stopped. */
-    if (!module_loaded || !playing || audio_ended) {
+    if ((playback_mode != PLAYBACK_ZX &&
+         playback_mode != PLAYBACK_MODULE &&
+         playback_mode != PLAYBACK_FFMPEG &&
+         playback_mode != PLAYBACK_SID) ||
+        !playing || audio_ended) {
         for (int i = 0; i < VIZ_BANDS; i++) {
             viz_levels[i] *= 0.82;
             viz_peaks[i] *= 0.96;
@@ -696,6 +2104,37 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
 
     cairo_set_source_rgb(cr, 0.055, 0.065, 0.080);
     cairo_paint(cr);
+
+    if (((zx_active_wav && playback_mode == PLAYBACK_FFMPEG) ||
+         playback_mode == PLAYBACK_ZX) &&
+        width >= 80 && height >= 20) {
+        /* Both ZX backends expose mixed output. Do not represent this
+         * waveform as separate AY chip channels. */
+        int16_t waveform[2048];
+        SDL_LockAudioDevice(audio_device);
+        unsigned int start = (viz_write_pos + VIZ_RING_SIZE - 2048) %
+                             VIZ_RING_SIZE;
+        for (unsigned i = 0; i < 2048; ++i)
+            waveform[i] = viz_ring[(start + i) % VIZ_RING_SIZE];
+        SDL_UnlockAudioDevice(audio_device);
+
+        cairo_set_source_rgb(cr, 0.73, 0.78, 0.84);
+        cairo_move_to(cr, 12, 17);
+        cairo_show_text(cr, "ZX Spectrum - mixed audio waveform");
+        cairo_set_source_rgb(cr, 0.35, 0.90, 0.65);
+        cairo_set_line_width(cr, 1.0);
+        for (int x = 0; x < width; ++x) {
+            int idx = (int)((int64_t)x * 2048 / width);
+            double y = height * 0.56 - waveform[idx] / 32768.0 *
+                       (height * 0.35);
+            if (x == 0)
+                cairo_move_to(cr, x, y);
+            else
+                cairo_line_to(cr, x, y);
+        }
+        cairo_stroke(cr);
+        return FALSE;
+    }
 
     if (!module_loaded || !player_started || width < 80 || height < 20)
         return FALSE;
@@ -931,8 +2370,24 @@ static void play_playlist_file(const char *filename)
     if (!filename || !*filename)
         return;
 
+    zx_autoplay_request = 1;
     open_module(filename);
-    if (module_loaded)
+    zx_autoplay_request = 0;
+
+    if (zx_is_music_path(filename))
+        return;
+
+    if (module_loaded) {
+        on_play(NULL, NULL);
+        return;
+    }
+
+    if (open_sid(filename)) {
+        on_play(NULL, NULL);
+        return;
+    }
+
+    if (open_ffmpeg_audio(filename))
         on_play(NULL, NULL);
 }
 
@@ -947,12 +2402,13 @@ static void on_playlist_load_m3u(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER_ACTION_OPEN,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Open", GTK_RESPONSE_ACCEPT, NULL);
+    restore_last_folder(dialog);
 
     if (gtk_dialog_run(GTK_DIALOG(dialog)) != GTK_RESPONSE_ACCEPT) {
         gtk_widget_destroy(dialog);
         return;
     }
-
+    remember_last_folder(dialog);
     char *filename = gtk_file_chooser_get_filename(
         GTK_FILE_CHOOSER(dialog));
     gtk_widget_destroy(dialog);
@@ -1025,12 +2481,13 @@ static void on_playlist_save_m3u(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER(dialog), TRUE);
     gtk_file_chooser_set_current_name(
         GTK_FILE_CHOOSER(dialog), "playlist.m3u");
+    restore_last_folder(dialog);
 
     if (gtk_dialog_run(GTK_DIALOG(dialog)) != GTK_RESPONSE_ACCEPT) {
         gtk_widget_destroy(dialog);
         return;
     }
-
+    remember_last_folder(dialog);
     char *filename = gtk_file_chooser_get_filename(
         GTK_FILE_CHOOSER(dialog));
     gtk_widget_destroy(dialog);
@@ -1079,15 +2536,38 @@ static void on_playlist_add(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER_ACTION_OPEN,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Add", GTK_RESPONSE_ACCEPT, NULL);
+    restore_last_folder(dialog);
 
     gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(dialog), TRUE);
 
     GtkFileFilter *filter = gtk_file_filter_new();
-    gtk_file_filter_set_name(filter, "Tracker modules and music files");
-    gtk_file_filter_add_pattern(filter, "*");
+    gtk_file_filter_set_name(filter, "Audio and tracker files");
+
+    const char *patterns[] = {
+        "*.mod", "*.MOD", "*.xm", "*.XM", "*.it", "*.IT",
+        "*.s3m", "*.S3M", "*.mptm", "*.MPTM", "*.mtm", "*.MTM",
+        "*.669", "*.amf", "*.med", "*.okt", "*.ult", "*.sid", "*.SID",
+        "*.mp3", "*.MP3", "*.wav", "*.WAV", "*.m4a", "*.M4A",
+        "*.aac", "*.AAC", "*.ogg", "*.OGG", "*.oga", "*.OGA", "*.opus", "*.OPUS",
+        "*.flac", "*.FLAC", "*.webm", "*.WEBM", "*.mka", "*.MKA",
+        "*.aiff", "*.aif", "*.wma", "*.mp4", "*.MP4",
+        "*.pt3", "*.PT3", "*.pt2", "*.PT2", "*.ay", "*.AY",
+        "*.vtx", "*.VTX", "*.ym", "*.YM", "*.stc", "*.STC",
+        "*.sqt", "*.SQT", "*.psg", "*.PSG", "*.asc", "*.ASC"
+    };
+
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
+        gtk_file_filter_add_pattern(filter, patterns[i]);
+
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
 
+    GtkFileFilter *all_filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(all_filter, "All files");
+    gtk_file_filter_add_pattern(all_filter, "*");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), all_filter);
+
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        remember_last_folder(dialog);
         GSList *files =
             gtk_file_chooser_get_filenames(GTK_FILE_CHOOSER(dialog));
 
@@ -1178,7 +2658,8 @@ static gboolean playlist_advance(void)
             if (next_file) {
                 play_playlist_file(next_file);
                 g_free(next_file);
-                return module_loaded && playing;
+                return (playback_mode != PLAYBACK_NONE && playing) ||
+                       zx_pending != NULL;
             }
             return FALSE;
         }
@@ -1212,7 +2693,9 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
     if (!module_loaded) {
         cairo_set_source_rgb(cr, 0.70, 0.73, 0.78);
         cairo_move_to(cr, 12, 24);
-        cairo_show_text(cr, "Load a module to view its pattern.");
+        cairo_show_text(cr, zx_active_source ?
+                        "ZX tunes do not expose XMP pattern data." :
+                        "Load a module to view its pattern.");
         return FALSE;
     }
 
@@ -1386,42 +2869,98 @@ static gboolean update_display(gpointer data)
 {
     (void)data;
 
-    if (!module_loaded)
+    if (playback_mode == PLAYBACK_NONE)
         return G_SOURCE_CONTINUE;
 
-    struct xmp_frame_info fi;
-    SDL_LockAudioDevice(audio_device);
-    xmp_get_frame_info(ctx, &fi);
-    int ended = audio_ended;
-    int is_playing = playing;
-    SDL_UnlockAudioDevice(audio_device);
+    int ended;
+    int is_playing;
+    int current;
+    int total;
 
-    int total = fi.total_time > 0 ? fi.total_time : 1;
-    int current = fi.time;
-    if (current < 0) current = 0;
-    if (current > total) current = total;
+    if (playback_mode == PLAYBACK_FFMPEG ||
+        playback_mode == PLAYBACK_ZX) {
+        SDL_LockAudioDevice(audio_device);
+        int64_t position_frames = ffmpeg_position_frames;
+        int64_t duration_ms = ffmpeg_duration_ms;
+        ended = audio_ended;
+        is_playing = playing;
+        SDL_UnlockAudioDevice(audio_device);
 
-    if (is_playing || ended) {
-        updating_seek = 1;
-        gtk_range_set_range(GTK_RANGE(seek_scale), 0, total);
-        gtk_range_set_value(GTK_RANGE(seek_scale), current);
-        updating_seek = 0;
+        current = (int)(position_frames * 1000 / AUDIO_RATE);
+        total = duration_ms > 0 ? (int)duration_ms : 1;
+        if (current < 0) current = 0;
+        if (current > total) current = total;
+
+        if (is_playing || ended) {
+            updating_seek = 1;
+            gtk_range_set_value(GTK_RANGE(seek_scale), current);
+            updating_seek = 0;
+        }
+
+        char time_text[80];
+        snprintf(time_text, sizeof(time_text), "%02d:%02d / %02d:%02d",
+                 current / 60000, (current / 1000) % 60,
+                 total / 60000, (total / 1000) % 60);
+        gtk_label_set_text(GTK_LABEL(time_label), time_text);
+
+        if (is_playing)
+            set_status(zx_active_source ? "Playing ZX Spectrum tune" :
+                       "Playing audio file");
+        else if (ended)
+            set_status("Playback finished");
+    } else if (playback_mode == PLAYBACK_SID) {
+        SDL_LockAudioDevice(audio_device);
+        unsigned int song = sid_audio ? sid_audio_current_song(sid_audio) : 0;
+        unsigned int count = sid_audio ? sid_audio_song_count(sid_audio) : 0;
+        ended = audio_ended;
+        is_playing = playing;
+        SDL_UnlockAudioDevice(audio_device);
+
+        char sid_status[128];
+        snprintf(sid_status, sizeof(sid_status), "SID subtune %u / %u",
+                 song, count);
+        gtk_label_set_text(GTK_LABEL(time_label), "SID tune");
+        if (is_playing)
+            gtk_label_set_text(GTK_LABEL(status_label), sid_status);
+        else if (ended)
+            set_status("SID playback finished");
+        current = 0;
+        total = 1;
+    } else {
+        struct xmp_frame_info fi;
+        SDL_LockAudioDevice(audio_device);
+        xmp_get_frame_info(ctx, &fi);
+        ended = audio_ended;
+        is_playing = playing;
+        SDL_UnlockAudioDevice(audio_device);
+
+        total = fi.total_time > 0 ? fi.total_time : 1;
+        current = fi.time;
+        if (current < 0) current = 0;
+        if (current > total) current = total;
+
+        if (is_playing || ended) {
+            updating_seek = 1;
+            gtk_range_set_range(GTK_RANGE(seek_scale), 0, total);
+            gtk_range_set_value(GTK_RANGE(seek_scale), current);
+            updating_seek = 0;
+        }
+
+        char time_text[80];
+        snprintf(time_text, sizeof(time_text), "%02d:%02d / %02d:%02d",
+                 current / 60000, (current / 1000) % 60,
+                 total / 60000, (total / 1000) % 60);
+        gtk_label_set_text(GTK_LABEL(time_label), time_text);
+
+        char status[160];
+        snprintf(status, sizeof(status),
+                 "Order %d    Pattern %d    Row %d    Speed %d    BPM %d",
+                 fi.pos, fi.pattern, fi.row, fi.speed, fi.bpm);
+        if (is_playing)
+            gtk_label_set_text(GTK_LABEL(status_label), status);
+        else if (ended)
+            set_status("Playback finished");
     }
-
-    char time_text[80];
-    snprintf(time_text, sizeof(time_text), "%02d:%02d / %02d:%02d",
-             current / 60000, (current / 1000) % 60,
-             total / 60000, (total / 1000) % 60);
-    gtk_label_set_text(GTK_LABEL(time_label), time_text);
-
-    char status[160];
-    snprintf(status, sizeof(status),
-             "Order %d    Pattern %d    Row %d    Speed %d    BPM %d",
-             fi.pos, fi.pattern, fi.row, fi.speed, fi.bpm);
-    if (playing)
-        gtk_label_set_text(GTK_LABEL(status_label), status);
-    else if (ended)
-        set_status("Playback finished");
 
     if (ended && !playlist_advance())
         update_play_button();
@@ -1430,10 +2969,8 @@ static gboolean update_display(gpointer data)
 
     if (scope_area)
         gtk_widget_queue_draw(scope_area);
-
     if (pattern_area)
         gtk_widget_queue_draw(pattern_area);
-
     if (visualizer_area)
         gtk_widget_queue_draw(visualizer_area);
 
@@ -1470,6 +3007,9 @@ static void apply_style(void)
         " min-height: 14px; }"
         ".module-title { font-size: 19px; font-weight: bold; }"
         "label#about-title { font-size: 24px; font-weight: bold; }"
+        "label#about-description { background-color: #20242c;"
+        " color: #e3e6ed; padding: 18px;"
+        " border: 1px solid #414754; border-radius: 6px; }"
         ".muted { color: #9ba4b4; }";
 
     GtkCssProvider *provider = gtk_css_provider_new();
@@ -1485,11 +3025,32 @@ static void on_destroy(GtkWidget *widget, gpointer data)
     (void)widget;
     (void)data;
 
+#ifdef ENABLE_WAV_EXPORT
+    if (active_wav_export) {
+        WavExportTask *task = active_wav_export;
+        g_atomic_int_set(&task->cancel, 1);
+        if (task->progress_timer)
+            g_source_remove(task->progress_timer);
+        g_thread_join(task->thread);
+        gtk_widget_destroy(task->dialog);
+        active_wav_export = NULL;
+        free_wav_export_task(task);
+    }
+#endif
+
+    stop_ffmpeg_decoder();
+    zx_cancel_pending();
+    zx_remove_active();
+
     if (audio_device) {
         SDL_PauseAudioDevice(audio_device, 1);
         SDL_LockAudioDevice(audio_device);
         if (player_started) xmp_end_player(ctx);
         if (module_loaded) xmp_release_module(ctx);
+        if (sid_audio) {
+            sid_audio_close(sid_audio);
+            sid_audio = NULL;
+        }
         player_started = 0;
         module_loaded = 0;
         SDL_UnlockAudioDevice(audio_device);
@@ -1583,7 +3144,7 @@ int main(int argc, char **argv)
                                 "module-title");
     gtk_box_pack_start(GTK_BOX(info), title_label, FALSE, FALSE, 0);
 
-    format_label = gtk_label_new("Open a tracker module to begin");
+    format_label = gtk_label_new("Open a music file to begin");
     gtk_label_set_xalign(GTK_LABEL(format_label), 0);
     gtk_box_pack_start(GTK_BOX(info), format_label, FALSE, FALSE, 0);
 
@@ -1603,7 +3164,11 @@ int main(int argc, char **argv)
     gtk_box_pack_start(GTK_BOX(outer), controls, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(controls),
-        make_button("Open module…", G_CALLBACK(on_open)), FALSE, FALSE, 0);
+        make_button("Open File…", G_CALLBACK(on_open)), FALSE, FALSE, 0);
+#ifdef ENABLE_WAV_EXPORT
+    gtk_box_pack_start(GTK_BOX(controls),
+        make_button("Export WAV…", G_CALLBACK(on_export_wav)), FALSE, FALSE, 0);
+#endif
     gtk_box_pack_start(GTK_BOX(controls),
         make_button("|◀", G_CALLBACK(on_previous)), FALSE, FALSE, 0);
 
@@ -1616,9 +3181,22 @@ int main(int argc, char **argv)
     gtk_box_pack_start(GTK_BOX(controls),
         make_button("▶|", G_CALLBACK(on_next)), FALSE, FALSE, 0);
 
-    /* Playlist */
-    GtkWidget *playlist_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_box_pack_start(GTK_BOX(outer), playlist_box, FALSE, FALSE, 0);
+    GtkWidget *volume_label = gtk_label_new("Volume");
+    gtk_box_pack_start(GTK_BOX(controls), volume_label, FALSE, FALSE, 0);
+    volume_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 100, 1);
+    gtk_scale_set_draw_value(GTK_SCALE(volume_scale), TRUE);
+    gtk_scale_set_value_pos(GTK_SCALE(volume_scale), GTK_POS_RIGHT);
+    gtk_widget_set_size_request(volume_scale, 140, -1);
+    gtk_range_set_value(GTK_RANGE(volume_scale), master_volume);
+    g_signal_connect(volume_scale, "value-changed", G_CALLBACK(on_volume_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(controls), volume_scale, FALSE, FALSE, 0);
+
+   /* Adjustable playlist and pattern sections */
+GtkWidget *content_pane = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
+gtk_box_pack_start(GTK_BOX(outer), content_pane, TRUE, TRUE, 0);
+
+/* Playlist */
+GtkWidget *playlist_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
 
     GtkWidget *playlist_controls =
         gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
@@ -1667,10 +3245,11 @@ int main(int argc, char **argv)
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(playlist_scroll),
                                    GTK_POLICY_AUTOMATIC,
                                    GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(playlist_scroll, -1, 110);
+    gtk_widget_set_size_request(playlist_scroll, -1, 60);
     gtk_container_add(GTK_CONTAINER(playlist_scroll), playlist_view);
-    gtk_box_pack_start(GTK_BOX(playlist_box), playlist_scroll,
-                       FALSE, TRUE, 0);
+   gtk_box_pack_start(GTK_BOX(playlist_box), playlist_scroll,
+                   TRUE, TRUE, 0);
+gtk_paned_pack1(GTK_PANED(content_pane), playlist_box, TRUE, TRUE);
 
     seek_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 1, 100);
     gtk_scale_set_draw_value(GTK_SCALE(seek_scale), FALSE);
@@ -1679,30 +3258,46 @@ int main(int argc, char **argv)
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(pattern_scroll),
                                    GTK_POLICY_AUTOMATIC,
                                    GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(pattern_scroll, -1, 230);
+    gtk_widget_set_size_request(pattern_scroll, -1, 60);
 
     pattern_area = gtk_drawing_area_new();
     gtk_widget_set_size_request(pattern_area, 900, 270);
     g_signal_connect(pattern_area, "draw", G_CALLBACK(draw_pattern), NULL);
     gtk_container_add(GTK_CONTAINER(pattern_scroll), pattern_area);
 
+    GtkWidget *pattern_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+
     GtkWidget *pattern_heading = gtk_label_new("Pattern View");
     gtk_widget_set_halign(pattern_heading, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(outer), pattern_heading,
-                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(pattern_box), pattern_heading,
+                   FALSE, FALSE, 0);
 
-    gtk_box_pack_start(GTK_BOX(outer), pattern_scroll, FALSE, TRUE, 0);
+gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
+                   TRUE, TRUE, 0);
+
+    /* Put pattern view and scopes together below the playlist. */
+    GtkWidget *lower_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+
+    gtk_box_pack_start(GTK_BOX(lower_box), pattern_box,
+                       TRUE, TRUE, 0);
 
     GtkWidget *scope_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scope_scroll),
                                    GTK_POLICY_AUTOMATIC,
                                    GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(scope_scroll, -1, 140);
+    gtk_widget_set_size_request(scope_scroll, -1, 60);
+
     scope_area = gtk_drawing_area_new();
     gtk_widget_set_size_request(scope_area, 620, 180);
     g_signal_connect(scope_area, "draw", G_CALLBACK(draw_scopes), NULL);
     gtk_container_add(GTK_CONTAINER(scope_scroll), scope_area);
-    gtk_box_pack_start(GTK_BOX(outer), scope_scroll, TRUE, TRUE, 0);
+
+    gtk_box_pack_start(GTK_BOX(lower_box), scope_scroll,
+                       TRUE, TRUE, 0);
+
+    /* One divider: playlist above, pattern and scopes below. */
+    gtk_paned_pack2(GTK_PANED(content_pane), lower_box, TRUE, TRUE);
+    gtk_paned_set_position(GTK_PANED(content_pane), 230);
 
     gtk_box_pack_start(GTK_BOX(outer), seek_scale, FALSE, FALSE, 0);
 
@@ -1791,6 +3386,174 @@ int main(int argc, char **argv)
         GTK_NOTEBOOK(notebook), samples_page,
         gtk_label_new("Samples & Notes"));
 
+
+    /* High Voltage SID Collection */
+    GtkWidget *hvsc_page =
+        gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    gtk_container_set_border_width(GTK_CONTAINER(hvsc_page), 24);
+
+    GtkWidget *hvsc_title =
+        gtk_label_new("High Voltage SID Collection");
+    gtk_widget_set_halign(hvsc_title, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(hvsc_title), "title");
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_title,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *hvsc_description = gtk_label_new(
+        "Download or manage the High Voltage SID Collection (HVSC),\n"
+        "an extensive archive of Commodore 64 SID music.");
+    gtk_label_set_xalign(GTK_LABEL(hvsc_description), 0);
+    gtk_label_set_line_wrap(GTK_LABEL(hvsc_description), TRUE);
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_description,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *hvsc_folder_label =
+        gtk_label_new("Collection folder:");
+    gtk_widget_set_halign(hvsc_folder_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_folder_label,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *hvsc_folder = gtk_file_chooser_button_new(
+        "Choose HVSC Collection Folder",
+        GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER);
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_folder,
+                       FALSE, FALSE, 0);
+
+    char *hvsc_settings_file = get_hvsc_folder_file();
+    char *saved_hvsc_folder = NULL;
+
+    if (g_file_get_contents(hvsc_settings_file,
+                            &saved_hvsc_folder, NULL, NULL)) {
+        g_strstrip(saved_hvsc_folder);
+        if (g_file_test(saved_hvsc_folder, G_FILE_TEST_IS_DIR))
+            gtk_file_chooser_set_filename(
+                GTK_FILE_CHOOSER(hvsc_folder), saved_hvsc_folder);
+    }
+
+    g_free(saved_hvsc_folder);
+    g_free(hvsc_settings_file);
+
+    g_signal_connect(hvsc_folder, "file-set",
+                     G_CALLBACK(on_hvsc_folder_changed), NULL);
+
+
+
+    /* Separate installation destination: never use the existing
+       collection selector as the download destination. */
+    GtkWidget *hvsc_install_label = gtk_label_new(
+        "Install a new HVSC collection into:");
+    gtk_widget_set_halign(hvsc_install_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_install_label,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *hvsc_install_folder =
+        gtk_file_chooser_button_new(
+            "Choose Installation Parent Folder",
+            GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER);
+
+    char *hvsc_default_parent =
+        g_build_filename(g_get_home_dir(), "Music", NULL);
+
+    if (g_file_test(hvsc_default_parent, G_FILE_TEST_IS_DIR))
+        gtk_file_chooser_set_filename(
+            GTK_FILE_CHOOSER(hvsc_install_folder),
+            hvsc_default_parent);
+    else
+        gtk_file_chooser_set_filename(
+            GTK_FILE_CHOOSER(hvsc_install_folder),
+            g_get_home_dir());
+
+    g_free(hvsc_default_parent);
+
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_install_folder,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *hvsc_install_hint = gtk_label_new(
+        "A new HVSC folder will be created inside the selected directory.\n"
+        "Existing files and collections will never be overwritten.");
+    gtk_label_set_xalign(GTK_LABEL(hvsc_install_hint), 0);
+    gtk_label_set_line_wrap(GTK_LABEL(hvsc_install_hint), TRUE);
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_install_hint,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *hvsc_buttons =
+        gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_buttons,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *hvsc_download =
+        gtk_button_new_with_label("Download HVSC");
+    gtk_box_pack_start(GTK_BOX(hvsc_buttons), hvsc_download,
+                       FALSE, FALSE, 0);
+
+    gtk_button_set_label(
+        GTK_BUTTON(hvsc_download), "Check Installation Destination");
+
+    g_signal_connect(
+        hvsc_download, "clicked",
+        G_CALLBACK(on_hvsc_check_destination),
+        hvsc_install_folder);
+
+    GtkWidget *hvsc_open_folder =
+        gtk_button_new_with_label("Open HVSC Folder");
+    gtk_box_pack_start(GTK_BOX(hvsc_buttons), hvsc_open_folder,
+                       FALSE, FALSE, 0);
+
+    g_signal_connect(hvsc_open_folder, "clicked",
+                     G_CALLBACK(on_hvsc_open_folder), hvsc_folder);
+
+
+    GtkWidget *hvsc_progress = gtk_progress_bar_new();
+
+    GtkWidget *hvsc_waveform = gtk_drawing_area_new();
+    gtk_widget_set_size_request(hvsc_waveform, -1, 76);
+
+    g_object_set_data(G_OBJECT(hvsc_waveform),
+                      "progress", hvsc_progress);
+
+    g_signal_connect(hvsc_waveform, "draw",
+                     G_CALLBACK(hvsc_waveform_draw), NULL);
+
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_waveform,
+                       FALSE, FALSE, 0);
+
+    /* Retain the progress object as our numeric progress state,
+       but hide its ordinary GTK visual representation. */
+    gtk_widget_set_no_show_all(hvsc_progress, TRUE);
+    gtk_widget_hide(hvsc_progress);
+
+    GtkWidget *hvsc_status =
+        gtk_label_new("Ready to download or select an existing collection.");
+    gtk_label_set_xalign(GTK_LABEL(hvsc_status), 0);
+    gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_status,
+                       FALSE, FALSE, 0);
+    GtkWidget *hvsc_auto_button =
+        gtk_button_new_with_label("Download & Install HVSC");
+
+    gtk_box_pack_start(GTK_BOX(hvsc_buttons),
+                       hvsc_auto_button, FALSE, FALSE, 0);
+
+    HvscUI *hvsc_ui = g_new0(HvscUI, 1);
+    hvsc_ui->button = hvsc_auto_button;
+    hvsc_ui->progress = hvsc_progress;
+    hvsc_ui->waveform = hvsc_waveform;
+    hvsc_ui->status = hvsc_status;
+    hvsc_ui->collection_folder = hvsc_folder;
+
+    GtkWidget **hvsc_data = g_new0(GtkWidget *, 2);
+    hvsc_data[0] = hvsc_install_folder;
+    hvsc_data[1] = (GtkWidget *)hvsc_ui;
+
+    g_signal_connect(hvsc_auto_button, "clicked",
+                     G_CALLBACK(on_hvsc_download_clicked),
+                     hvsc_data);
+
+
+    gtk_notebook_append_page(
+        GTK_NOTEBOOK(notebook), hvsc_page,
+        gtk_label_new("HVSC"));
+
     /* About page */
     GtkWidget *about_page =
         gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
@@ -1803,13 +3566,22 @@ int main(int argc, char **argv)
     gtk_box_pack_start(GTK_BOX(about_page), about_icon,
                        FALSE, FALSE, 0);
 
-    GtkWidget *about_title = gtk_label_new("XMP Module Player");
+    GtkWidget *about_title = gtk_label_new("XMP Module Player 1.1");
     gtk_widget_set_name(about_title, "about-title");
     gtk_box_pack_start(GTK_BOX(about_page), about_title,
                        FALSE, FALSE, 0);
 
     GtkWidget *about_description = gtk_label_new(
-        "A native Linux tracker module player built with GTK3, SDL2, and libxmp.");
+        "A native Linux music player built with GTK3 and SDL2.\n"
+        "\n"
+        "Tracker modules powered by libxmp\n"
+        "Commodore 64 SID music powered by libsidplayfp\n"
+        "Digital audio powered by FFmpeg\n"
+        "MP3, WAV, M4A/AAC, Ogg Vorbis, Opus, FLAC and more\n"
+        "\n"
+        "High Voltage SID Collection (HVSC) browsing\n"
+        "and integrated collection downloader.");
+    gtk_widget_set_name(about_description, "about-description");
     gtk_label_set_line_wrap(GTK_LABEL(about_description), TRUE);
     gtk_label_set_justify(GTK_LABEL(about_description), GTK_JUSTIFY_CENTER);
     gtk_widget_set_size_request(about_description, 420, -1);
@@ -1827,8 +3599,12 @@ int main(int argc, char **argv)
 
     g_timeout_add(33, update_display, NULL);
 
-    if (argc > 1)
+    if (argc > 1) {
         open_module(argv[1]);
+        if (!zx_is_music_path(argv[1]) && !module_loaded &&
+            !open_sid(argv[1]))
+            open_ffmpeg_audio(argv[1]);
+    }
 
     gtk_widget_show_all(window);
     gtk_main();
