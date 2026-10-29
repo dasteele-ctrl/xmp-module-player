@@ -10,9 +10,12 @@ XMP Module Player brings classic tracker music and regular audio playback to the
 
 - 🎵 **Tracker module playback** powered by libxmp
 - 🎧 **Regular audio playback** powered by FFmpeg: MP3, WAV, M4A/AAC, Ogg Vorbis, Opus, and FLAC
-- 🎵 **ZX Spectrum AY/YM playback** through the optional ZXTune renderer, including PT3, AY, VTX, YM, STC, and SQT
+- 🎵 **Commodore 64 SID playback** powered by libsidplayfp
+- 🎵 **ZX Spectrum AY/YM playback** through bundled ZXTune, including PT3, AY, VTX, YM, STC, and SQT
+- 💾 **Offline WAV export** for supported audio formats, with cancellation and overwrite confirmation
 - 🎚️ **Playback controls** with seeking and track timing
 - 📃 **Playlist management** with add, remove, clear, and drag-and-drop support
+- 📃 **High Voltage SID Collection (HVSC) browsing and integrated downloader**
 - 🔁 **Automatic track advancement**
 - 📂 **M3U playlist loading and saving**
 - 📊 **Real-time audio spectrum visualizer** with peak hold
