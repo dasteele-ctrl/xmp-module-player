@@ -13,13 +13,16 @@ local test, not a distribution-ready release.
    into that same folder. Make both tools executable.
 4. Run `bash packaging/appimage/build.sh` from the repository root.
 
-The resulting AppImage is written under `dist/` with a timestamp in its
-filename. This script does not overwrite an existing AppImage.
+The resulting version 1.4 AppImage is written under `dist/` with a timestamp in
+its filename (`XMP_Module_Player-1.4-x86_64-*.AppImage`). This script does not
+overwrite an existing AppImage.
 
 GTK plugins and resources can be loaded dynamically, so `ldd` alone does
 not capture all runtime dependencies. Test the AppImage with ZX, tracker,
 SID, and FFmpeg-supported formats, and verify the file picker and desktop
-theme. ZXTune is linked statically into `xmp-zx-helper`, not the main player.
+theme. For version 1.4, test the IRC tab's TLS connection to EsperNet as well:
+the GTK GIO TLS backend and certificate handling may be dynamically loaded.
+ZXTune is linked statically into `xmp-zx-helper`, not the main player.
 The two executables communicate directly over a local PCM stream, so the
 system libsidplayfp in `xmp-linux` cannot conflict with ZXTune's bundled
 libsidplayfp. Both executables and their runtime dependencies are included

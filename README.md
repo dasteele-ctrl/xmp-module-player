@@ -21,7 +21,7 @@ XMP Module Player brings classic tracker music and regular audio playback to the
 - 🔁 **Automatic track advancement**
 - 📂 **M3U playlist loading and saving**
 - 📊 **Real-time audio spectrum visualizer** with peak hold
-- 🎚️ **10-band equalizer (1.3 development)** with presets, preamp, and a live frequency-response curve
+- 🎚️ **10-band equalizer (introduced in 1.3)** with presets, preamp, and a live frequency-response curve
 - 🌊 **Channel scopes** for visualizing audio activity
 - 🧩 **Pattern viewer** for tracker data
 - 🔊 **Sample browser** with waveform visualization, sample details, loop information, and module comments
@@ -52,13 +52,13 @@ Download the latest Linux AppImage from the project's **[Releases](../../release
 
 ### Running the AppImage
 
-1. Download `XMP_Module_Player-x86_64.AppImage`.
+1. Download the versioned `XMP_Module_Player-1.4-x86_64-*.AppImage` file from Release 1.4.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x XMP_Module_Player-x86_64.AppImage
-   ./XMP_Module_Player-x86_64.AppImage
+   chmod +x XMP_Module_Player-1.4-x86_64-*.AppImage
+   ./XMP_Module_Player-1.4-x86_64-*.AppImage
    ```
 
 ## Requirements
@@ -91,7 +91,7 @@ on systems without one installed. The AppImage script can optionally include a
 chosen SF2/SF3 and its license, after both have been reviewed. See the AppImage
 MIDI playback and the SoundFont Manager were introduced in **version 1.2**.
 
-### 10-Band Equalizer (version 1.3 development)
+### 10-Band Equalizer (introduced in version 1.3)
 
 The integrated **Equalizer** tab provides ten adjustable bands (31 Hz to
 16 kHz), a preamp control, an aqua frequency-response graph with a subtle live
@@ -167,7 +167,11 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current version: 1.2**
+**Current version: 1.4**
+
+Version 1.4 integrates an IRC client in the player's existing GTK interface.
+It includes TLS connections, multiple channels, private-message tabs, and an
+EsperNet `#modulez` preset. IRC connections are initiated manually.
 
 This project is actively being developed. Features and compatibility may change as development continues.
 

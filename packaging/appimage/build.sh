@@ -43,7 +43,7 @@ done
 mkdir -p -- "$dist_dir"
 build_root="$(mktemp -d /tmp/xmp-appimage.XXXXXXXX)"
 appdir="$build_root/XMP_Module_Player.AppDir"
-output_name="XMP_Module_Player-x86_64-$(date +%Y%m%d-%H%M%S).AppImage"
+output_name="XMP_Module_Player-1.4-x86_64-$(date +%Y%m%d-%H%M%S).AppImage"
 
 cleanup() {
     if [[ -n "${build_root:-}" && -d "$build_root" &&
