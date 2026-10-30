@@ -4,7 +4,7 @@ A native Linux music player built with **GTK3, SDL2, libxmp, and FFmpeg**.
 
 XMP Module Player brings classic tracker music and regular audio playback to the Linux desktop, with a graphical interface, real-time audio visualization, and detailed module and sample information.
 
-![XMP Module Player running on Linux](xmp1.2.png)
+![XMP Module Player running on Linux](xmp1.3.png)
 
 ## Features
 
