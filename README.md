@@ -27,6 +27,24 @@ XMP Module Player brings classic tracker music and regular audio playback to the
 - 🔊 **Sample browser** with waveform visualization, sample details, loop information, and module comments
 - 📂 Offline WAV export: Render supported music to WAV without waiting through real-time playback.
 - 🖥️ **Native GTK3 interface** with SDL2 audio output
+- 💬 **Built-in IRC chat** with EsperNet/#modulez preset, TLS, channel tabs, and private messages
+
+## IRC community chat
+
+The **IRC** tab is a simple, classic IRC client integrated into XMP's GTK3
+interface. It defaults to EsperNet (`irc.esper.net`, TLS port 6697) and
+auto-joins `#modulez` after a successful connection. Change the network,
+nickname, and auto-join channel with the **Connect** or **Settings** buttons.
+
+The client has channels, private-message tabs, a user list, and IRC commands
+such as `/join`, `/part`, `/nick`, and `/me`. It does not connect until you
+click **Connect**. Network settings are saved to
+`~/.config/xmp-irc/settings.ini`; no IRC passwords are stored.
+
+The IRC widget uses XMP's existing dark teal GTK palette, with green
+nicknames for a classic terminal look. The parser can be checked using
+`make check-irc`; that command also performs a syntax check of the GTK/GIO
+source files.
 
 ## Download
 

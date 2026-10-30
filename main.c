@@ -13,6 +13,7 @@
 #include "midi_audio.h"
 #include "equalizer.h"
 #include "hvsc_download.h"
+#include "xmp_irc_widget.h"
 #ifdef ENABLE_WAV_EXPORT
 #include "export_wav.h"
 #endif
@@ -4887,6 +4888,9 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_notebook_append_page(
         GTK_NOTEBOOK(notebook), hvsc_page,
         gtk_label_new("HVSC"));
+
+    /* Classic IRC chat, using the same GTK notebook and dark theme. */
+    xmp_irc_add_notebook_page(GTK_NOTEBOOK(notebook));
 
     /* About page */
     GtkWidget *about_page =
