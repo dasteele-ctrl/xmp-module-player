@@ -24,6 +24,22 @@ if [[ ! -x "$linuxdeploy" || ! -x "$gtk_plugin" ]]; then
     exit 1
 fi
 
+# The HVSC downloader uses these executables at runtime. Bundle curl and the
+# standalone 7zz (rather than plugin-dependent 7z) with their ELF dependencies.
+hvsc_utilities=()
+for utility_name in curl 7zz; do
+    utility_path="$(command -v "$utility_name" || true)"
+    # Ubuntu's /usr/bin/7zz is a shell wrapper; linuxdeploy needs the ELF.
+    if [[ "$utility_name" == 7zz && -x /usr/lib/7zip/7zz ]]; then
+        utility_path=/usr/lib/7zip/7zz
+    fi
+    if [[ ! -f "$utility_path" || ! -x "$utility_path" ]]; then
+        echo "Missing $utility_name on the build machine. On Mint/Ubuntu: sudo apt install curl 7zip-standalone" >&2
+        exit 1
+    fi
+    hvsc_utilities+=(--executable "$utility_path")
+done
+
 mkdir -p -- "$dist_dir"
 build_root="$(mktemp -d /tmp/xmp-appimage.XXXXXXXX)"
 appdir="$build_root/XMP_Module_Player.AppDir"
@@ -48,10 +64,21 @@ fi
         --appdir "$appdir" \
         --executable "$project_dir/xmp-linux" \
         --executable "$project_dir/xmp-zx-helper" \
+        "${hvsc_utilities[@]}" \
         --desktop-file "$script_dir/xmp-module-player.desktop" \
         --icon-file "$project_dir/icons/xmp.png" \
         --plugin gtk
 )
+
+# hvsc_download.c looks for this helper inside $APPDIR when launched as an
+# AppImage. Without it, HVSC installation works only in a source-tree build.
+hvsc_installer="$project_dir/hvsc-install-safe.sh"
+if [[ ! -f "$hvsc_installer" ]]; then
+    echo "Missing HVSC installer script: $hvsc_installer" >&2
+    exit 1
+fi
+install -D -m 0755 "$hvsc_installer" \
+    "$appdir/usr/share/xmp-module-player/hvsc-install-safe.sh"
 
 # Optional bundled General MIDI bank. Keep the exact license for the chosen
 # SoundFont with the AppImage; other sources may have different permissions.

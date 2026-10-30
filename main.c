@@ -11,6 +11,7 @@
 #include "ffmpeg_audio.h"
 #include "sid_audio.h"
 #include "midi_audio.h"
+#include "equalizer.h"
 #include "hvsc_download.h"
 #ifdef ENABLE_WAV_EXPORT
 #include "export_wav.h"
@@ -42,6 +43,7 @@ static int stopped = 0;
 static int audio_ended = 0;
 static int updating_seek = 0;
 static int master_volume = 100;
+static XmpEqualizer equalizer;
 
 /* ZX tunes are converted by zxtune123 and played through the existing
  * FFmpeg / SDL pipeline. No additional audio device or decoder thread. */
@@ -78,6 +80,14 @@ static GtkWidget *sample_waveform_area;
 static GtkWidget *module_comments_view;
 
 static GtkWidget *visualizer_area;
+static GtkWidget *eq_graph_area;
+static GtkWidget *eq_band_scales[XMP_EQ_BANDS];
+static GtkWidget *eq_preamp_scale;
+static GtkWidget *eq_preset_combo;
+static GtkWidget *eq_enabled_switch;
+static guint eq_save_timer;
+static gboolean eq_updating_ui;
+static int eq_preset_index;
 
 #define VIZ_BANDS 32
 #define VIZ_FFT_SIZE 1024
@@ -393,7 +403,11 @@ static void audio_callback(void *userdata, Uint8 *stream, int len)
         return;
     }
 
-    /* Apply master volume to both module and FFmpeg audio output. */
+    /* One shared post-processing path for every playback engine. */
+    xmp_eq_process_s16(&equalizer, (int16_t *)stream,
+                       len / (int)(2 * sizeof(int16_t)));
+
+    /* Apply master volume after the EQ. */
     int16_t *volume_pcm = (int16_t *)stream;
     int pcm_samples = len / (int)sizeof(int16_t);
     if (master_volume < 100) {
@@ -493,7 +507,7 @@ static gboolean on_sample_waveform_draw(GtkWidget *widget,
         return FALSE;
 
     /* Dark background and center line. */
-    cairo_set_source_rgb(cr, 0.063, 0.071, 0.086);
+    cairo_set_source_rgb(cr, 0.028, 0.060, 0.075);
     cairo_paint(cr);
 
     double center = height / 2.0;
@@ -741,6 +755,8 @@ static int open_ffmpeg_audio(const char *filename)
         gtk_widget_queue_draw(pattern_area);
     if (visualizer_area)
         gtk_widget_queue_draw(visualizer_area);
+    if (eq_graph_area)
+        gtk_widget_queue_draw(eq_graph_area);
 
     update_play_button();
     set_status("Audio file loaded");
@@ -1489,6 +1505,23 @@ static gboolean set_selected_soundfont(const char *path)
     return TRUE;
 }
 
+/* GtkDialog has separate content and button areas. Give both the same
+ * Deep Ocean surface, regardless of the host GTK theme. */
+static void theme_dialog(GtkWidget *dialog)
+{
+    gtk_style_context_add_class(gtk_widget_get_style_context(dialog),
+                                "xmp-dialog");
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *actions = gtk_dialog_get_action_area(GTK_DIALOG(dialog));
+    if (content)
+        gtk_style_context_add_class(gtk_widget_get_style_context(content),
+                                    "xmp-dialog-surface");
+    if (actions)
+        gtk_style_context_add_class(gtk_widget_get_style_context(actions),
+                                    "xmp-dialog-surface");
+}
+
 static void on_choose_soundfont(GtkButton *button, gpointer data)
 {
     (void)button;
@@ -1498,6 +1531,7 @@ static void on_choose_soundfont(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER_ACTION_OPEN,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Add", GTK_RESPONSE_ACCEPT, NULL);
+    theme_dialog(dialog);
     restore_last_folder(dialog);
     gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(dialog), TRUE);
     GtkFileFilter *filter = gtk_file_filter_new();
@@ -1649,6 +1683,7 @@ static void on_import_soundfont_folder(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Scan Folder", GTK_RESPONSE_ACCEPT, NULL);
+    theme_dialog(dialog);
     restore_last_folder(dialog);
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
         gchar *folder = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
@@ -1752,7 +1787,7 @@ static gboolean hvsc_waveform_draw(GtkWidget *widget,
 
     fraction = CLAMP(fraction, 0.0, 1.0);
 
-    cairo_set_source_rgb(cr, 0.082, 0.110, 0.153);
+    cairo_set_source_rgb(cr, 0.035, 0.079, 0.095);
     cairo_rectangle(cr, 0, 0, width, height);
     cairo_fill(cr);
 
@@ -1916,6 +1951,7 @@ static void on_hvsc_check_destination(GtkButton *button, gpointer data)
             GTK_WINDOW(window), GTK_DIALOG_MODAL,
             GTK_MESSAGE_WARNING, GTK_BUTTONS_CLOSE,
             "Please select an installation directory.");
+        theme_dialog(dialog);
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
         return;
@@ -1947,6 +1983,7 @@ static void on_hvsc_check_destination(GtkButton *button, gpointer data)
         GTK_WINDOW(window), GTK_DIALOG_MODAL,
         type, GTK_BUTTONS_CLOSE, "%s", message);
 
+    theme_dialog(dialog);
     gtk_dialog_run(GTK_DIALOG(dialog));
     gtk_widget_destroy(dialog);
 
@@ -1986,6 +2023,7 @@ static void on_open(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER_ACTION_OPEN,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Open", GTK_RESPONSE_ACCEPT, NULL);
+    theme_dialog(dialog);
     restore_last_folder(dialog);
 
     GtkFileFilter *filter = gtk_file_filter_new();
@@ -2096,6 +2134,7 @@ static gboolean update_wav_export_dialog(gpointer data)
                 GTK_WINDOW(window), GTK_DIALOG_MODAL,
                 GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE,
                 "WAV exported successfully:\n%s", task->destination);
+            theme_dialog(message);
             gtk_dialog_run(GTK_DIALOG(message));
             gtk_widget_destroy(message);
         } else if (!g_atomic_int_get(&task->cancel)) {
@@ -2104,6 +2143,7 @@ static gboolean update_wav_export_dialog(gpointer data)
                 GTK_WINDOW(window), GTK_DIALOG_MODAL,
                 GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
                 "WAV export failed:\n%s", task->error);
+            theme_dialog(message);
             gtk_dialog_run(GTK_DIALOG(message));
             gtk_widget_destroy(message);
         } else {
@@ -2167,6 +2207,7 @@ static void on_export_wav(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER_ACTION_SAVE,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Export", GTK_RESPONSE_ACCEPT, NULL);
+    theme_dialog(chooser);
 
     gchar *base = g_path_get_basename(source);
     char *extension = strrchr(base, '.');
@@ -2198,6 +2239,7 @@ static void on_export_wav(GtkButton *button, gpointer data)
             GTK_MESSAGE_WARNING, GTK_BUTTONS_NONE,
             "This file already exists:\n%s\n\nReplace it with the exported WAV?",
             destination);
+        theme_dialog(replace_dialog);
         gtk_dialog_add_buttons(GTK_DIALOG(replace_dialog),
                                "_Cancel", GTK_RESPONSE_CANCEL,
                                "_Replace", GTK_RESPONSE_ACCEPT, NULL);
@@ -2216,6 +2258,7 @@ static void on_export_wav(GtkButton *button, gpointer data)
             "SID export duration", GTK_WINDOW(window), GTK_DIALOG_MODAL,
             "_Cancel", GTK_RESPONSE_CANCEL,
             "_Continue", GTK_RESPONSE_ACCEPT, NULL);
+        theme_dialog(duration_dialog);
         GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(duration_dialog));
         GtkWidget *description = gtk_label_new(
             "SID files do not contain a fixed duration.\n"
@@ -2252,6 +2295,7 @@ static void on_export_wav(GtkButton *button, gpointer data)
     task->dialog = gtk_dialog_new_with_buttons(
         "Exporting WAV", GTK_WINDOW(window), GTK_DIALOG_MODAL,
         "_Cancel Export", GTK_RESPONSE_CANCEL, NULL);
+    theme_dialog(task->dialog);
     gtk_window_set_default_size(GTK_WINDOW(task->dialog), 420, -1);
     GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(task->dialog));
     GtkWidget *description = gtk_label_new(
@@ -2402,6 +2446,10 @@ static void on_stop(GtkButton *button, gpointer data)
         midi_audio_restart(midi_audio);
         SDL_UnlockAudioDevice(audio_device);
     }
+
+    SDL_LockAudioDevice(audio_device);
+    xmp_eq_reset_history(&equalizer);
+    SDL_UnlockAudioDevice(audio_device);
 
     playing = 0;
     stopped = 1;
@@ -2562,7 +2610,7 @@ static gboolean draw_visualizer(GtkWidget *widget, cairo_t *cr,
     double baseline = h - 8.0;
     double max_height = h - 22.0;
 
-    cairo_set_source_rgb(cr, 0.025, 0.035, 0.065);
+    cairo_set_source_rgb(cr, 0.022, 0.060, 0.075);
     cairo_paint(cr);
 
     /* Subtle horizontal guides for the rising spectrum. */
@@ -2742,7 +2790,7 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
     const int width = allocation.width;
     const int height = allocation.height;
 
-    cairo_set_source_rgb(cr, 0.055, 0.065, 0.080);
+    cairo_set_source_rgb(cr, 0.028, 0.060, 0.075);
     cairo_paint(cr);
 
     if (((zx_active_wav && playback_mode == PLAYBACK_FFMPEG) ||
@@ -2832,7 +2880,7 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
         const double bottom = y + 49;
         const double mid = (top + bottom) / 2.0;
 
-        cairo_set_source_rgb(cr, 0.035, 0.045, 0.050);
+        cairo_set_source_rgb(cr, 0.022, 0.050, 0.065);
         cairo_rectangle(cr, plot_left, top, plot_width, bottom - top);
         cairo_fill(cr);
 
@@ -3050,6 +3098,7 @@ static void on_playlist_load_m3u(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER_ACTION_OPEN,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Open", GTK_RESPONSE_ACCEPT, NULL);
+    theme_dialog(dialog);
     restore_last_folder(dialog);
 
     if (gtk_dialog_run(GTK_DIALOG(dialog)) != GTK_RESPONSE_ACCEPT) {
@@ -3070,6 +3119,7 @@ static void on_playlist_load_m3u(GtkButton *button, gpointer data)
             GTK_WINDOW(window), GTK_DIALOG_MODAL,
             GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
             "Could not load playlist: %s", error->message);
+        theme_dialog(message);
         gtk_dialog_run(GTK_DIALOG(message));
         gtk_widget_destroy(message);
         g_error_free(error);
@@ -3124,6 +3174,7 @@ static void on_playlist_save_m3u(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER_ACTION_SAVE,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Save", GTK_RESPONSE_ACCEPT, NULL);
+    theme_dialog(dialog);
 
     gtk_file_chooser_set_do_overwrite_confirmation(
         GTK_FILE_CHOOSER(dialog), TRUE);
@@ -3165,6 +3216,7 @@ static void on_playlist_save_m3u(GtkButton *button, gpointer data)
             GTK_WINDOW(window), GTK_DIALOG_MODAL,
             GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
             "Could not save playlist: %s", error->message);
+        theme_dialog(message);
         gtk_dialog_run(GTK_DIALOG(message));
         gtk_widget_destroy(message);
         g_error_free(error);
@@ -3184,6 +3236,7 @@ static void on_playlist_add(GtkButton *button, gpointer data)
         GTK_FILE_CHOOSER_ACTION_OPEN,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Add", GTK_RESPONSE_ACCEPT, NULL);
+    theme_dialog(dialog);
     restore_last_folder(dialog);
 
     gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(dialog), TRUE);
@@ -3331,7 +3384,7 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
     int width = allocation.width;
     int height = allocation.height;
 
-    cairo_set_source_rgb(cr, 0.055, 0.065, 0.080);
+    cairo_set_source_rgb(cr, 0.028, 0.060, 0.075);
     cairo_paint(cr);
 
     cairo_select_font_face(cr, "Monospace",
@@ -3433,7 +3486,7 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
             cairo_rectangle(cr, 2, y - 13, width - 4, row_height);
             cairo_fill(cr);
         } else if ((row & 1) == 0) {
-            cairo_set_source_rgb(cr, 0.075, 0.087, 0.105);
+            cairo_set_source_rgb(cr, 0.037, 0.080, 0.095);
             cairo_rectangle(cr, 2, y - 13, width - 4, row_height);
             cairo_fill(cr);
         }
@@ -3646,6 +3699,8 @@ static gboolean update_display(gpointer data)
         gtk_widget_queue_draw(pattern_area);
     if (visualizer_area)
         gtk_widget_queue_draw(visualizer_area);
+    if (eq_graph_area)
+        gtk_widget_queue_draw(eq_graph_area);
 
     return G_SOURCE_CONTINUE;
 }
@@ -3657,36 +3712,492 @@ static GtkWidget *make_button(const char *label, GCallback callback)
     return button;
 }
 
+/* Graphic equalizer. This state belongs to the user, not the AppImage, so it
+ * stays in XDG_CONFIG_HOME when an AppImage is rebuilt or replaced. */
+typedef struct {
+    const char *name;
+    double gains[XMP_EQ_BANDS];
+    double preamp;
+} EqPreset;
+
+static const EqPreset eq_presets[] = {
+    {"Flat",         { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},  0},
+    {"Rock",         { 4, 3, 2, 0,-1,-1, 1, 3, 4, 3}, -4},
+    {"Pop",          {-1, 1, 3, 4, 2,-1,-1, 1, 2, 2}, -4},
+    {"Classical",    { 3, 2, 1, 0, 0, 0, 1, 2, 3, 4}, -4},
+    {"Jazz",         { 3, 2, 1, 2,-1,-1, 0, 1, 2, 3}, -3},
+    {"Bass Boost",   { 6, 5, 4, 2, 0, 0, 0, 0, 0, 0}, -6},
+    {"Vocal Clarity",{-3,-2,-1, 0, 2, 3, 4, 3, 1, 0}, -4},
+    {"Custom",       { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},  0}
+};
+#define EQ_CUSTOM_PRESET ((int)G_N_ELEMENTS(eq_presets) - 1)
+
+static gchar *eq_settings_path(void)
+{
+    return g_build_filename(g_get_user_config_dir(), "xmp-module-player",
+                            "equalizer.ini", NULL);
+}
+
+static void eq_save_settings(void)
+{
+    GKeyFile *keyfile = g_key_file_new();
+    g_key_file_set_boolean(keyfile, "Equalizer", "enabled", equalizer.enabled);
+    g_key_file_set_integer(keyfile, "Equalizer", "preset", eq_preset_index);
+    g_key_file_set_double(keyfile, "Equalizer", "preamp", equalizer.target_preamp_db);
+    for (int i = 0; i < XMP_EQ_BANDS; ++i) {
+        gchar *key = g_strdup_printf("band%d", i);
+        g_key_file_set_double(keyfile, "Equalizer", key, equalizer.target_db[i]);
+        g_free(key);
+    }
+    gchar *file = eq_settings_path();
+    gchar *directory = g_path_get_dirname(file);
+    if (g_mkdir_with_parents(directory, 0700) == 0) {
+        gsize size = 0;
+        gchar *contents = g_key_file_to_data(keyfile, &size, NULL);
+        GError *error = NULL;
+        if (!g_file_set_contents(file, contents, size, &error)) {
+            g_warning("Could not save equalizer settings: %s", error->message);
+            g_clear_error(&error);
+        }
+        g_free(contents);
+    } else {
+        g_warning("Could not create equalizer settings directory: %s", directory);
+    }
+    g_free(file);
+    g_free(directory);
+    g_key_file_free(keyfile);
+}
+
+static gboolean eq_deferred_save(gpointer user_data)
+{
+    (void)user_data;
+    eq_save_timer = 0;
+    eq_save_settings();
+    return G_SOURCE_REMOVE;
+}
+
+static void eq_schedule_save(void)
+{
+    if (eq_save_timer)
+        g_source_remove(eq_save_timer);
+    eq_save_timer = g_timeout_add(500, eq_deferred_save, NULL);
+}
+
+static void eq_load_settings(void)
+{
+    gchar *file = eq_settings_path();
+    GKeyFile *keyfile = g_key_file_new();
+    if (g_key_file_load_from_file(keyfile, file, G_KEY_FILE_NONE, NULL)) {
+        if (g_key_file_has_key(keyfile, "Equalizer", "enabled", NULL))
+            xmp_eq_set_enabled(&equalizer,
+                g_key_file_get_boolean(keyfile, "Equalizer", "enabled", NULL));
+        if (g_key_file_has_key(keyfile, "Equalizer", "preset", NULL)) {
+            int preset = g_key_file_get_integer(keyfile, "Equalizer", "preset", NULL);
+            eq_preset_index = CLAMP(preset, 0, EQ_CUSTOM_PRESET);
+        }
+        if (g_key_file_has_key(keyfile, "Equalizer", "preamp", NULL))
+            xmp_eq_set_preamp(&equalizer,
+                g_key_file_get_double(keyfile, "Equalizer", "preamp", NULL));
+        for (int i = 0; i < XMP_EQ_BANDS; ++i) {
+            gchar *key = g_strdup_printf("band%d", i);
+            if (g_key_file_has_key(keyfile, "Equalizer", key, NULL))
+                xmp_eq_set_band(&equalizer, i,
+                    g_key_file_get_double(keyfile, "Equalizer", key, NULL));
+            g_free(key);
+        }
+    }
+    g_key_file_free(keyfile);
+    g_free(file);
+}
+
+static void eq_refresh_graph(void)
+{
+    if (eq_graph_area)
+        gtk_widget_queue_draw(eq_graph_area);
+}
+
+static void eq_apply_preset(int preset)
+{
+    if (preset < 0 || preset >= EQ_CUSTOM_PRESET)
+        return;
+
+    eq_preset_index = preset;
+    eq_updating_ui = TRUE;
+    SDL_LockAudioDevice(audio_device);
+    for (int i = 0; i < XMP_EQ_BANDS; ++i)
+        xmp_eq_set_band(&equalizer, i, eq_presets[preset].gains[i]);
+    xmp_eq_set_preamp(&equalizer, eq_presets[preset].preamp);
+    SDL_UnlockAudioDevice(audio_device);
+    for (int i = 0; i < XMP_EQ_BANDS; ++i)
+        if (eq_band_scales[i])
+            gtk_range_set_value(GTK_RANGE(eq_band_scales[i]),
+                                eq_presets[preset].gains[i]);
+    if (eq_preamp_scale)
+        gtk_range_set_value(GTK_RANGE(eq_preamp_scale), eq_presets[preset].preamp);
+    if (eq_preset_combo)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(eq_preset_combo), preset);
+    eq_updating_ui = FALSE;
+    eq_refresh_graph();
+    eq_schedule_save();
+}
+
+static void eq_on_preset_changed(GtkComboBox *combo, gpointer user_data)
+{
+    (void)user_data;
+    if (eq_updating_ui)
+        return;
+    int selected = gtk_combo_box_get_active(combo);
+    if (selected == EQ_CUSTOM_PRESET) {
+        eq_preset_index = EQ_CUSTOM_PRESET;
+        eq_schedule_save();
+    } else {
+        eq_apply_preset(selected);
+    }
+}
+
+static void eq_mark_custom(void)
+{
+    if (eq_preset_index == EQ_CUSTOM_PRESET)
+        return;
+    eq_preset_index = EQ_CUSTOM_PRESET;
+    eq_updating_ui = TRUE;
+    if (eq_preset_combo)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(eq_preset_combo),
+                                 EQ_CUSTOM_PRESET);
+    eq_updating_ui = FALSE;
+}
+
+static void eq_on_band_changed(GtkRange *range, gpointer user_data)
+{
+    if (eq_updating_ui)
+        return;
+    int band = GPOINTER_TO_INT(user_data);
+    SDL_LockAudioDevice(audio_device);
+    xmp_eq_set_band(&equalizer, band, gtk_range_get_value(range));
+    SDL_UnlockAudioDevice(audio_device);
+    eq_mark_custom();
+    eq_refresh_graph();
+    eq_schedule_save();
+}
+
+static void eq_on_preamp_changed(GtkRange *range, gpointer user_data)
+{
+    (void)user_data;
+    if (eq_updating_ui)
+        return;
+    SDL_LockAudioDevice(audio_device);
+    xmp_eq_set_preamp(&equalizer, gtk_range_get_value(range));
+    SDL_UnlockAudioDevice(audio_device);
+    eq_mark_custom();
+    eq_refresh_graph();
+    eq_schedule_save();
+}
+
+static void eq_on_enabled_changed(GObject *switch_object,
+                                  GParamSpec *pspec, gpointer user_data)
+{
+    (void)pspec;
+    (void)user_data;
+    SDL_LockAudioDevice(audio_device);
+    xmp_eq_set_enabled(&equalizer,
+        gtk_switch_get_active(GTK_SWITCH(switch_object)));
+    SDL_UnlockAudioDevice(audio_device);
+    eq_refresh_graph();
+    eq_schedule_save();
+}
+
+static void eq_on_reset(GtkButton *button, gpointer user_data)
+{
+    (void)button;
+    (void)user_data;
+    eq_apply_preset(0);
+}
+
+static gboolean eq_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
+{
+    (void)user_data;
+    const double width = gtk_widget_get_allocated_width(widget);
+    const double height = gtk_widget_get_allocated_height(widget);
+    const double left = 46, right = width - 24;
+    const double top = 25, bottom = height - 33;
+    const double plot_w = MAX(1.0, right - left);
+    const double plot_h = MAX(1.0, bottom - top);
+
+    cairo_pattern_t *background = cairo_pattern_create_linear(0, 0, 0, height);
+    cairo_pattern_add_color_stop_rgb(background, 0, .029, .077, .098);
+    cairo_pattern_add_color_stop_rgb(background, 1, .017, .049, .063);
+    cairo_set_source(cr, background);
+    cairo_paint(cr);
+    cairo_pattern_destroy(background);
+
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL,
+                           CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 10.5);
+    for (int db = -12; db <= 12; db += 6) {
+        double y = top + (12.0 - db) / 24.0 * plot_h;
+        cairo_set_source_rgba(cr, .32, .68, .7, db == 0 ? .35 : .14);
+        cairo_set_line_width(cr, db == 0 ? 1.1 : .7);
+        cairo_move_to(cr, left, y);
+        cairo_line_to(cr, right, y);
+        cairo_stroke(cr);
+        char label[16];
+        g_snprintf(label, sizeof(label), "%+d", db);
+        cairo_set_source_rgba(cr, .65, .80, .81, .85);
+        cairo_move_to(cr, 8, y + 4);
+        cairo_show_text(cr, label);
+    }
+    const double marks[] = {31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000};
+    const char *mark_text[] = {"31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"};
+    const double loglow = log(20), logspan = log(20000.0 / 20.0);
+    for (int i = 0; i < XMP_EQ_BANDS; ++i) {
+        double x = left + (log(marks[i]) - loglow) / logspan * plot_w;
+        cairo_set_source_rgba(cr, .31, .62, .64, .12);
+        cairo_move_to(cr, x, top);
+        cairo_line_to(cr, x, bottom);
+        cairo_stroke(cr);
+        cairo_set_source_rgba(cr, .58, .79, .80, .9);
+        cairo_move_to(cr, x - (double)strlen(mark_text[i]) * 3.1, height - 12);
+        cairo_show_text(cr, mark_text[i]);
+    }
+
+    /* The main player's smoothed spectrum appears softly behind the EQ curve. */
+    for (int i = 0; i < VIZ_BANDS; ++i) {
+        double level = CLAMP(viz_levels[i], 0.0, 1.0);
+        double x0 = left + (i + .22) * plot_w / VIZ_BANDS;
+        double bar_h = level * plot_h * .7;
+        cairo_pattern_t *bar = cairo_pattern_create_linear(0, bottom - bar_h, 0, bottom);
+        cairo_pattern_add_color_stop_rgba(bar, 0, .22, .94, .88, .12);
+        cairo_pattern_add_color_stop_rgba(bar, 1, .12, .64, .67, .02);
+        cairo_set_source(cr, bar);
+        cairo_rectangle(cr, x0, bottom - bar_h, plot_w / VIZ_BANDS * .58, bar_h);
+        cairo_fill(cr);
+        cairo_pattern_destroy(bar);
+    }
+
+    /* Draw a smooth logarithmic-frequency response without another DSP lib. */
+    XmpEqualizer snapshot = equalizer;
+    const int points = 220;
+    double curve_x[221], curve_y[221];
+    for (int i = 0; i <= points; ++i) {
+        double fraction = (double)i / points;
+        double freq = 20.0 * exp(logspan * fraction);
+        double db = CLAMP(xmp_eq_response_db(&snapshot, freq), -12.0, 12.0);
+        curve_x[i] = left + fraction * plot_w;
+        curve_y[i] = top + (12.0 - db) / 24.0 * plot_h;
+    }
+    cairo_move_to(cr, curve_x[0], bottom);
+    for (int i = 0; i <= points; ++i)
+        cairo_line_to(cr, curve_x[i], curve_y[i]);
+    cairo_line_to(cr, curve_x[points], bottom);
+    cairo_close_path(cr);
+    cairo_pattern_t *fill = cairo_pattern_create_linear(0, top, 0, bottom);
+    cairo_pattern_add_color_stop_rgba(fill, 0, .1, .94, .83, .21);
+    cairo_pattern_add_color_stop_rgba(fill, 1, .1, .65, .70, .015);
+    cairo_set_source(cr, fill);
+    cairo_fill(cr);
+    cairo_pattern_destroy(fill);
+    for (int glow = 5; glow >= 1; --glow) {
+        cairo_set_source_rgba(cr, .13, .94, .91, glow == 1 ? .93 : .045);
+        cairo_set_line_width(cr, glow == 1 ? 2.0 : glow * 2.7);
+        cairo_move_to(cr, curve_x[0], curve_y[0]);
+        for (int i = 1; i <= points; ++i)
+            cairo_line_to(cr, curve_x[i], curve_y[i]);
+        cairo_stroke(cr);
+    }
+    return FALSE;
+}
+
+static GtkWidget *eq_create_page(gboolean compact_ui)
+{
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, compact_ui ? 9 : 16);
+    gtk_container_set_border_width(GTK_CONTAINER(page), compact_ui ? 14 : 22);
+    GtkWidget *heading = gtk_label_new("10-Band Graphic Equalizer");
+    gtk_widget_set_halign(heading, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(heading), "module-title");
+    gtk_box_pack_start(GTK_BOX(page), heading, FALSE, FALSE, 0);
+    GtkWidget *description = gtk_label_new(
+        "Shape your sound in real time across every playback format. "
+        "Lower Preamp when boosting frequencies to avoid clipping.");
+    gtk_label_set_xalign(GTK_LABEL(description), 0);
+    gtk_label_set_line_wrap(GTK_LABEL(description), TRUE);
+    gtk_box_pack_start(GTK_BOX(page), description, FALSE, FALSE, 0);
+
+    GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 15);
+    gtk_box_pack_start(GTK_BOX(page), toolbar, FALSE, FALSE, 0);
+    GtkWidget *preset_label = gtk_label_new("Preset");
+    gtk_box_pack_start(GTK_BOX(toolbar), preset_label, FALSE, FALSE, 0);
+    eq_preset_combo = gtk_combo_box_text_new();
+    for (guint i = 0; i < G_N_ELEMENTS(eq_presets); ++i)
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(eq_preset_combo),
+                                       eq_presets[i].name);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(eq_preset_combo), eq_preset_index);
+    g_signal_connect(eq_preset_combo, "changed", G_CALLBACK(eq_on_preset_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(toolbar), eq_preset_combo, TRUE, TRUE, 0);
+    GtkWidget *reset = make_button("Reset Flat", G_CALLBACK(eq_on_reset));
+    gtk_box_pack_start(GTK_BOX(toolbar), reset, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar), gtk_label_new("EQ On"), FALSE, FALSE, 0);
+    eq_enabled_switch = gtk_switch_new();
+    gtk_switch_set_active(GTK_SWITCH(eq_enabled_switch), equalizer.enabled);
+    g_signal_connect(eq_enabled_switch, "notify::active",
+                     G_CALLBACK(eq_on_enabled_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(toolbar), eq_enabled_switch, FALSE, FALSE, 0);
+
+    eq_graph_area = gtk_drawing_area_new();
+    gtk_widget_set_name(eq_graph_area, "eq-graph");
+    gtk_widget_set_size_request(eq_graph_area, -1, compact_ui ? 145 : 280);
+    gtk_widget_set_hexpand(eq_graph_area, TRUE);
+    g_signal_connect(eq_graph_area, "draw", G_CALLBACK(eq_draw), NULL);
+    gtk_box_pack_start(GTK_BOX(page), eq_graph_area, TRUE, TRUE, 0);
+
+    GtkWidget *slider_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_set_homogeneous(GTK_BOX(slider_row), TRUE);
+    gtk_widget_set_name(slider_row, "eq-sliders");
+    gtk_box_pack_start(GTK_BOX(page), slider_row, FALSE, FALSE, 0);
+    const char *frequencies[] = {"31 Hz","62 Hz","125 Hz","250 Hz","500 Hz",
+                                 "1 kHz","2 kHz","4 kHz","8 kHz","16 kHz"};
+    for (int i = 0; i < XMP_EQ_BANDS; ++i) {
+        GtkWidget *column = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+        gtk_box_pack_start(GTK_BOX(slider_row), column, TRUE, TRUE, 0);
+        GtkWidget *label = gtk_label_new(frequencies[i]);
+        gtk_box_pack_start(GTK_BOX(column), label, FALSE, FALSE, 0);
+        eq_band_scales[i] = gtk_scale_new_with_range(
+            GTK_ORIENTATION_VERTICAL, -12, 12, 0.5);
+        gtk_scale_set_draw_value(GTK_SCALE(eq_band_scales[i]), TRUE);
+        gtk_scale_set_digits(GTK_SCALE(eq_band_scales[i]), 1);
+        gtk_widget_set_size_request(eq_band_scales[i], -1, compact_ui ? 130 : 200);
+        gtk_range_set_value(GTK_RANGE(eq_band_scales[i]), equalizer.target_db[i]);
+        g_signal_connect(eq_band_scales[i], "value-changed",
+                         G_CALLBACK(eq_on_band_changed), GINT_TO_POINTER(i));
+        gtk_box_pack_start(GTK_BOX(column), eq_band_scales[i], FALSE, FALSE, 0);
+    }
+
+    GtkWidget *preamp_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_box_pack_start(GTK_BOX(page), preamp_row, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(preamp_row),
+        gtk_label_new("Preamp"), FALSE, FALSE, 0);
+    eq_preamp_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,
+                                                -12, 12, 0.5);
+    gtk_scale_set_digits(GTK_SCALE(eq_preamp_scale), 1);
+    gtk_scale_set_value_pos(GTK_SCALE(eq_preamp_scale), GTK_POS_RIGHT);
+    gtk_range_set_value(GTK_RANGE(eq_preamp_scale), equalizer.target_preamp_db);
+    g_signal_connect(eq_preamp_scale, "value-changed",
+                     G_CALLBACK(eq_on_preamp_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(preamp_row), eq_preamp_scale, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(preamp_row),
+        gtk_label_new("dB"), FALSE, FALSE, 0);
+    return page;
+}
+
 static void apply_style(void)
 {
     const char *css =
-        "window { background: #17191e; color: #e3e6ed; }"
-        "label { color: #e3e6ed; }"
-        "treeview#playlist-view { background-color: #101216; color: #e3e6ed; }"
-        "treeview#playlist-view:selected { background-color: #31506d; color: #ffffff; }"
-        "treeview#playlist-view row:hover { background-color: #252b35; }"
-        "treeview#soundfont-view { background-color: #101216; color: #e3e6ed; }"
-        "treeview#soundfont-view:selected { background-color: #31506d; color: #ffffff; }"
-        "treeview#soundfont-view row:hover { background-color: #252b35; }"
-        "listbox#sample-list { background-color: #101216; color: #e3e6ed; }"
-        "listbox#sample-list row { background-color: #101216; color: #e3e6ed; }"
-        "listbox#sample-list row:selected { background-color: #31506d; color: #ffffff; }"
-        "label#sample-details { background-color: #20242c; color: #e3e6ed; padding: 10px; }"
-        "textview#module-comments { background-color: #101216; color: #e3e6ed; }"
-        "button { background: #292d36; color: #e3e6ed;"
-        " border: 1px solid #414754; border-radius: 4px;"
+        "window, notebook, notebook stack { background: #071218; color: #dbeff0; }"
+        "label { color: #dbeff0; }"
+        /* Dialogs have GTK controls that the player tabs do not use. Cover
+         * their panels, file lists, sidebars, entries and spin buttons. */
+        "window.dialog, window.dialog.background {"
+        " background: #071218; color: #dbeff0; }"
+        "window.dialog box, window.dialog grid, window.dialog paned,"
+        " window.dialog stack { background-color: #071218; }"
+        "window.dialog headerbar, window.dialog .dialog-action-box {"
+        " background: #0d1e25; color: #dbeff0; }"
+        /* Override the theme's background images as well as its colors.
+         * File chooser action buttons live outside the filechooser node. */
+        "window.xmp-dialog, .xmp-dialog-surface,"
+        "window.xmp-dialog .dialog-action-box {"
+        " background: #071218; color: #dbeff0; }"
+        "filechooser { background: #071218; color: #dbeff0; }"
+        /* GTK places the file-type filter in its own GtkActionBar. */
+        "filechooser actionbar { background: #071218; color: #dbeff0; }"
+        "filechooser scrolledwindow, filechooser viewport, filechooser .view,"
+        " filechooser treeview, filechooser iconview {"
+        " background: #050d11; color: #dbeff0; }"
+        "filechooser treeview:selected, filechooser iconview:selected {"
+        " background: #16515a; color: #ffffff; }"
+        "filechooser placessidebar, filechooser placessidebar list,"
+        " filechooser placessidebar row, filechooser .sidebar {"
+        " background: #0d1e25; color: #dbeff0; }"
+        "filechooser placessidebar row:hover { background: #163039; }"
+        "filechooser placessidebar row:selected {"
+        " background: #16515a; color: #ffffff; }"
+        "filechooser placessidebar row:selected label { color: #ffffff; }"
+        "window.dialog entry, entry, spinbutton,"
+        " spinbutton entry, filechooser entry {"
+        " background: #050d11; color: #dbeff0;"
+        " border-color: #34616a; caret-color: #65eee0; }"
+        "spinbutton button {"
+        " background: #10262e; color: #dbeff0;"
+        " border-color: #34616a; }"
+        "window.dialog button:hover { background: #193b44; }"
+        "progressbar trough { background: #163139; }"
+        "progressbar progress { background: #39d4c5; }"
+        "popover, popover.background { background: #0d1e25;"
+        " color: #dbeff0; border-color: #34616a; }"
+        /* Combo boxes and file-type filters open GtkMenu popups which
+         * otherwise inherit the user's light/dark desktop theme. */
+        "menu, menu.background, window.popup {"
+        " background-color: #0d1e25; background-image: none;"
+        " color: #dbeff0; border-color: #34616a; }"
+        "menuitem { background-color: transparent; background-image: none;"
+        " color: #dbeff0; }"
+        "menuitem label { color: #dbeff0; }"
+        "menuitem:hover, menuitem:selected { background-color: #16515a;"
+        " background-image: none; color: #ffffff; }"
+        "menuitem:hover label, menuitem:selected label { color: #ffffff; }"
+        "menuitem:disabled, menuitem:disabled label { color: #819fa2; }"
+        "combobox window.popup, combobox window.popup scrolledwindow,"
+        " combobox window.popup .view, combobox window.popup treeview {"
+        " background-color: #0d1e25; color: #dbeff0; }"
+        "combobox window.popup .view:selected,"
+        " combobox window.popup treeview:selected {"
+        " background-color: #16515a; color: #ffffff; }"
+        "notebook header { background: #08181d; border-color: #25545a; }"
+        "notebook tab { background: #0d1e25; color: #b8d7d8;"
+        " border: 1px solid #28525a; padding: 8px 12px; }"
+        "notebook tab:checked { background: #14343b;"
+        " border-bottom: 2px solid #45d9cb; }"
+        "notebook tab:hover { background: #163039; }"
+        "treeview#playlist-view { background-color: #050d11; color: #dbeff0; }"
+        "treeview#playlist-view:selected { background-color: #16515a; color: #ffffff; }"
+        "treeview#playlist-view row:hover { background-color: #10242d; }"
+        "treeview#soundfont-view { background-color: #050d11; color: #dbeff0; }"
+        "treeview#soundfont-view:selected { background-color: #16515a; color: #ffffff; }"
+        "treeview#soundfont-view row:hover { background-color: #10242d; }"
+        "box#samples-page { background-color: #071218; }"
+        "scrolledwindow#sample-scroll, scrolledwindow#sample-scroll viewport {"
+        " background-color: #050d11; background-image: none; }"
+        "list#sample-list { background-color: #050d11;"
+        " background-image: none; color: #dbeff0; }"
+        "list#sample-list row { background-color: #050d11;"
+        " background-image: none; color: #dbeff0; }"
+        "list#sample-list row:hover { background-color: #10242d; }"
+        "list#sample-list row:selected { background-color: #16515a; color: #ffffff; }"
+        "list#sample-list row label { background: transparent; color: #dbeff0; }"
+        "list#sample-list row:selected label { color: #ffffff; }"
+        "label#sample-details { background-color: #0d1e25; color: #dbeff0; padding: 10px; }"
+        "textview#module-comments, textview#module-comments text {"
+        " background-color: #050d11; color: #dbeff0; }"
+        "button, combobox button { background: #10262e; color: #dbeff0;"
+        " border: 1px solid #34616a; border-radius: 4px;"
         " padding: 7px 12px; }"
-        "button:hover { background: #394151; }"
-        "scale trough { background: #303541; min-height: 6px; }"
-        "scale highlight { background: #4b9fe8; }"
-        "scale slider { background: #d9e8f7; min-width: 14px;"
+        "button:hover { background: #193b44; }"
+        "scale trough { background: #163139; min-height: 6px; }"
+        "scale highlight { background: #39d4c5; }"
+        "scale slider { background: #9af4e7; min-width: 14px;"
         " min-height: 14px; }"
+        "switch { background: #163139; }"
+        "switch:checked { background: #238f8b; }"
+        "switch slider { background: #c4fff4; }"
+        "#eq-graph { border: 1px solid #2a5c62;"
+        " border-radius: 8px; }"
+        "#eq-sliders scale slider { background: #65eee0;"
+        " border: 1px solid #b1fff4; min-width: 19px; min-height: 19px; }"
         ".module-title { font-size: 19px; font-weight: bold; }"
         "label#about-title { font-size: 24px; font-weight: bold; }"
-        "label#about-description { background-color: #20242c;"
-        " color: #e3e6ed; padding: 18px;"
-        " border: 1px solid #414754; border-radius: 6px; }"
-        ".muted { color: #9ba4b4; }";
+        "label#about-description { background-color: #0d1e25;"
+        " color: #dbeff0; padding: 18px;"
+        " border: 1px solid #34616a; border-radius: 6px; }"
+        ".muted { color: #9dbfc2; }";
 
     GtkCssProvider *provider = gtk_css_provider_new();
     gtk_css_provider_load_from_data(provider, css, -1, NULL);
@@ -3700,6 +4211,12 @@ static void on_destroy(GtkWidget *widget, gpointer data)
 {
     (void)widget;
     (void)data;
+
+    if (eq_save_timer) {
+        g_source_remove(eq_save_timer);
+        eq_save_timer = 0;
+    }
+    eq_save_settings();
 
 #ifdef ENABLE_WAV_EXPORT
     if (active_wav_export) {
@@ -3748,6 +4265,14 @@ int main(int argc, char **argv)
 {
     gtk_init(&argc, &argv);
 
+    /* Request a dark GTK fallback for controls the application does not
+     * explicitly style (notably file-chooser internals and popup menus). */
+    g_object_set(gtk_settings_get_default(),
+                 "gtk-application-prefer-dark-theme", TRUE, NULL);
+
+    xmp_eq_init(&equalizer);
+    eq_load_settings();
+
     if (SDL_Init(SDL_INIT_AUDIO) < 0) {
         g_printerr("SDL audio initialization failed: %s\n", SDL_GetError());
         return 1;
@@ -3794,6 +4319,24 @@ int main(int argc, char **argv)
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(window), "XMP Module Player");
 
+    /* Size the initial window to the monitor's usable area. GTK will not
+     * honor a smaller default size if notebook pages request more space, so
+     * the tall pages also use shorter minimum widgets on compact displays. */
+    gint initial_width = 900;
+    gint initial_height = 850;
+    gboolean compact_ui = FALSE;
+    GdkDisplay *display = gdk_display_get_default();
+    GdkMonitor *monitor = display ? gdk_display_get_primary_monitor(display) : NULL;
+    if (!monitor && display)
+        monitor = gdk_display_get_monitor(display, 0);
+    if (monitor) {
+        GdkRectangle workarea;
+        gdk_monitor_get_workarea(monitor, &workarea);
+        compact_ui = workarea.height < 960;
+        initial_width = MIN(initial_width, MAX(650, workarea.width - 48));
+        initial_height = MIN(initial_height, MAX(480, workarea.height - 48));
+    }
+
     GtkTargetEntry drop_targets[] = {
         { "text/uri-list", 0, 0 }
     };
@@ -3804,25 +4347,33 @@ int main(int argc, char **argv)
                      G_CALLBACK(on_file_drop), NULL);
     if (app_icon)
         gtk_window_set_icon(GTK_WINDOW(window), app_icon);
-    gtk_window_set_default_size(GTK_WINDOW(window), 900, 850);
+    gtk_window_set_default_size(GTK_WINDOW(window), initial_width, initial_height);
     gtk_window_set_position(GTK_WINDOW(window), GTK_WIN_POS_CENTER);
     g_signal_connect(window, "destroy", G_CALLBACK(on_destroy), NULL);
 
     GtkWidget *notebook = gtk_notebook_new();
     gtk_container_add(GTK_CONTAINER(window), notebook);
 
-    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_container_set_border_width(GTK_CONTAINER(outer), 20);
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, compact_ui ? 8 : 12);
+    gtk_container_set_border_width(GTK_CONTAINER(outer), compact_ui ? 12 : 20);
 
-    GtkWidget *player_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_container_set_border_width(GTK_CONTAINER(player_page), 8);
+    GtkWidget *player_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, compact_ui ? 8 : 12);
+    gtk_container_set_border_width(GTK_CONTAINER(player_page), compact_ui ? 4 : 8);
     gtk_container_add(GTK_CONTAINER(player_page), outer);
 
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
     gtk_box_pack_start(GTK_BOX(outer), top, FALSE, FALSE, 0);
 
-    GtkWidget *cover = app_icon ? gtk_image_new_from_pixbuf(app_icon) : gtk_image_new();
-    gtk_widget_set_size_request(cover, 100, 100);
+    GdkPixbuf *small_cover = (app_icon && compact_ui)
+        ? gdk_pixbuf_scale_simple(app_icon, 80, 80, GDK_INTERP_BILINEAR)
+        : NULL;
+    GtkWidget *cover = app_icon
+        ? gtk_image_new_from_pixbuf(small_cover ? small_cover : app_icon)
+        : gtk_image_new();
+    if (small_cover)
+        g_object_unref(small_cover);
+    gtk_widget_set_size_request(cover, compact_ui ? 80 : 100,
+                               compact_ui ? 80 : 100);
     gtk_box_pack_start(GTK_BOX(top), cover, FALSE, FALSE, 0);
 
     GtkWidget *info = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -3845,7 +4396,8 @@ int main(int argc, char **argv)
 
     /* Mirrored FFT spectrum in the open space at the top right. */
     visualizer_area = gtk_drawing_area_new();
-    gtk_widget_set_size_request(visualizer_area, 320, 100);
+    gtk_widget_set_size_request(visualizer_area, compact_ui ? 280 : 320,
+                               compact_ui ? 80 : 100);
     gtk_widget_set_hexpand(visualizer_area, TRUE);
     g_signal_connect(visualizer_area, "draw",
                      G_CALLBACK(draw_visualizer), NULL);
@@ -3988,7 +4540,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     /* One divider: playlist above, pattern and scopes below. */
     gtk_paned_pack2(GTK_PANED(content_pane), lower_box, TRUE, TRUE);
-    gtk_paned_set_position(GTK_PANED(content_pane), 230);
+    gtk_paned_set_position(GTK_PANED(content_pane), compact_ui ? 150 : 230);
 
     gtk_box_pack_start(GTK_BOX(outer), seek_scale, FALSE, FALSE, 0);
 
@@ -4013,6 +4565,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     GtkWidget *samples_page =
         gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_name(samples_page, "samples-page");
     gtk_container_set_border_width(GTK_CONTAINER(samples_page), 12);
 
     GtkWidget *samples_heading = gtk_label_new("Module Samples");
@@ -4028,10 +4581,11 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         G_CALLBACK(on_sample_selected), NULL);
 
     GtkWidget *sample_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_name(sample_scroll, "sample-scroll");
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sample_scroll),
                                    GTK_POLICY_AUTOMATIC,
                                    GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(sample_scroll, -1, 220);
+    gtk_widget_set_size_request(sample_scroll, -1, compact_ui ? 160 : 220);
     gtk_container_add(GTK_CONTAINER(sample_scroll), sample_list);
     gtk_box_pack_start(GTK_BOX(samples_page), sample_scroll,
                        TRUE, TRUE, 0);
@@ -4045,7 +4599,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     sample_waveform_area = gtk_drawing_area_new();
     gtk_widget_set_name(sample_waveform_area, "sample-waveform");
-    gtk_widget_set_size_request(sample_waveform_area, -1, 120);
+    gtk_widget_set_size_request(sample_waveform_area, -1, compact_ui ? 90 : 120);
     gtk_widget_set_hexpand(sample_waveform_area, TRUE);
     g_signal_connect(sample_waveform_area, "draw",
         G_CALLBACK(on_sample_waveform_draw), NULL);
@@ -4068,7 +4622,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(comments_scroll),
                                    GTK_POLICY_AUTOMATIC,
                                    GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(comments_scroll, -1, 140);
+    gtk_widget_set_size_request(comments_scroll, -1, compact_ui ? 100 : 140);
     gtk_container_add(GTK_CONTAINER(comments_scroll), module_comments_view);
     gtk_box_pack_start(GTK_BOX(samples_page), comments_scroll,
                        TRUE, TRUE, 0);
@@ -4079,7 +4633,8 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     /* MIDI SoundFont library: persistent paths, startup default, live switching. */
     GtkWidget *soundfont_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
-    gtk_container_set_border_width(GTK_CONTAINER(soundfont_page), 24);
+    gtk_container_set_border_width(GTK_CONTAINER(soundfont_page),
+                                   compact_ui ? 14 : 24);
 
     GtkWidget *soundfont_heading = gtk_label_new("MIDI SoundFonts");
     gtk_widget_set_halign(soundfont_heading, GTK_ALIGN_START);
@@ -4120,7 +4675,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     GtkWidget *sf_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sf_scroll),
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(sf_scroll, -1, 280);
+    gtk_widget_set_size_request(sf_scroll, -1, compact_ui ? 170 : 280);
     gtk_container_add(GTK_CONTAINER(sf_scroll), soundfont_view);
     gtk_box_pack_start(GTK_BOX(soundfont_page), sf_scroll, TRUE, TRUE, 0);
 
@@ -4160,6 +4715,10 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     update_soundfont_label();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), soundfont_page,
                              gtk_label_new("SoundFonts"));
+
+    /* A built-in, tabbed EQ rather than a second floating window. */
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), eq_create_page(compact_ui),
+                             gtk_label_new("Equalizer"));
 
 
     /* High Voltage SID Collection */
@@ -4341,7 +4900,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_box_pack_start(GTK_BOX(about_page), about_icon,
                        FALSE, FALSE, 0);
 
-    GtkWidget *about_title = gtk_label_new("XMP Module Player 1.2 (development)");
+    GtkWidget *about_title = gtk_label_new("XMP Module Player 1.3 (development)");
     gtk_widget_set_name(about_title, "about-title");
     gtk_box_pack_start(GTK_BOX(about_page), about_title,
                        FALSE, FALSE, 0);
@@ -4353,6 +4912,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         "Commodore 64 SID music powered by libsidplayfp\n"
         "Digital audio powered by FFmpeg\n"
         "MIDI powered by FluidSynth with a SoundFont library\n"
+        "Built-in 10-band equalizer with presets and live spectrum\n"
         "MP3, WAV, M4A/AAC, Ogg Vorbis, Opus, FLAC and more\n"
         "\n"
         "High Voltage SID Collection (HVSC) browsing\n"

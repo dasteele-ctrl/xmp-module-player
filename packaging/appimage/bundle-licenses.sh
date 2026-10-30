@@ -23,6 +23,18 @@ if [[ -d /usr/share/common-licenses ]]; then
     cp -a /usr/share/common-licenses/. "$notice_dir/common-licenses/"
 fi
 
+# These executable programs are included specifically for the HVSC installer.
+# Their notices are needed even though they are not shared libraries.
+for utility_package in curl 7zip-standalone; do
+    utility_notice="/usr/share/doc/$utility_package/copyright"
+    if [[ -f "$utility_notice" ]]; then
+        install -D -m 0644 "$utility_notice" \
+            "$package_dir/$utility_package/copyright"
+    else
+        echo "WARNING: Missing copyright notice for bundled $utility_package" >&2
+    fi
+done
+
 manifest="$notice_dir/BUNDLED-LIBRARY-INVENTORY.tsv"
 missing="$notice_dir/UNMAPPED-LIBRARIES.txt"
 printf 'Library filename\tDebian package\tPackage version\n' > "$manifest"

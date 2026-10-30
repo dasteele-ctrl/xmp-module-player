@@ -77,6 +77,7 @@ static void report_progress(HvscJob *job,
 static gpointer download_worker(gpointer data)
 {
     HvscJob *job = data;
+    char *startup_error = NULL;
 
     char *executable = g_file_read_link(
         "/proc/self/exe", NULL);
@@ -102,8 +103,7 @@ static gpointer download_worker(gpointer data)
     g_free(executable);
 
     if (!script || !g_file_test(script, G_FILE_TEST_IS_REGULAR)) {
-        report_progress(job, -1.0,
-                        "ERROR: HVSC installer script not found.");
+        startup_error = g_strdup("ERROR: HVSC installer script not found. Reinstall or rebuild XMP.");
         goto finish;
     }
 
@@ -122,14 +122,10 @@ static gpointer download_worker(gpointer data)
         &error);
 
     if (!process) {
-        char *message = g_strdup_printf(
+        startup_error = g_strdup_printf(
             "ERROR: %s",
             error ? error->message :
                     "Unable to start installer.");
-
-        report_progress(job, -1.0, message);
-
-        g_free(message);
         g_clear_error(&error);
         goto finish;
     }
@@ -148,6 +144,7 @@ static gpointer download_worker(gpointer data)
     double fraction = 0.0;
     gboolean read_failed = FALSE;
     char *last_status = g_strdup("Preparing HVSC installation...");
+    char *last_error = NULL;
 
     while (TRUE) {
         gsize length = 0;
@@ -178,6 +175,8 @@ static gpointer download_worker(gpointer data)
             report_progress(job, fraction, last_status);
         }
         else if (g_str_has_prefix(line, "ERROR: ")) {
+            g_free(last_error);
+            last_error = g_strdup(line);
             report_progress(job, -1.0, line);
         }
         else if (g_str_has_prefix(line, "SUCCESS: ")) {
@@ -192,6 +191,8 @@ static gpointer download_worker(gpointer data)
         char *message = g_strdup_printf(
             "ERROR: Reading installer output failed: %s",
             error->message);
+        g_free(last_error);
+        last_error = g_strdup(message);
         report_progress(job, -1.0, message);
         g_free(message);
         g_clear_error(&error);
@@ -234,9 +235,11 @@ static gpointer download_worker(gpointer data)
                         "HVSC installation completed successfully.");
     else
         report_progress(job, -2.0,
+                        last_error ? last_error :
                         final_error ? final_error :
                         "ERROR: HVSC installation failed.");
 
+    g_free(last_error);
     g_free(final_error);
 
     g_free(script);
@@ -260,8 +263,10 @@ finish:
         report_progress(job, -2.0, "Installation cancelled.");
     else
         report_progress(job, -2.0,
+                        startup_error ? startup_error :
                         "ERROR: Unable to start HVSC installer.");
 
+    g_free(startup_error);
     g_free(script);
     g_free(job->parent);
     g_free(job);

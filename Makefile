@@ -12,11 +12,11 @@ all: xmp-linux
 ZX_ROOT ?= $(HOME)/zxtune
 ZX_INCLUDE = -I$(ZX_ROOT) -I$(ZX_ROOT)/include -I$(ZX_ROOT)/src
 ZX_LIBRARIES = $(wildcard $(ZX_ROOT)/lib/linux/release/*.a)
-ZX_NATIVE_OBJECTS = main_zx_native.o zx_audio.o xmp-resources.o ffmpeg_audio.o sid_audio.o midi_audio.o hvsc_download.o
+ZX_NATIVE_OBJECTS = main_zx_native.o zx_audio.o xmp-resources.o ffmpeg_audio.o sid_audio.o midi_audio.o equalizer.o hvsc_download.o
 ZX_ISOLATED_OBJECTS = $(filter-out zx_audio.o main_zx_native.o,$(ZX_NATIVE_OBJECTS)) zx_audio_proxy.o main_export.o export_wav.o
 EXPORT_TEST_OBJECTS = $(ZX_ISOLATED_OBJECTS)
 ZX_SID_TEST_OBJECTS = $(filter-out sid_audio.o,$(ZX_NATIVE_OBJECTS)) sid_audio_zx.o
-ZX_WAV_OBJECTS = main.o xmp-resources.o ffmpeg_audio.o sid_audio.o midi_audio.o hvsc_download.o
+ZX_WAV_OBJECTS = main.o xmp-resources.o ffmpeg_audio.o sid_audio.o midi_audio.o equalizer.o hvsc_download.o
 
 # The tested default isolates libsidplayfp and ZXTune in different processes.
 # Both render PCM directly, without a temporary WAV or conflicting SID symbols.
@@ -27,7 +27,7 @@ xmp-linux xmp-zx-native xmp-zx-isolated-test: $(ZX_ISOLATED_OBJECTS) xmp-zx-help
 xmp-export-test: $(EXPORT_TEST_OBJECTS) xmp-zx-helper Makefile
 	$(CXX) -o $@ $(EXPORT_TEST_OBJECTS) $(LDLIBS) -ldl -lpthread -lz
 
-main_export.o: main.c ffmpeg_audio.h sid_audio.h midi_audio.h zx_audio.h export_wav.h
+main_export.o: main.c ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h zx_audio.h export_wav.h
 	$(CC) $(CFLAGS) -DENABLE_ZXTUNE_NATIVE -DENABLE_WAV_EXPORT -c -o $@ main.c
 
 export_wav.o: export_wav.c export_wav.h ffmpeg_audio.h sid_audio.h midi_audio.h zx_audio.h
@@ -55,7 +55,7 @@ sid_audio_zx.o: sid_audio.cpp sid_audio.h
 	$(CXX) $(CXXFLAGS) -std=c++20 -DXMP_USE_ZXTUNE_SID_HEADERS \
 	    -I$(ZX_ROOT)/3rdparty/sidplayfp/src -c -o $@ sid_audio.cpp
 
-main_zx_native.o: main.c ffmpeg_audio.h sid_audio.h midi_audio.h zx_audio.h
+main_zx_native.o: main.c ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h zx_audio.h
 	$(CC) $(CFLAGS) -DENABLE_ZXTUNE_NATIVE -c -o $@ main.c
 
 zx_audio.o: zx_audio.cpp zx_audio.h
@@ -64,7 +64,7 @@ zx_audio.o: zx_audio.cpp zx_audio.h
 xmp-zx-wav: $(ZX_WAV_OBJECTS) Makefile
 	$(CXX) -o $@ $(ZX_WAV_OBJECTS) $(LDLIBS)
 
-main.o: main.c ffmpeg_audio.h sid_audio.h midi_audio.h
+main.o: main.c ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h
 	$(CC) $(CFLAGS) -c -o $@ main.c
 
 ffmpeg_audio.o: ffmpeg_audio.c ffmpeg_audio.h
@@ -76,6 +76,9 @@ sid_audio.o: sid_audio.cpp sid_audio.h
 midi_audio.o: midi_audio.c midi_audio.h
 	$(CC) $(CFLAGS) -c -o $@ midi_audio.c
 
+equalizer.o: equalizer.c equalizer.h
+	$(CC) $(CFLAGS) -c -o $@ equalizer.c
+
 xmp-resources.o: xmp-resources.c
 	$(CC) $(CFLAGS) -c -o $@ xmp-resources.c
 
@@ -83,9 +86,17 @@ xmp-resources.c: xmp.gresource.xml icons/xmp.png
 	glib-compile-resources --generate-source --target=$@ $<
 
 clean:
-	rm -f xmp-linux xmp-zx-native xmp-zx-wav xmp-zx-sid-test xmp-zx-isolated-test xmp-zx-helper xmp-export-test main_export.o export_wav.o main_zx_native.o zx_audio.o zx_audio_proxy.o zx_helper.o hvsc_download.o main.o xmp-resources.o ffmpeg_audio.o midi_audio.o sid_audio.o sid_audio_zx.o xmp-resources.c
+	rm -f xmp-linux xmp-zx-native xmp-zx-wav xmp-zx-sid-test xmp-zx-isolated-test xmp-zx-helper xmp-export-test main_export.o export_wav.o main_zx_native.o zx_audio.o zx_audio_proxy.o zx_helper.o hvsc_download.o main.o xmp-resources.o ffmpeg_audio.o midi_audio.o equalizer.o sid_audio.o sid_audio_zx.o xmp-resources.c
 
 .PHONY: all clean
+
+# Checks the pure-C DSP without GTK, SDL or other desktop libraries.
+check-eq:
+	$(CC) -O2 -Wall -Wextra -Werror -std=c11 -o /tmp/xmp-check-eq \
+		test_equalizer.c equalizer.c -lm
+	/tmp/xmp-check-eq
+
+.PHONY: check-eq
 
 hvsc_download.o: hvsc_download.c hvsc_download.h
 	$(CC) $(CFLAGS) -c -o $@ hvsc_download.c
