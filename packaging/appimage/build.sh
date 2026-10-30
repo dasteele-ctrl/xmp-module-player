@@ -53,6 +53,28 @@ fi
         --plugin gtk
 )
 
+# Optional bundled General MIDI bank. Keep the exact license for the chosen
+# SoundFont with the AppImage; other sources may have different permissions.
+# No SoundFont is downloaded or silently redistributed by this script.
+if [[ -n "${XMP_BUNDLED_SOUNDFONT:-}" ]]; then
+    source_font="$XMP_BUNDLED_SOUNDFONT"
+    source_notice="${XMP_BUNDLED_SOUNDFONT_LICENSE:-}"
+    if [[ ! -f "$source_font" || ! -f "$source_notice" ]]; then
+        echo "Set XMP_BUNDLED_SOUNDFONT and XMP_BUNDLED_SOUNDFONT_LICENSE to existing files." >&2
+        exit 1
+    fi
+    case "${source_font,,}" in
+        *.sf2) bundled_font="default-GM.sf2" ;;
+        *.sf3) bundled_font="default-GM.sf3" ;;
+        *) echo "Bundled SoundFont must have an .sf2 or .sf3 extension." >&2; exit 1 ;;
+    esac
+    install -D -m 0644 "$source_font" \
+        "$appdir/usr/share/sounds/sf2/$bundled_font"
+    install -D -m 0644 "$source_notice" \
+        "$appdir/usr/share/doc/xmp-module-player/soundfonts/SOUNDFONT-LICENSE.txt"
+    echo "Bundled SoundFont: $source_font ($bundled_font)"
+fi
+
 # Stage the notices after linuxdeploy has collected libraries, but before
 # producing the compressed AppImage.
 bash "$script_dir/bundle-licenses.sh" "$appdir" "$project_dir"

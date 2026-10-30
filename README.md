@@ -11,6 +11,8 @@ XMP Module Player brings classic tracker music and regular audio playback to the
 - 🎵 **Tracker module playback** powered by libxmp
 - 🎧 **Regular audio playback** powered by FFmpeg: MP3, WAV, M4A/AAC, Ogg Vorbis, Opus, and FLAC
 - 🎵 **Commodore 64 SID playback** powered by libsidplayfp
+- 🎹 **MIDI playback** powered by FluidSynth, with user-selectable SF2/SF3 SoundFonts
+- 🎼 **SoundFont manager** with multi-file import, folder scanning, live switching, and a startup default
 - 🎵 **ZX Spectrum AY/YM playback** through bundled ZXTune, including PT3, AY, VTX, YM, STC, and SQT
 - 💾 **Offline WAV export** for supported audio formats, with cancellation and overwrite confirmation
 - 🎚️ **Playback controls** with seeking and track timing
@@ -42,6 +44,32 @@ Download the latest Linux AppImage from the project's **[Releases](../../release
 ## Requirements
 
 The AppImage bundles many of its required libraries. Compatibility with Linux distributions other than the development system has not yet been fully tested.
+
+### MIDI and SoundFonts
+
+Standard MIDI files (`.mid`, `.midi`, `.kar`) are rendered directly to the
+existing SDL stereo output by **FluidSynth**, using its audio sample clock.
+The **SoundFonts** tab manages a library of `.sf2` and `.sf3` file paths.
+Add one or many files, scan a folder (including subfolders), or double-click
+an entry to switch while MIDI plays. **Set / Clear Default** chooses the font
+used automatically on subsequent launches. Removal only removes the list entry,
+never the original SoundFont file. Existing single-SoundFont settings are
+imported automatically when upgrading. The player also detects common system
+SoundFonts if you have not selected one.
+
+On Linux Mint / Ubuntu, build MIDI support with the FluidSynth development
+library and a General MIDI SoundFont:
+
+```bash
+sudo apt install libfluidsynth-dev fluid-soundfont-gm
+make -j4
+./xmp-linux
+```
+
+An AppImage must bundle a redistributable SoundFont to provide MIDI instruments
+on systems without one installed. The AppImage script can optionally include a
+chosen SF2/SF3 and its license, after both have been reviewed. See the AppImage
+MIDI playback and the SoundFont Manager were introduced in **version 1.2**.
 
 ### ZX Spectrum playback
 
@@ -91,10 +119,11 @@ in the distributed AppImage.
 - [libxmp](https://github.com/libxmp/libxmp) — tracker module playback
 - [FFmpeg](https://ffmpeg.org/) — decoding regular audio formats
 - [ZXTune](https://github.com/vitamin-caig/zxtune) — native ZX Spectrum and chiptune playback
+- [FluidSynth](https://www.fluidsynth.org/) — MIDI synthesis with SF2/SF3 SoundFonts
 
 ## Project Status
 
-**Current version: 1.1**
+**Current version: 1.2**
 
 This project is actively being developed. Features and compatibility may change as development continues.
 

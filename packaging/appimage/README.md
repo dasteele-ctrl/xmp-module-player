@@ -31,3 +31,24 @@ even if most shared libraries are bundled. Build eventual releases on the
 oldest supported target distribution and test on a separate system. Audit
 licenses and redistribution requirements for all included components before
 publishing.
+
+MIDI playback links against FluidSynth. Check that linuxdeploy gathers
+`libfluidsynth` and its codecs, and test the **SoundFonts** tab with both SF2
+and SF3 before releasing. A SoundFont is not bundled by this recipe yet;
+users can select a system-installed or personal SoundFont. Any future bundled
+font requires separate license review and an appropriate in-AppDir path.
+
+To include a reviewed SF2 or SF3 without downloading it automatically, set
+these environment variables when invoking the build script:
+
+```bash
+XMP_BUNDLED_SOUNDFONT="$HOME/Music/SoundFonts/MS Basic.sf3" \
+XMP_BUNDLED_SOUNDFONT_LICENSE="$HOME/Music/SoundFonts/MS Basic_License.md" \
+bash packaging/appimage/build.sh
+```
+
+The script refuses to bundle a font without its supplied license notice.
+It stages the selected bank as `default-GM.sf2` or `default-GM.sf3` inside
+`usr/share/sounds/sf2/`, where XMP detects it on first launch. The original
+file is not moved or modified. Review all applicable license and attribution
+terms for the exact SoundFont and version before distributing the AppImage.

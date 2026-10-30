@@ -6,9 +6,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
 #include <math.h>
 #include "ffmpeg_audio.h"
 #include "sid_audio.h"
+#include "midi_audio.h"
 #include "hvsc_download.h"
 #ifdef ENABLE_WAV_EXPORT
 #include "export_wav.h"
@@ -26,6 +28,7 @@ typedef enum {
     PLAYBACK_MODULE,
     PLAYBACK_FFMPEG,
     PLAYBACK_SID,
+    PLAYBACK_MIDI,
     PLAYBACK_ZX
 } PlaybackMode;
 
@@ -91,6 +94,20 @@ static SDL_Thread *decoder_thread;
 static SDL_atomic_t decoder_stop;
 static FfmpegAudio *ffmpeg_audio;
 static SidAudio *sid_audio;
+static MidiAudio *midi_audio;
+static gchar *selected_soundfont;
+static GtkWidget *soundfont_label;
+static GtkListStore *soundfont_store;
+static GtkWidget *soundfont_view;
+static gchar *favorite_soundfont;
+
+enum {
+    SF_NAME,
+    SF_FORMAT,
+    SF_PATH,
+    SF_STATE,
+    SF_COLUMNS
+};
 #ifdef ENABLE_ZXTUNE_NATIVE
 static ZxAudio *zx_audio;
 #endif
@@ -359,6 +376,15 @@ static void audio_callback(void *userdata, Uint8 *stream, int len)
         int got = sid_audio ? sid_audio_read(sid_audio,
                                               (int16_t *)stream,
                                               requested_frames) : 0;
+        if (got <= 0) {
+            audio_ended = 1;
+            playing = 0;
+        }
+    } else if (playback_mode == PLAYBACK_MIDI) {
+        int requested_frames = len / (int)(2 * sizeof(int16_t));
+        int got = midi_audio ? midi_audio_read(midi_audio,
+                                               (int16_t *)stream,
+                                               requested_frames) : 0;
         if (got <= 0) {
             audio_ended = 1;
             playing = 0;
@@ -656,6 +682,10 @@ static int open_ffmpeg_audio(const char *filename)
         sid_audio_close(sid_audio);
         sid_audio = NULL;
     }
+    if (midi_audio) {
+        midi_audio_close(midi_audio);
+        midi_audio = NULL;
+    }
 
     SDL_UnlockAudioDevice(audio_device);
 
@@ -914,6 +944,10 @@ static void open_module(const char *filename)
         sid_audio_close(sid_audio);
         sid_audio = NULL;
     }
+    if (midi_audio) {
+        midi_audio_close(midi_audio);
+        midi_audio = NULL;
+    }
 
     if (zx_is_music_path(filename)) {
         SDL_UnlockAudioDevice(audio_device);
@@ -1027,6 +1061,10 @@ static int open_sid(const char *filename)
         sid_audio_close(sid_audio);
         sid_audio = NULL;
     }
+    if (midi_audio) {
+        midi_audio_close(midi_audio);
+        midi_audio = NULL;
+    }
     SDL_UnlockAudioDevice(audio_device);
 
     sid_audio = sid_audio_open(filename, error_text, sizeof(error_text));
@@ -1080,6 +1118,100 @@ static int open_sid(const char *filename)
     return 1;
 }
 
+static gboolean is_midi_path(const char *filename)
+{
+    const char *dot = filename ? strrchr(filename, '.') : NULL;
+    return dot && (g_ascii_strcasecmp(dot, ".mid") == 0 ||
+                   g_ascii_strcasecmp(dot, ".midi") == 0 ||
+                   g_ascii_strcasecmp(dot, ".kar") == 0);
+}
+
+static int open_midi(const char *filename)
+{
+    char error[512] = "";
+    if (!filename || !*filename || !audio_device)
+        return 0;
+
+    stop_ffmpeg_decoder();
+    zx_cancel_pending();
+    zx_remove_active();
+    SDL_PauseAudioDevice(audio_device, 1);
+    SDL_LockAudioDevice(audio_device);
+    playing = 0;
+    audio_ended = 0;
+    stopped = 0;
+    playback_mode = PLAYBACK_NONE;
+    if (player_started) {
+        xmp_end_player(ctx);
+        player_started = 0;
+    }
+    if (module_loaded) {
+        xmp_release_module(ctx);
+        module_loaded = 0;
+    }
+    if (sid_audio) {
+        sid_audio_close(sid_audio);
+        sid_audio = NULL;
+    }
+    if (midi_audio) {
+        midi_audio_close(midi_audio);
+        midi_audio = NULL;
+    }
+    SDL_UnlockAudioDevice(audio_device);
+
+    midi_audio = midi_audio_open(filename, selected_soundfont,
+                                 error, sizeof(error));
+    if (!midi_audio) {
+        current_file[0] = '\0';
+        gtk_label_set_text(GTK_LABEL(title_label), "Unable to load MIDI");
+        set_status(error[0] ? error : "Could not open MIDI file");
+        populate_sample_browser();
+        update_play_button();
+        return 0;
+    }
+
+    SDL_LockAudioDevice(audio_device);
+    playback_mode = PLAYBACK_MIDI;
+    SDL_UnlockAudioDevice(audio_device);
+    g_strlcpy(current_file, filename, sizeof(current_file));
+
+    gchar *base = g_path_get_basename(filename);
+    gchar *details = g_strdup_printf("%s\nSoundFont: %s", filename,
+                                      midi_audio_soundfont(midi_audio));
+    gtk_label_set_text(GTK_LABEL(title_label), base);
+    gtk_label_set_text(GTK_LABEL(format_label),
+                       "Standard MIDI File (FluidSynth)");
+    gtk_label_set_text(GTK_LABEL(channels_label), "Stereo    44100 Hz");
+    gtk_label_set_text(GTK_LABEL(details_label), details);
+    g_free(base);
+    g_free(details);
+
+    int64_t duration = midi_audio_duration_ms(midi_audio);
+    char time_text[80];
+    g_snprintf(time_text, sizeof(time_text), "00:00 / %02lld:%02lld",
+               (long long)(duration / 60000),
+               (long long)((duration / 1000) % 60));
+    gtk_label_set_text(GTK_LABEL(time_label), time_text);
+    gtk_widget_set_sensitive(seek_scale, TRUE);
+    updating_seek = 1;
+    gtk_range_set_range(GTK_RANGE(seek_scale), 0, duration > 0 ? duration : 1);
+    gtk_range_set_value(GTK_RANGE(seek_scale), 0);
+    updating_seek = 0;
+
+    populate_sample_browser();
+    if (scope_area) {
+        gtk_widget_set_size_request(scope_area, 620, 180);
+        gtk_widget_queue_draw(scope_area);
+    }
+    if (pattern_area)
+        gtk_widget_queue_draw(pattern_area);
+    if (visualizer_area)
+        gtk_widget_queue_draw(visualizer_area);
+    update_play_button();
+    set_status("MIDI loaded (FluidSynth)");
+    return 1;
+}
+
 static char *get_last_folder_file(void)
 {
     return g_build_filename(g_get_user_config_dir(),
@@ -1119,6 +1251,456 @@ static void remember_last_folder(GtkWidget *dialog)
         g_free(settings_file);
         g_free(folder);
     }
+}
+
+static char *get_soundfont_settings_file(void)
+{
+    return g_build_filename(g_get_user_config_dir(),
+                            "xmp-module-player", "soundfont", NULL);
+}
+
+static char *get_soundfont_library_file(void)
+{
+    return g_build_filename(g_get_user_config_dir(),
+                            "xmp-module-player", "soundfonts.ini", NULL);
+}
+
+static gboolean soundfont_find(const char *path, GtkTreeIter *result)
+{
+    if (!soundfont_store || !path)
+        return FALSE;
+    GtkTreeModel *model = GTK_TREE_MODEL(soundfont_store);
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
+    while (valid) {
+        gchar *existing = NULL;
+        gtk_tree_model_get(model, &iter, SF_PATH, &existing, -1);
+        gboolean found = g_strcmp0(existing, path) == 0;
+        g_free(existing);
+        if (found) {
+            if (result) *result = iter;
+            return TRUE;
+        }
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+    return FALSE;
+}
+
+/* Only paths are stored, never copies of the user's SoundFont files. */
+static gboolean soundfont_add_to_library(const char *path, gboolean validate)
+{
+    if (!path || !*path || !soundfont_store)
+        return FALSE;
+    gchar *canonical = g_canonicalize_filename(path, NULL);
+    if (soundfont_find(canonical, NULL) ||
+        (validate && !midi_audio_valid_soundfont(canonical))) {
+        g_free(canonical);
+        return FALSE;
+    }
+
+    gchar *name = g_path_get_basename(canonical);
+    const char *dot = strrchr(name, '.');
+    const char *format = dot && g_ascii_strcasecmp(dot, ".sf3") == 0
+                         ? "SF3" : "SF2";
+    GtkTreeIter iter;
+    gtk_list_store_append(soundfont_store, &iter);
+    gtk_list_store_set(soundfont_store, &iter,
+                       SF_NAME, name, SF_FORMAT, format,
+                       SF_PATH, canonical, SF_STATE, "", -1);
+    g_free(name);
+    g_free(canonical);
+    return TRUE;
+}
+
+static void refresh_soundfont_library(void)
+{
+    if (!soundfont_store)
+        return;
+    gchar *fallback = NULL;
+    const char *active = midi_audio
+        ? midi_audio_soundfont(midi_audio) : selected_soundfont;
+    if (!active) {
+        fallback = midi_audio_find_default_soundfont();
+        active = fallback;
+    }
+
+    GtkTreeModel *model = GTK_TREE_MODEL(soundfont_store);
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
+    while (valid) {
+        gchar *path = NULL;
+        gtk_tree_model_get(model, &iter, SF_PATH, &path, -1);
+        gboolean current = g_strcmp0(path, active) == 0;
+        gboolean favorite = g_strcmp0(path, favorite_soundfont) == 0;
+        const char *state = !g_file_test(path, G_FILE_TEST_IS_REGULAR)
+            ? "Missing"
+            : current && favorite ? "Active · Default"
+            : current ? "Active"
+            : favorite ? "Default" : "";
+        gtk_list_store_set(soundfont_store, &iter, SF_STATE, state, -1);
+        g_free(path);
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+    g_free(fallback);
+}
+
+static void save_soundfont_library(void)
+{
+    if (!soundfont_store)
+        return;
+    GKeyFile *keys = g_key_file_new();
+    GPtrArray *paths = g_ptr_array_new_with_free_func(g_free);
+    GtkTreeModel *model = GTK_TREE_MODEL(soundfont_store);
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
+    while (valid) {
+        gchar *path = NULL;
+        gtk_tree_model_get(model, &iter, SF_PATH, &path, -1);
+        if (path) g_ptr_array_add(paths, path);
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+
+    const gchar *empty_list[] = {NULL};
+    g_key_file_set_string_list(keys, "Library", "paths",
+        paths->len ? (const gchar *const *)paths->pdata : empty_list,
+        paths->len);
+    if (favorite_soundfont)
+        g_key_file_set_string(keys, "Library", "startup-default",
+                              favorite_soundfont);
+    gsize length = 0;
+    gchar *contents = g_key_file_to_data(keys, &length, NULL);
+    gchar *path = get_soundfont_library_file();
+    gchar *directory = g_path_get_dirname(path);
+    GError *error = NULL;
+    if (g_mkdir_with_parents(directory, 0700) != 0 ||
+        !g_file_set_contents(path, contents, length, &error)) {
+        set_status(error ? error->message : "Could not save SoundFont library");
+        g_clear_error(&error);
+    }
+    g_free(directory);
+    g_free(path);
+    g_free(contents);
+    g_ptr_array_free(paths, TRUE);
+    g_key_file_free(keys);
+}
+
+static void load_soundfont_library(void)
+{
+    GKeyFile *keys = g_key_file_new();
+    gchar *file = get_soundfont_library_file();
+    if (g_key_file_load_from_file(keys, file, G_KEY_FILE_NONE, NULL)) {
+        gsize count = 0;
+        gchar **paths = g_key_file_get_string_list(keys, "Library",
+                                                  "paths", &count, NULL);
+        for (gsize i = 0; i < count; ++i)
+            soundfont_add_to_library(paths[i], FALSE);
+        g_strfreev(paths);
+        favorite_soundfont = g_key_file_get_string(keys, "Library",
+                                                  "startup-default", NULL);
+    }
+    g_key_file_free(keys);
+    g_free(file);
+
+    /* Migration from XMP 1.1's single selected-SoundFont setting. */
+    if (selected_soundfont)
+        soundfont_add_to_library(selected_soundfont, FALSE);
+    if (selected_soundfont && !midi_audio_valid_soundfont(selected_soundfont))
+        g_clear_pointer(&selected_soundfont, g_free);
+    if (favorite_soundfont && midi_audio_valid_soundfont(favorite_soundfont)) {
+        soundfont_add_to_library(favorite_soundfont, FALSE);
+        g_free(selected_soundfont);
+        selected_soundfont = g_strdup(favorite_soundfont);
+    }
+    /* Don't persist an AppImage's temporary mount path as a library entry.
+     * The current bundled/system bank is always visible in the label below. */
+    refresh_soundfont_library();
+}
+
+static gchar *get_selected_library_soundfont(void)
+{
+    if (!soundfont_view)
+        return NULL;
+    GtkTreeSelection *selection =
+        gtk_tree_view_get_selection(GTK_TREE_VIEW(soundfont_view));
+    GtkTreeModel *model = NULL;
+    GtkTreeIter iter;
+    if (!gtk_tree_selection_get_selected(selection, &model, &iter))
+        return NULL;
+    gchar *path = NULL;
+    gtk_tree_model_get(model, &iter, SF_PATH, &path, -1);
+    return path;
+}
+
+static void update_soundfont_label(void)
+{
+    if (!soundfont_label)
+        return;
+    char *fallback = NULL;
+    const char *path = selected_soundfont;
+    if (!path || !*path) {
+        fallback = midi_audio_find_default_soundfont();
+        path = fallback;
+    }
+    gchar *message = path
+        ? g_strdup_printf("%s\n%s", selected_soundfont ?
+                          "Selected SoundFont:" : "System SoundFont:", path)
+        : g_strdup("No SoundFont found. Choose an SF2 or SF3 file to play MIDI.");
+    gtk_label_set_text(GTK_LABEL(soundfont_label), message);
+    g_free(message);
+    g_free(fallback);
+    refresh_soundfont_library();
+}
+
+static gboolean set_selected_soundfont(const char *path)
+{
+    char error[512] = "";
+    if (!midi_audio_valid_soundfont(path)) {
+        set_status("Please choose a valid SF2 or SF3 SoundFont file");
+        return FALSE;
+    }
+
+    if (midi_audio) {
+        SDL_LockAudioDevice(audio_device);
+        int ok = midi_audio_set_soundfont(midi_audio, path, error,
+                                          sizeof(error));
+        SDL_UnlockAudioDevice(audio_device);
+        if (!ok) {
+            set_status(error[0] ? error : "Could not load the SoundFont");
+            return FALSE;
+        }
+        gchar *details = g_strdup_printf("%s\nSoundFont: %s",
+                                          current_file, path);
+        gtk_label_set_text(GTK_LABEL(details_label), details);
+        g_free(details);
+    }
+
+    g_free(selected_soundfont);
+    selected_soundfont = g_strdup(path);
+    char *settings_file = get_soundfont_settings_file();
+    char *settings_dir = g_path_get_dirname(settings_file);
+    g_mkdir_with_parents(settings_dir, 0700);
+    g_file_set_contents(settings_file, path, -1, NULL);
+    g_free(settings_dir);
+    g_free(settings_file);
+    soundfont_add_to_library(path, FALSE);
+    save_soundfont_library();
+    update_soundfont_label();
+    set_status("SoundFont selected and saved");
+    return TRUE;
+}
+
+static void on_choose_soundfont(GtkButton *button, gpointer data)
+{
+    (void)button;
+    (void)data;
+    GtkWidget *dialog = gtk_file_chooser_dialog_new(
+        "Add MIDI SoundFonts", GTK_WINDOW(window),
+        GTK_FILE_CHOOSER_ACTION_OPEN,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Add", GTK_RESPONSE_ACCEPT, NULL);
+    restore_last_folder(dialog);
+    gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(dialog), TRUE);
+    GtkFileFilter *filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(filter, "SoundFont files (SF2, SF3)");
+    gtk_file_filter_add_pattern(filter, "*.sf2");
+    gtk_file_filter_add_pattern(filter, "*.SF2");
+    gtk_file_filter_add_pattern(filter, "*.sf3");
+    gtk_file_filter_add_pattern(filter, "*.SF3");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        GSList *files = gtk_file_chooser_get_filenames(GTK_FILE_CHOOSER(dialog));
+        guint count = 0;
+        for (GSList *item = files; item; item = item->next)
+            if (soundfont_add_to_library(item->data, TRUE)) ++count;
+        g_slist_free_full(files, g_free);
+        save_soundfont_library();
+        refresh_soundfont_library();
+        remember_last_folder(dialog);
+        gchar *message = g_strdup_printf(
+            "%u SoundFont(s) added. Double-click one to activate.", count);
+        set_status(message);
+        g_free(message);
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void on_activate_soundfont(GtkButton *button, gpointer data)
+{
+    (void)button;
+    (void)data;
+    gchar *path = get_selected_library_soundfont();
+    if (path) {
+        set_selected_soundfont(path);
+        g_free(path);
+    } else {
+        set_status("Select a SoundFont from the library first");
+    }
+}
+
+static void on_soundfont_row_activated(GtkTreeView *view, GtkTreePath *path,
+                                       GtkTreeViewColumn *column, gpointer data)
+{
+    (void)view;
+    (void)column;
+    (void)data;
+    GtkTreeIter iter;
+    if (gtk_tree_model_get_iter(GTK_TREE_MODEL(soundfont_store), &iter, path)) {
+        gchar *filename = NULL;
+        gtk_tree_model_get(GTK_TREE_MODEL(soundfont_store), &iter,
+                           SF_PATH, &filename, -1);
+        set_selected_soundfont(filename);
+        g_free(filename);
+    }
+}
+
+static void on_favorite_soundfont(GtkButton *button, gpointer data)
+{
+    (void)button;
+    (void)data;
+    gchar *path = get_selected_library_soundfont();
+    if (!path) {
+        set_status("Select a SoundFont to set or clear its default status");
+        return;
+    }
+    if (!midi_audio_valid_soundfont(path)) {
+        set_status("That SoundFont file is unavailable");
+        g_free(path);
+        return;
+    }
+    if (g_strcmp0(path, favorite_soundfont) == 0) {
+        g_clear_pointer(&favorite_soundfont, g_free);
+        set_status("Startup default cleared");
+    } else {
+        g_free(favorite_soundfont);
+        favorite_soundfont = g_strdup(path);
+        set_status("Startup default saved");
+    }
+    save_soundfont_library();
+    refresh_soundfont_library();
+    g_free(path);
+}
+
+static void on_remove_soundfont(GtkButton *button, gpointer data)
+{
+    (void)button;
+    (void)data;
+    gchar *path = get_selected_library_soundfont();
+    if (!path)
+        return;
+    if (midi_audio &&
+        g_strcmp0(path, midi_audio_soundfont(midi_audio)) == 0) {
+        set_status("Switch MIDI to another SoundFont before removing this one");
+        g_free(path);
+        return;
+    }
+    GtkTreeIter iter;
+    if (soundfont_find(path, &iter)) {
+        gtk_list_store_remove(soundfont_store, &iter);
+        if (g_strcmp0(path, favorite_soundfont) == 0)
+            g_clear_pointer(&favorite_soundfont, g_free);
+        if (g_strcmp0(path, selected_soundfont) == 0) {
+            g_clear_pointer(&selected_soundfont, g_free);
+            gchar *settings = get_soundfont_settings_file();
+            g_file_set_contents(settings, "", 0, NULL);
+            g_free(settings);
+        }
+        save_soundfont_library();
+        update_soundfont_label();
+        set_status("Removed from library. Original SoundFont file was not deleted.");
+    }
+    g_free(path);
+}
+
+#define MAX_IMPORTED_SOUNDFONTS 500
+static void scan_soundfont_folder(const char *folder, int depth, guint *added)
+{
+    if (depth > 8 || *added >= MAX_IMPORTED_SOUNDFONTS)
+        return;
+    GDir *dir = g_dir_open(folder, 0, NULL);
+    if (!dir)
+        return;
+    const gchar *name;
+    while ((name = g_dir_read_name(dir)) && *added < MAX_IMPORTED_SOUNDFONTS) {
+        if (name[0] == '.')
+            continue;
+        gchar *path = g_build_filename(folder, name, NULL);
+        if (g_file_test(path, G_FILE_TEST_IS_DIR) &&
+            !g_file_test(path, G_FILE_TEST_IS_SYMLINK)) {
+            scan_soundfont_folder(path, depth + 1, added);
+        } else {
+            const char *dot = strrchr(name, '.');
+            if (dot && (g_ascii_strcasecmp(dot, ".sf2") == 0 ||
+                        g_ascii_strcasecmp(dot, ".sf3") == 0)) {
+                if (soundfont_add_to_library(path, TRUE))
+                    ++*added;
+            }
+        }
+        g_free(path);
+    }
+    g_dir_close(dir);
+}
+
+static void on_import_soundfont_folder(GtkButton *button, gpointer data)
+{
+    (void)button;
+    (void)data;
+    GtkWidget *dialog = gtk_file_chooser_dialog_new(
+        "Import SoundFonts From Folder", GTK_WINDOW(window),
+        GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Scan Folder", GTK_RESPONSE_ACCEPT, NULL);
+    restore_last_folder(dialog);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        gchar *folder = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        if (folder) {
+            guint added = 0;
+            scan_soundfont_folder(folder, 0, &added);
+            save_soundfont_library();
+            refresh_soundfont_library();
+            gchar *message = g_strdup_printf(
+                "%u SoundFont(s) imported%s. Files were not moved.",
+                added, added >= MAX_IMPORTED_SOUNDFONTS ? " (limit reached)" : "");
+            set_status(message);
+            g_free(message);
+            remember_last_folder(dialog);
+            g_free(folder);
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void on_system_soundfont(GtkButton *button, gpointer data)
+{
+    (void)button;
+    (void)data;
+    char *fallback = midi_audio_find_default_soundfont();
+    if (!fallback) {
+        set_status("No system SoundFont found. Choose an SF2/SF3 file.");
+        return;
+    }
+    char error[512] = "";
+    if (midi_audio) {
+        SDL_LockAudioDevice(audio_device);
+        int ok = midi_audio_set_soundfont(midi_audio, fallback, error,
+                                          sizeof(error));
+        SDL_UnlockAudioDevice(audio_device);
+        if (!ok) {
+            set_status(error[0] ? error : "Could not load system SoundFont");
+            g_free(fallback);
+            return;
+        }
+        gchar *details = g_strdup_printf("%s\nSoundFont: %s",
+                                          current_file, fallback);
+        gtk_label_set_text(GTK_LABEL(details_label), details);
+        g_free(details);
+    }
+    g_clear_pointer(&selected_soundfont, g_free);
+    char *settings_file = get_soundfont_settings_file();
+    g_file_set_contents(settings_file, "", 0, NULL);
+    g_free(settings_file);
+    update_soundfont_label();
+    set_status("Using system SoundFont");
+    g_free(fallback);
 }
 
 
@@ -1411,6 +1993,7 @@ static void on_open(GtkButton *button, gpointer data)
 
     const char *patterns[] = {
         "*.mod", "*.MOD", "*.xm", "*.XM", "*.it", "*.IT",
+        "*.mid", "*.MID", "*.midi", "*.MIDI", "*.kar", "*.KAR",
         "*.s3m", "*.S3M", "*.mptm", "*.MPTM", "*.mtm", "*.MTM",
         "*.669", "*.amf", "*.med", "*.okt", "*.ult", "*.sid", "*.SID",
         "*.mp3", "*.MP3", "*.wav", "*.WAV", "*.m4a", "*.M4A",
@@ -1437,10 +2020,14 @@ static void on_open(GtkButton *button, gpointer data)
         char *filename =
             gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
         if (filename) {
-            open_module(filename);
-            if (!zx_is_music_path(filename) && !module_loaded &&
-                !open_sid(filename))
-                open_ffmpeg_audio(filename);
+            if (is_midi_path(filename)) {
+                open_midi(filename);
+            } else {
+                open_module(filename);
+                if (!zx_is_music_path(filename) && !module_loaded &&
+                    !open_sid(filename))
+                    open_ffmpeg_audio(filename);
+            }
             g_free(filename);
         }
     }
@@ -1453,6 +2040,8 @@ static void free_wav_export_task(WavExportTask *task)
 {
     if (!task) return;
     g_free(task->source);
+    if (task->request.format == EXPORT_WAV_MIDI)
+        g_free((gpointer)task->request.soundfont);
     g_free(task->destination);
     g_free(task);
 }
@@ -1565,6 +2154,8 @@ static void on_export_wav(GtkButton *button, gpointer data)
         SDL_LockAudioDevice(audio_device);
         if (sid_audio) sid_subtune = sid_audio_current_song(sid_audio);
         SDL_UnlockAudioDevice(audio_device);
+    } else if (playback_mode == PLAYBACK_MIDI) {
+        format = EXPORT_WAV_MIDI;
     } else if (playback_mode == PLAYBACK_ZX ||
                (playback_mode == PLAYBACK_FFMPEG && zx_active_wav)) {
         format = EXPORT_WAV_ZXTUNE;
@@ -1653,6 +2244,11 @@ static void on_export_wav(GtkButton *button, gpointer data)
     task->request.format = format;
     task->request.sid_seconds = sid_seconds;
     task->request.sid_subtune = sid_subtune;
+    task->request.soundfont = NULL;
+    if (format == EXPORT_WAV_MIDI) {
+        /* Keep a private copy: the SoundFonts tab may change while exporting. */
+        task->request.soundfont = g_strdup(midi_audio_soundfont(midi_audio));
+    }
     task->dialog = gtk_dialog_new_with_buttons(
         "Exporting WAV", GTK_WINDOW(window), GTK_DIALOG_MODAL,
         "_Cancel Export", GTK_RESPONSE_CANCEL, NULL);
@@ -1742,6 +2338,21 @@ static void on_play(GtkButton *button, gpointer data)
         SDL_UnlockAudioDevice(audio_device);
         SDL_PauseAudioDevice(audio_device, 0);
         set_status("Playing SID tune");
+    } else if (playback_mode == PLAYBACK_MIDI) {
+        SDL_LockAudioDevice(audio_device);
+        if (stopped || audio_ended) {
+            if (!midi_audio || !midi_audio_restart(midi_audio)) {
+                SDL_UnlockAudioDevice(audio_device);
+                set_status("Could not restart MIDI file");
+                return;
+            }
+        }
+        stopped = 0;
+        audio_ended = 0;
+        playing = 1;
+        SDL_UnlockAudioDevice(audio_device);
+        SDL_PauseAudioDevice(audio_device, 0);
+        set_status("Playing MIDI file");
     } else if (playback_mode == PLAYBACK_FFMPEG) {
         stopped = 0;
         audio_ended = 0;
@@ -1786,6 +2397,10 @@ static void on_stop(GtkButton *button, gpointer data)
         SDL_LockAudioDevice(audio_device);
         sid_audio_select_song(sid_audio, sid_audio_current_song(sid_audio));
         SDL_UnlockAudioDevice(audio_device);
+    } else if (playback_mode == PLAYBACK_MIDI && midi_audio) {
+        SDL_LockAudioDevice(audio_device);
+        midi_audio_restart(midi_audio);
+        SDL_UnlockAudioDevice(audio_device);
     }
 
     playing = 0;
@@ -1800,6 +2415,14 @@ static void on_previous(GtkButton *button, gpointer data)
 {
     (void)button;
     (void)data;
+    if (playback_mode == PLAYBACK_MIDI && midi_audio) {
+        SDL_LockAudioDevice(audio_device);
+        midi_audio_restart(midi_audio);
+        audio_ended = 0;
+        stopped = 0;
+        SDL_UnlockAudioDevice(audio_device);
+        return;
+    }
     if (playback_mode == PLAYBACK_SID && sid_audio) {
         SDL_LockAudioDevice(audio_device);
         unsigned int count = sid_audio_song_count(sid_audio);
@@ -1843,6 +2466,13 @@ static void on_next(GtkButton *button, gpointer data)
 {
     (void)button;
     (void)data;
+    if (playback_mode == PLAYBACK_MIDI && midi_audio) {
+        SDL_LockAudioDevice(audio_device);
+        midi_audio_seek(midi_audio, midi_audio_duration_ms(midi_audio));
+        audio_ended = 0;
+        SDL_UnlockAudioDevice(audio_device);
+        return;
+    }
     if (playback_mode == PLAYBACK_SID && sid_audio) {
         SDL_LockAudioDevice(audio_device);
         unsigned int count = sid_audio_song_count(sid_audio);
@@ -1894,6 +2524,15 @@ static void on_seek(GtkRange *range, gpointer data)
         xmp_seek_time(ctx, ms);
         audio_ended = 0;
         stopped = 0;
+        SDL_UnlockAudioDevice(audio_device);
+    } else if (playback_mode == PLAYBACK_MIDI && midi_audio) {
+        SDL_LockAudioDevice(audio_device);
+        if (audio_ended)
+            midi_audio_restart(midi_audio);
+        if (midi_audio_seek(midi_audio, ms)) {
+            audio_ended = 0;
+            stopped = 0;
+        }
         SDL_UnlockAudioDevice(audio_device);
     } else if ((playback_mode == PLAYBACK_FFMPEG && ffmpeg_audio)
 #ifdef ENABLE_ZXTUNE_NATIVE
@@ -1998,6 +2637,7 @@ static void update_visualizer_spectrum(void)
     if ((playback_mode != PLAYBACK_ZX &&
          playback_mode != PLAYBACK_MODULE &&
          playback_mode != PLAYBACK_FFMPEG &&
+         playback_mode != PLAYBACK_MIDI &&
          playback_mode != PLAYBACK_SID) ||
         !playing || audio_ended) {
         for (int i = 0; i < VIZ_BANDS; i++) {
@@ -2106,7 +2746,7 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
     cairo_paint(cr);
 
     if (((zx_active_wav && playback_mode == PLAYBACK_FFMPEG) ||
-         playback_mode == PLAYBACK_ZX) &&
+         playback_mode == PLAYBACK_ZX || playback_mode == PLAYBACK_MIDI) &&
         width >= 80 && height >= 20) {
         /* Both ZX backends expose mixed output. Do not represent this
          * waveform as separate AY chip channels. */
@@ -2120,7 +2760,9 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
 
         cairo_set_source_rgb(cr, 0.73, 0.78, 0.84);
         cairo_move_to(cr, 12, 17);
-        cairo_show_text(cr, "ZX Spectrum - mixed audio waveform");
+        cairo_show_text(cr, playback_mode == PLAYBACK_MIDI
+                              ? "MIDI - mixed audio waveform"
+                              : "ZX Spectrum - mixed audio waveform");
         cairo_set_source_rgb(cr, 0.35, 0.90, 0.65);
         cairo_set_line_width(cr, 1.0);
         for (int x = 0; x < width; ++x) {
@@ -2370,6 +3012,12 @@ static void play_playlist_file(const char *filename)
     if (!filename || !*filename)
         return;
 
+    if (is_midi_path(filename)) {
+        if (open_midi(filename))
+            on_play(NULL, NULL);
+        return;
+    }
+
     zx_autoplay_request = 1;
     open_module(filename);
     zx_autoplay_request = 0;
@@ -2545,6 +3193,7 @@ static void on_playlist_add(GtkButton *button, gpointer data)
 
     const char *patterns[] = {
         "*.mod", "*.MOD", "*.xm", "*.XM", "*.it", "*.IT",
+        "*.mid", "*.MID", "*.midi", "*.MIDI", "*.kar", "*.KAR",
         "*.s3m", "*.S3M", "*.mptm", "*.MPTM", "*.mtm", "*.MTM",
         "*.669", "*.amf", "*.med", "*.okt", "*.ult", "*.sid", "*.SID",
         "*.mp3", "*.MP3", "*.wav", "*.WAV", "*.m4a", "*.M4A",
@@ -2908,6 +3557,30 @@ static gboolean update_display(gpointer data)
                        "Playing audio file");
         else if (ended)
             set_status("Playback finished");
+    } else if (playback_mode == PLAYBACK_MIDI) {
+        SDL_LockAudioDevice(audio_device);
+        int64_t position = midi_audio ? midi_audio_position_ms(midi_audio) : 0;
+        int64_t duration = midi_audio ? midi_audio_duration_ms(midi_audio) : 0;
+        ended = audio_ended;
+        is_playing = playing;
+        SDL_UnlockAudioDevice(audio_device);
+
+        total = duration > 0 ? (int)MIN(duration, INT_MAX) : 1;
+        current = (int)MIN(position, total);
+        if (is_playing || ended) {
+            updating_seek = 1;
+            gtk_range_set_value(GTK_RANGE(seek_scale), current);
+            updating_seek = 0;
+        }
+        char time_text[80];
+        g_snprintf(time_text, sizeof(time_text), "%02d:%02d / %02d:%02d",
+                   current / 60000, (current / 1000) % 60,
+                   total / 60000, (total / 1000) % 60);
+        gtk_label_set_text(GTK_LABEL(time_label), time_text);
+        if (is_playing)
+            set_status("Playing MIDI file");
+        else if (ended)
+            set_status("MIDI playback finished");
     } else if (playback_mode == PLAYBACK_SID) {
         SDL_LockAudioDevice(audio_device);
         unsigned int song = sid_audio ? sid_audio_current_song(sid_audio) : 0;
@@ -2992,6 +3665,9 @@ static void apply_style(void)
         "treeview#playlist-view { background-color: #101216; color: #e3e6ed; }"
         "treeview#playlist-view:selected { background-color: #31506d; color: #ffffff; }"
         "treeview#playlist-view row:hover { background-color: #252b35; }"
+        "treeview#soundfont-view { background-color: #101216; color: #e3e6ed; }"
+        "treeview#soundfont-view:selected { background-color: #31506d; color: #ffffff; }"
+        "treeview#soundfont-view row:hover { background-color: #252b35; }"
         "listbox#sample-list { background-color: #101216; color: #e3e6ed; }"
         "listbox#sample-list row { background-color: #101216; color: #e3e6ed; }"
         "listbox#sample-list row:selected { background-color: #31506d; color: #ffffff; }"
@@ -3051,6 +3727,10 @@ static void on_destroy(GtkWidget *widget, gpointer data)
             sid_audio_close(sid_audio);
             sid_audio = NULL;
         }
+        if (midi_audio) {
+            midi_audio_close(midi_audio);
+            midi_audio = NULL;
+        }
         player_started = 0;
         module_loaded = 0;
         SDL_UnlockAudioDevice(audio_device);
@@ -3058,6 +3738,8 @@ static void on_destroy(GtkWidget *widget, gpointer data)
     }
 
     if (ctx) xmp_free_context(ctx);
+    g_free(selected_soundfont);
+    g_free(favorite_soundfont);
     SDL_Quit();
     gtk_main_quit();
 }
@@ -3096,6 +3778,15 @@ int main(int argc, char **argv)
     SDL_PauseAudioDevice(audio_device, 1);
 
     apply_style();
+
+    char *saved_soundfont_file = get_soundfont_settings_file();
+    if (g_file_get_contents(saved_soundfont_file, &selected_soundfont,
+                            NULL, NULL)) {
+        g_strstrip(selected_soundfont);
+        if (!*selected_soundfont)
+            g_clear_pointer(&selected_soundfont, g_free);
+    }
+    g_free(saved_soundfont_file);
 
     GdkPixbuf *app_icon = gdk_pixbuf_new_from_resource(
         "/org/helllabs/xmp/icons/xmp.png", NULL);
@@ -3386,6 +4077,90 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         GTK_NOTEBOOK(notebook), samples_page,
         gtk_label_new("Samples & Notes"));
 
+    /* MIDI SoundFont library: persistent paths, startup default, live switching. */
+    GtkWidget *soundfont_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    gtk_container_set_border_width(GTK_CONTAINER(soundfont_page), 24);
+
+    GtkWidget *soundfont_heading = gtk_label_new("MIDI SoundFonts");
+    gtk_widget_set_halign(soundfont_heading, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(soundfont_heading), "module-title");
+    gtk_box_pack_start(GTK_BOX(soundfont_page), soundfont_heading,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *soundfont_description = gtk_label_new(
+        "MIDI files contain musical instructions, not recorded audio.\n"
+        "Add SF2/SF3 files or scan a folder to build your personal library.\n"
+        "Double-click a SoundFont to use it; set a startup default if desired.");
+    gtk_label_set_xalign(GTK_LABEL(soundfont_description), 0);
+    gtk_label_set_line_wrap(GTK_LABEL(soundfont_description), TRUE);
+    gtk_box_pack_start(GTK_BOX(soundfont_page), soundfont_description,
+                       FALSE, FALSE, 0);
+
+    soundfont_store = gtk_list_store_new(SF_COLUMNS, G_TYPE_STRING,
+        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    load_soundfont_library();
+    soundfont_view = gtk_tree_view_new_with_model(
+        GTK_TREE_MODEL(soundfont_store));
+    gtk_widget_set_name(soundfont_view, "soundfont-view");
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(soundfont_view), TRUE);
+    const char *sf_headers[] = {"Name", "Format", "File location", "Status"};
+    const int sf_fields[] = {SF_NAME, SF_FORMAT, SF_PATH, SF_STATE};
+    for (guint i = 0; i < G_N_ELEMENTS(sf_fields); ++i) {
+        GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+        g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+        GtkTreeViewColumn *column = gtk_tree_view_column_new_with_attributes(
+            sf_headers[i], renderer, "text", sf_fields[i], NULL);
+        gtk_tree_view_column_set_resizable(column, TRUE);
+        gtk_tree_view_column_set_expand(column, i == 2);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(soundfont_view), column);
+    }
+    g_signal_connect(soundfont_view, "row-activated",
+                     G_CALLBACK(on_soundfont_row_activated), NULL);
+    GtkWidget *sf_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sf_scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(sf_scroll, -1, 280);
+    gtk_container_add(GTK_CONTAINER(sf_scroll), soundfont_view);
+    gtk_box_pack_start(GTK_BOX(soundfont_page), sf_scroll, TRUE, TRUE, 0);
+
+    GtkWidget *sf_library_buttons =
+        gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(soundfont_page), sf_library_buttons,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(sf_library_buttons),
+        make_button("Add Files…", G_CALLBACK(on_choose_soundfont)),
+        FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(sf_library_buttons),
+        make_button("Scan Folder…", G_CALLBACK(on_import_soundfont_folder)),
+        FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(sf_library_buttons),
+        make_button("Use Selected", G_CALLBACK(on_activate_soundfont)),
+        FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(sf_library_buttons),
+        make_button("Set / Clear Default", G_CALLBACK(on_favorite_soundfont)),
+        FALSE, FALSE, 0);
+
+    GtkWidget *sf_more_buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(soundfont_page), sf_more_buttons,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(sf_more_buttons),
+        make_button("Remove from Library", G_CALLBACK(on_remove_soundfont)),
+        FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(sf_more_buttons),
+        make_button("Use System SoundFont", G_CALLBACK(on_system_soundfont)),
+        FALSE, FALSE, 0);
+
+    soundfont_label = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(soundfont_label), 0);
+    gtk_label_set_line_wrap(GTK_LABEL(soundfont_label), TRUE);
+    gtk_label_set_selectable(GTK_LABEL(soundfont_label), TRUE);
+    gtk_box_pack_start(GTK_BOX(soundfont_page), soundfont_label,
+                       FALSE, FALSE, 0);
+    update_soundfont_label();
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), soundfont_page,
+                             gtk_label_new("SoundFonts"));
+
 
     /* High Voltage SID Collection */
     GtkWidget *hvsc_page =
@@ -3566,7 +4341,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_box_pack_start(GTK_BOX(about_page), about_icon,
                        FALSE, FALSE, 0);
 
-    GtkWidget *about_title = gtk_label_new("XMP Module Player 1.1");
+    GtkWidget *about_title = gtk_label_new("XMP Module Player 1.2 (development)");
     gtk_widget_set_name(about_title, "about-title");
     gtk_box_pack_start(GTK_BOX(about_page), about_title,
                        FALSE, FALSE, 0);
@@ -3577,6 +4352,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         "Tracker modules powered by libxmp\n"
         "Commodore 64 SID music powered by libsidplayfp\n"
         "Digital audio powered by FFmpeg\n"
+        "MIDI powered by FluidSynth with a SoundFont library\n"
         "MP3, WAV, M4A/AAC, Ogg Vorbis, Opus, FLAC and more\n"
         "\n"
         "High Voltage SID Collection (HVSC) browsing\n"
@@ -3600,10 +4376,14 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     g_timeout_add(33, update_display, NULL);
 
     if (argc > 1) {
-        open_module(argv[1]);
-        if (!zx_is_music_path(argv[1]) && !module_loaded &&
-            !open_sid(argv[1]))
-            open_ffmpeg_audio(argv[1]);
+        if (is_midi_path(argv[1])) {
+            open_midi(argv[1]);
+        } else {
+            open_module(argv[1]);
+            if (!zx_is_music_path(argv[1]) && !module_loaded &&
+                !open_sid(argv[1]))
+                open_ffmpeg_audio(argv[1]);
+        }
     }
 
     gtk_widget_show_all(window);

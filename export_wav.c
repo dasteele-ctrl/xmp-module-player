@@ -2,6 +2,7 @@
 #include "export_wav.h"
 #include "ffmpeg_audio.h"
 #include "sid_audio.h"
+#include "midi_audio.h"
 #include "zx_audio.h"
 
 #include <glib/gstdio.h>
@@ -93,6 +94,7 @@ int export_wav_render(const ExportWavRequest *request,
     FfmpegAudio *ffmpeg = NULL;
     SidAudio *sid = NULL;
     ZxAudio *zx = NULL;
+    MidiAudio *midi = NULL;
     uint64_t frame_limit = 0;
     uint64_t frames_written = 0;
     int16_t pcm[EXPORT_FRAMES_PER_BLOCK * 2];
@@ -153,6 +155,13 @@ int export_wav_render(const ExportWavRequest *request,
             ? (uint64_t)zx_audio_duration_ms(zx) * EXPORT_RATE / 1000u
             : (uint64_t)EXPORT_FALLBACK_SECONDS * EXPORT_RATE;
         break;
+    case EXPORT_WAV_MIDI:
+        midi = midi_audio_open(request->source, request->soundfont,
+                               error, error_size);
+        if (!midi) goto cleanup;
+        frame_limit = (uint64_t)(midi_audio_duration_ms(midi) + 2000) *
+                      EXPORT_RATE / 1000u;
+        break;
     default:
         set_error(error, error_size, "Unsupported playback format");
         goto cleanup;
@@ -205,6 +214,8 @@ int export_wav_render(const ExportWavRequest *request,
             got = sid_audio_read(sid, pcm, frames);
         } else if (zx) {
             got = zx_audio_read(zx, pcm, frames);
+        } else if (midi) {
+            got = midi_audio_read(midi, pcm, frames);
         }
 
         if (got < 0) {
@@ -262,6 +273,7 @@ cleanup:
     if (!success && temporary) g_unlink(temporary);
     g_free(temporary);
     if (zx) zx_audio_close(zx);
+    if (midi) midi_audio_close(midi);
     if (sid) sid_audio_close(sid);
     if (ffmpeg) ffmpeg_audio_close(ffmpeg);
     if (xmp_started) xmp_end_player(xmp);
