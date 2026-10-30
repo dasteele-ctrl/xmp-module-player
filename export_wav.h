@@ -8,7 +8,8 @@ typedef enum {
     EXPORT_WAV_XMP,
     EXPORT_WAV_FFMPEG,
     EXPORT_WAV_SID,
-    EXPORT_WAV_ZXTUNE
+    EXPORT_WAV_ZXTUNE,
+    EXPORT_WAV_MIDI
 } ExportWavFormat;
 
 typedef struct {
@@ -17,6 +18,7 @@ typedef struct {
     ExportWavFormat format;
     unsigned int sid_seconds; /* SID files lack a guaranteed song length. */
     unsigned int sid_subtune; /* Export the currently selected SID subtune. */
+    const char *soundfont;    /* MIDI export uses the currently selected font. */
 } ExportWavRequest;
 
 /* Runs off the GTK thread, with independent decoder instances.
