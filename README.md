@@ -21,6 +21,7 @@ XMP Module Player brings classic tracker music and regular audio playback to the
 - 🔁 **Automatic track advancement**
 - 📂 **M3U playlist loading and saving**
 - 📊 **Real-time audio spectrum visualizer** with peak hold
+- 🎚️ **10-band equalizer (1.3 development)** with presets, preamp, and a live frequency-response curve
 - 🌊 **Channel scopes** for visualizing audio activity
 - 🧩 **Pattern viewer** for tracker data
 - 🔊 **Sample browser** with waveform visualization, sample details, loop information, and module comments
@@ -71,6 +72,30 @@ An AppImage must bundle a redistributable SoundFont to provide MIDI instruments
 on systems without one installed. The AppImage script can optionally include a
 chosen SF2/SF3 and its license, after both have been reviewed. See the AppImage
 MIDI playback and the SoundFont Manager were introduced in **version 1.2**.
+
+### 10-Band Equalizer (version 1.3 development)
+
+The integrated **Equalizer** tab provides ten adjustable bands (31 Hz to
+16 kHz), a preamp control, an aqua frequency-response graph with a subtle live
+spectrum, on/off bypass, and Flat, Rock, Pop, Classical, Jazz, Bass Boost and
+Vocal Clarity presets. Moving a slider creates a Custom preset. Changes are
+applied to the shared stereo output for tracker modules, SID, ZX, MIDI, and
+regular audio files without any additional audio library. The EQ uses smooth
+transitions when changing gains or toggling bypass.
+
+EQ settings are stored in
+`~/.config/xmp-module-player/equalizer.ini` (or the corresponding XDG
+configuration directory), so they persist between AppImage upgrades.
+
+The EQ is for **live playback**; exported WAV files remain unchanged. Use the
+preamp to leave headroom when boosting multiple frequency bands. The 1.3 theme
+also brings the same deep ocean-blue and aqua palette to the other tabs.
+
+To run the standalone DSP regression tests during development:
+
+```bash
+make check-eq
+```
 
 ### ZX Spectrum playback
 

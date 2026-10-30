@@ -15,12 +15,28 @@ if [[ -e "$DESTINATION" || -L "$DESTINATION" ]]; then
     exit 1
 fi
 
-for command in curl 7z python3; do
+# Prefer the executables packaged in the AppImage to any host installation.
+if [[ -n "${APPDIR:-}" && -d "$APPDIR/usr/bin" ]]; then
+    export PATH="$APPDIR/usr/bin:$PATH"
+fi
+
+missing_commands=()
+for command in curl python3; do
     if ! command -v "$command" >/dev/null 2>&1; then
-        echo "ERROR: Missing required command: $command"
-        exit 1
+        missing_commands+=("$command")
     fi
 done
+if command -v 7zz >/dev/null 2>&1; then
+    ARCHIVER=7zz
+elif command -v 7z >/dev/null 2>&1; then
+    ARCHIVER=7z
+else
+    missing_commands+=("7z/7zz")
+fi
+if (( ${#missing_commands[@]} > 0 )); then
+    echo "ERROR: Missing HVSC requirements: ${missing_commands[*]}. On Linux Mint/Ubuntu: sudo apt install curl 7zip python3"
+    exit 1
+fi
 
 STAGING=$(mktemp -d "$PARENT/.hvsc-stage-XXXXXXXX")
 ARCHIVE="$STAGING/HVSC.7z"
@@ -85,12 +101,15 @@ fi
 echo "PROGRESS: 85"
 echo "STATUS: Verifying archive"
 
-7z t "$ARCHIVE" >/dev/null
+if ! "$ARCHIVER" t "$ARCHIVE" >/dev/null; then
+    echo "ERROR: Downloaded HVSC archive failed its integrity test."
+    exit 1
+fi
 
 echo "PROGRESS: 88"
 echo "STATUS: Checking archive paths"
 
-7z l -slt "$ARCHIVE" |
+"$ARCHIVER" l -slt "$ARCHIVE" |
 awk '
     /^----------$/ { in_files=1; next }
     in_files && /^Path = / {
@@ -108,7 +127,10 @@ awk '
 echo "PROGRESS: 90"
 echo "STATUS: Extracting HVSC"
 
-7z x "$ARCHIVE" "-o$EXTRACTED" -y >/dev/null
+if ! "$ARCHIVER" x "$ARCHIVE" "-o$EXTRACTED" -y >/dev/null; then
+    echo "ERROR: Could not extract the downloaded HVSC archive."
+    exit 1
+fi
 
 if [[ ! -f "$EXTRACTED/C64Music/DOCUMENTS/HVSC.txt" ||
       ! -d "$EXTRACTED/C64Music/MUSICIANS" ]]; then
