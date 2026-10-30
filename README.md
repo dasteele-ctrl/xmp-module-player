@@ -52,13 +52,13 @@ Download the latest Linux AppImage from the project's **[Releases](../../release
 
 ### Running the AppImage
 
-1. Download the versioned `XMP_Module_Player-1.4-x86_64-*.AppImage` file from Release 1.4.
+1. Download the versioned `XMP-Module-Player-1.4-x86_64.AppImage` file from Release 1.4.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x XMP_Module_Player-1.4-x86_64-*.AppImage
-   ./XMP_Module_Player-1.4-x86_64-*.AppImage
+   chmod +x XMP-Module-Player-1.4-x86_64.AppImage
+   ./XMP-Module-Player-1.4-x86_64.AppImage
    ```
 
 ## Requirements
