@@ -24,6 +24,9 @@ typedef struct {
     IrcClient *client;
     guint generation;
     GBytes *bytes; /* only used by writes */
+    gchar *connect_host; /* only used by connection attempts */
+    guint16 connect_port;
+    gboolean tried_ipv4;
 } AsyncContext;
 
 static IrcClient *irc_client_ref(IrcClient *client)
@@ -57,6 +60,7 @@ static void context_free(AsyncContext *ctx)
 {
     if (ctx->bytes)
         g_bytes_unref(ctx->bytes);
+    g_free(ctx->connect_host);
     irc_client_unref(ctx->client);
     g_free(ctx);
 }
@@ -215,6 +219,18 @@ static void connect_finished(GObject *source, GAsyncResult *result, gpointer dat
             g_io_stream_close(G_IO_STREAM(socket), NULL, NULL);
             g_object_unref(socket);
         }
+    } else if (!socket && !ctx->tried_ipv4) {
+        /* Prefer IPv6, but retain access to IPv4-only hosts and networks. */
+        g_socket_client_set_family(G_SOCKET_CLIENT(source), G_SOCKET_FAMILY_IPV4);
+        AsyncContext *retry = context_new(client);
+        retry->connect_host = g_strdup(ctx->connect_host);
+        retry->connect_port = ctx->connect_port;
+        retry->tried_ipv4 = TRUE;
+        g_socket_client_connect_to_host_async(G_SOCKET_CLIENT(source),
+                                               retry->connect_host,
+                                               retry->connect_port,
+                                               client->cancel,
+                                               connect_finished, retry);
     } else if (!socket) {
         gchar *reason = g_strdup_printf("Connection failed: %s",
                                           error ? error->message : "unknown error");
@@ -254,6 +270,7 @@ gboolean irc_client_connect(IrcClient *client, const char *host, guint16 port,
     client->connecting = TRUE;
     client->cancel = g_cancellable_new();
     client->socket_client = g_socket_client_new();
+    g_socket_client_set_family(client->socket_client, G_SOCKET_FAMILY_IPV6);
     /* IRC sessions can remain quiet for long periods. A socket I/O timeout
      * here also times out the asynchronous read loop, even on a healthy
      * connection. Let IRC PING/PONG keep the session alive instead. */
@@ -262,7 +279,10 @@ gboolean irc_client_connect(IrcClient *client, const char *host, guint16 port,
     client->nick = g_strdup(nick);
 
     AsyncContext *ctx = context_new(client);
-    g_socket_client_connect_to_host_async(client->socket_client, host, port,
+    ctx->connect_host = g_strdup(host);
+    ctx->connect_port = port;
+    g_socket_client_connect_to_host_async(client->socket_client,
+                                           ctx->connect_host, ctx->connect_port,
                                            client->cancel, connect_finished, ctx);
     return TRUE;
 }

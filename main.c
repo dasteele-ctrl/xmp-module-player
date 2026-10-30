@@ -4951,6 +4951,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     }
 
     gtk_widget_show_all(window);
-    gtk_main();
+gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), 0);
+gtk_main();
     return 0;
 }
