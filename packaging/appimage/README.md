@@ -13,14 +13,14 @@ local test, not a distribution-ready release.
    into that same folder. Make both tools executable.
 4. Run `bash packaging/appimage/build.sh` from the repository root.
 
-The resulting version 1.4.1 AppImage is written under `dist/` with a timestamp in
-its filename (`XMP_Module_Player-1.4.1-x86_64-*.AppImage`). This script does not
+The resulting version 1.4.2 AppImage is written under `dist/` with a timestamp in
+its filename (`XMP_Module_Player-1.4.2-x86_64-*.AppImage`). This script does not
 overwrite an existing AppImage.
 
 GTK plugins and resources can be loaded dynamically, so `ldd` alone does
 not capture all runtime dependencies. Test the AppImage with ZX, tracker,
 SID, and FFmpeg-supported formats, and verify the file picker and desktop
-theme. For version 1.4.1, test the tray icon, minimize-to-tray preference,
+theme. For version 1.4.2, test the tray icon, minimize-to-tray preference,
 playlist controls, and high-contrast tooltip on an Xfce panel. Also test the
 IRC tab's TLS connection to EsperNet:
 the GTK GIO TLS backend and certificate handling may be dynamically loaded.

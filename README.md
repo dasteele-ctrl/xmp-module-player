@@ -52,13 +52,13 @@ Download the latest Linux AppImage from the project's **[Releases](../../release
 
 ### Running the AppImage
 
-1. Download the versioned `XMP-Module-Player-v1.4.1-Linux-x86_64.AppImage` file from Release v1.4.1.
+1. Download the versioned `XMP-Module-Player-v1.4.2-Linux-x86_64.AppImage` file from Release v1.4.2.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x XMP-Module-Player-v1.4.1-Linux-x86_64.AppImage
-   ./XMP-Module-Player-v1.4.1-Linux-x86_64.AppImage
+   chmod +x XMP-Module-Player-v1.4.2-Linux-x86_64.AppImage
+   ./XMP-Module-Player-v1.4.2-Linux-x86_64.AppImage
    ```
 
 ## Requirements
@@ -167,7 +167,9 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.4.1**
+**Current source version: 1.4.2**
+
+Version 1.4.2 fixes playlist navigation, makes Play start the first playlist track, and adds recursive folder loading.
 
 Version 1.4.1 adds a high-contrast system tray icon, playback controls,
 optional minimize-to-tray behavior, and a more readable track tooltip.
