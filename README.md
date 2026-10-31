@@ -167,13 +167,34 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current version: 1.4**
+**Current source version: 1.4.1**
+
+Version 1.4.1 adds a high-contrast system tray icon, playback controls,
+optional minimize-to-tray behavior, and a more readable track tooltip.
 
 Version 1.4 integrates an IRC client in the player's existing GTK interface.
 It includes TLS connections, multiple channels, private-message tabs, and an
 EsperNet `#modulez` preset. IRC connections are initiated manually.
 
 This project is actively being developed. Features and compatibility may change as development continues.
+
+## System tray and preferences
+
+XMP shows a tray icon on desktops with a GTK3-compatible notification area.
+Click the icon to bring the player back; right-click for playback controls,
+current-track information, and **Quit XMP**. The tray icon uses a bright
+white version of the XMP mark for visibility on dark panels. Its excess
+transparent margins are cropped so the X fills the tray icon slot. Previous and
+Next in the tray menu move between playlist files, wrapping at either end;
+they do not skip positions within a tracker module. If nothing is loaded,
+Play in the tray menu starts the first file in the playlist. The tooltip
+shows the current track title in bold white text against a charcoal surface.
+
+The **Preferences** tab includes **Minimize to tray when closing XMP**,
+enabled by default. When checked, closing the main window keeps the player
+running in the tray. Uncheck it to make the close button quit normally.
+This choice is saved in `~/.config/xmp-module-player/preferences.ini`.
+If there is no usable tray, closing the window always exits normally.
 
 ## Author
 

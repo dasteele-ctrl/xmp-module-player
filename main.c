@@ -14,6 +14,7 @@
 #include "equalizer.h"
 #include "hvsc_download.h"
 #include "xmp_irc_widget.h"
+#include "tray_icon.h"
 #ifdef ENABLE_WAV_EXPORT
 #include "export_wav.h"
 #endif
@@ -71,6 +72,8 @@ static GtkWidget *time_label;
 static GtkWidget *seek_scale;
 static GtkWidget *volume_scale;
 static GtkWidget *play_button;
+static XmpTrayIcon *tray_icon;
+static gboolean minimize_to_tray = TRUE;
 static GtkWidget *channels_label;
 static GtkWidget *details_label;
 static GtkWidget *scope_area;
@@ -440,11 +443,17 @@ static void update_play_button(void)
 {
     gtk_button_set_label(GTK_BUTTON(play_button),
                          playing ? "❚❚  Pause" : "▶  Play");
+    if (title_label)
+        xmp_tray_icon_update(tray_icon, playing,
+                             gtk_label_get_text(GTK_LABEL(title_label)));
 }
 
 static void set_status(const char *message)
 {
     gtk_label_set_text(GTK_LABEL(status_label), message);
+    if (title_label)
+        xmp_tray_icon_update(tray_icon, playing,
+                             gtk_label_get_text(GTK_LABEL(title_label)));
 }
 
 static void update_sample_details(int index)
@@ -3373,6 +3382,87 @@ static gboolean playlist_advance(void)
     return FALSE;
 }
 
+/* Start a file from the playlist and keep its selection in sync even when
+ * the main window is hidden. */
+static gboolean playlist_play_index(gint index)
+{
+    if (!playlist_store || !playlist_view)
+        return FALSE;
+
+    GtkTreeModel *model = GTK_TREE_MODEL(playlist_store);
+    GtkTreeIter iter;
+    if (index < 0 || !gtk_tree_model_iter_nth_child(model, &iter, NULL, index))
+        return FALSE;
+
+    gchar *filename = NULL;
+    gtk_tree_model_get(model, &iter, 1, &filename, -1);
+    if (!filename || !*filename) {
+        g_free(filename);
+        return FALSE;
+    }
+
+    GtkTreeSelection *selection = gtk_tree_view_get_selection(
+        GTK_TREE_VIEW(playlist_view));
+    GtkTreePath *target_path = gtk_tree_model_get_path(model, &iter);
+    gtk_tree_selection_select_iter(selection, &iter);
+    if (target_path) {
+        gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(playlist_view),
+                                     target_path, NULL, TRUE, 0.5, 0.0);
+        gtk_tree_path_free(target_path);
+    }
+
+    play_playlist_file(filename);
+    g_free(filename);
+    return TRUE;
+}
+
+/* Tray Previous/Next navigate playlist FILES, not positions/patterns inside
+ * a tracker module. Keep the main player's subtune/position buttons intact. */
+static gboolean playlist_skip_track(gint direction)
+{
+    if (!playlist_store || !playlist_view)
+        return FALSE;
+
+    GtkTreeModel *model = GTK_TREE_MODEL(playlist_store);
+    gint count = gtk_tree_model_iter_n_children(model, NULL);
+    if (count == 0)
+        return FALSE;
+
+    gint current_index = -1;
+    GtkTreeIter iter;
+    for (gint i = 0; i < count; ++i) {
+        if (!gtk_tree_model_iter_nth_child(model, &iter, NULL, i))
+            continue;
+        gchar *filename = NULL;
+        gtk_tree_model_get(model, &iter, 1, &filename, -1);
+        gboolean matches = current_file[0] &&
+                           g_strcmp0(filename, current_file) == 0;
+        g_free(filename);
+        if (matches) {
+            current_index = i;
+            break;
+        }
+    }
+
+    GtkTreeSelection *selection = gtk_tree_view_get_selection(
+        GTK_TREE_VIEW(playlist_view));
+    if (current_index < 0 &&
+        gtk_tree_selection_get_selected(selection, NULL, &iter)) {
+        GtkTreePath *selected_path = gtk_tree_model_get_path(model, &iter);
+        if (selected_path) {
+            gint *indices = gtk_tree_path_get_indices(selected_path);
+            if (indices && gtk_tree_path_get_depth(selected_path) == 1)
+                current_index = indices[0];
+            gtk_tree_path_free(selected_path);
+        }
+    }
+
+    gint target_index = current_index < 0
+        ? (direction > 0 ? 0 : count - 1)
+        : (current_index + (direction > 0 ? 1 : count - 1)) % count;
+    return playlist_play_index(target_index);
+}
+
 
 
 static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
@@ -4146,6 +4236,13 @@ static void apply_style(void)
         " background-image: none; color: #ffffff; }"
         "menuitem:hover label, menuitem:selected label { color: #ffffff; }"
         "menuitem:disabled, menuitem:disabled label { color: #819fa2; }"
+        /* Force legible tooltips even when the desktop GTK theme supplies a
+         * light/yellow tooltip background with light foreground text. */
+        "window.tooltip, window.tooltip.background, tooltip, tooltip.background {"
+        " background-color: #252a30; background-image: none;"
+        " color: #ffffff; border: 1px solid #67757e; border-radius: 6px; }"
+        "window.tooltip label, tooltip label, .tooltip label {"
+        " color: #ffffff; font-weight: bold; padding: 3px 5px; }"
         "combobox window.popup, combobox window.popup scrolledwindow,"
         " combobox window.popup .view, combobox window.popup treeview {"
         " background-color: #0d1e25; color: #dbeff0; }"
@@ -4208,10 +4305,135 @@ static void apply_style(void)
     g_object_unref(provider);
 }
 
+static gchar *preferences_path(void)
+{
+    return g_build_filename(g_get_user_config_dir(), "xmp-module-player",
+                            "preferences.ini", NULL);
+}
+
+static void load_preferences(void)
+{
+    gchar *path = preferences_path();
+    GKeyFile *settings = g_key_file_new();
+    if (g_key_file_load_from_file(settings, path, G_KEY_FILE_NONE, NULL) &&
+        g_key_file_has_key(settings, "Window", "minimize-to-tray", NULL)) {
+        GError *error = NULL;
+        gboolean value = g_key_file_get_boolean(
+            settings, "Window", "minimize-to-tray", &error);
+        if (!error)
+            minimize_to_tray = value;
+        g_clear_error(&error);
+    }
+    g_key_file_free(settings);
+    g_free(path);
+}
+
+static void save_preferences(void)
+{
+    gchar *path = preferences_path();
+    gchar *directory = g_path_get_dirname(path);
+    GKeyFile *settings = g_key_file_new();
+    g_key_file_set_boolean(settings, "Window", "minimize-to-tray",
+                           minimize_to_tray);
+
+    if (g_mkdir_with_parents(directory, 0700) == 0) {
+        gsize length = 0;
+        gchar *contents = g_key_file_to_data(settings, &length, NULL);
+        GError *error = NULL;
+        if (!g_file_set_contents(path, contents, length, &error)) {
+            g_warning("Could not save XMP preferences: %s", error->message);
+            g_clear_error(&error);
+        }
+        g_free(contents);
+    } else {
+        g_warning("Could not create XMP preferences directory: %s", directory);
+    }
+
+    g_key_file_free(settings);
+    g_free(directory);
+    g_free(path);
+}
+
+static void on_minimize_to_tray_changed(GtkToggleButton *button, gpointer data)
+{
+    (void)data;
+    minimize_to_tray = gtk_toggle_button_get_active(button);
+    save_preferences();
+}
+
+static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event,
+                                 gpointer data)
+{
+    (void)event;
+    (void)data;
+    if (minimize_to_tray && xmp_tray_icon_is_available(tray_icon)) {
+        gtk_widget_hide(widget);
+        return TRUE;
+    }
+    /* No tray host: allow GTK to destroy the window so XMP cannot become
+     * an inaccessible background process. */
+    return FALSE;
+}
+
+static void on_tray_show(gpointer data)
+{
+    (void)data;
+    gtk_widget_show(window);
+    gtk_window_present(GTK_WINDOW(window));
+}
+
+static void on_tray_play_pause(gpointer data)
+{
+    (void)data;
+    if (playback_mode == PLAYBACK_NONE && !zx_pending) {
+        if (!playlist_play_index(0))
+            set_status("Add songs to the playlist to start playback");
+        return;
+    }
+    on_play(NULL, NULL);
+}
+
+static void on_tray_stop(gpointer data)
+{
+    (void)data;
+    on_stop(NULL, NULL);
+}
+
+static void on_tray_previous(gpointer data)
+{
+    (void)data;
+    if (!playlist_skip_track(-1))
+        set_status("Add tracks to the playlist to use Previous/Next");
+}
+
+static void on_tray_next(gpointer data)
+{
+    (void)data;
+    if (!playlist_skip_track(1))
+        set_status("Add tracks to the playlist to use Previous/Next");
+}
+
+static gboolean destroy_window_from_idle(gpointer data)
+{
+    (void)data;
+    gtk_widget_destroy(window);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_tray_quit(gpointer data)
+{
+    (void)data;
+    /* Finish the menu callback before tearing down the menu and window. */
+    g_idle_add(destroy_window_from_idle, NULL);
+}
+
 static void on_destroy(GtkWidget *widget, gpointer data)
 {
     (void)widget;
     (void)data;
+
+    xmp_tray_icon_free(tray_icon);
+    tray_icon = NULL;
 
     if (eq_save_timer) {
         g_source_remove(eq_save_timer);
@@ -4273,6 +4495,7 @@ int main(int argc, char **argv)
 
     xmp_eq_init(&equalizer);
     eq_load_settings();
+    load_preferences();
 
     if (SDL_Init(SDL_INIT_AUDIO) < 0) {
         g_printerr("SDL audio initialization failed: %s\n", SDL_GetError());
@@ -4350,9 +4573,21 @@ int main(int argc, char **argv)
         gtk_window_set_icon(GTK_WINDOW(window), app_icon);
     gtk_window_set_default_size(GTK_WINDOW(window), initial_width, initial_height);
     gtk_window_set_position(GTK_WINDOW(window), GTK_WIN_POS_CENTER);
+    g_signal_connect(window, "delete-event", G_CALLBACK(on_window_delete), NULL);
     g_signal_connect(window, "destroy", G_CALLBACK(on_destroy), NULL);
 
+    XmpTrayActions tray_actions = {
+        .show = on_tray_show,
+        .play_pause = on_tray_play_pause,
+        .stop = on_tray_stop,
+        .previous = on_tray_previous,
+        .next = on_tray_next,
+        .quit = on_tray_quit
+    };
+    tray_icon = xmp_tray_icon_new(app_icon, &tray_actions);
+
     GtkWidget *notebook = gtk_notebook_new();
+    gtk_notebook_set_scrollable(GTK_NOTEBOOK(notebook), TRUE);
     gtk_container_add(GTK_CONTAINER(window), notebook);
 
     GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, compact_ui ? 8 : 12);
@@ -4892,6 +5127,43 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     /* Classic IRC chat, using the same GTK notebook and dark theme. */
     xmp_irc_add_notebook_page(GTK_NOTEBOOK(notebook));
 
+    /* General preferences. A missing preferences file defaults to hiding
+     * the window on close, provided the desktop has a usable system tray. */
+    GtkWidget *preferences_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    gtk_container_set_border_width(GTK_CONTAINER(preferences_page),
+                                   compact_ui ? 14 : 24);
+
+    GtkWidget *preferences_heading = gtk_label_new("General Preferences");
+    gtk_widget_set_halign(preferences_heading, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(preferences_heading), "module-title");
+    gtk_box_pack_start(GTK_BOX(preferences_page), preferences_heading,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *minimize_check = gtk_check_button_new_with_label(
+        "Minimize to tray when closing XMP");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(minimize_check),
+                                 minimize_to_tray);
+    g_signal_connect(minimize_check, "toggled",
+                     G_CALLBACK(on_minimize_to_tray_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(preferences_page), minimize_check,
+                       FALSE, FALSE, 0);
+
+    GtkWidget *tray_hint = gtk_label_new(
+        "When enabled, the window's close button hides XMP in the system "
+        "tray while music keeps playing. Click the tray icon to reopen "
+        "the player, or choose Quit XMP in its menu to exit completely.\n\n"
+        "If your desktop has no working system tray, closing XMP exits "
+        "normally instead.");
+    gtk_label_set_line_wrap(GTK_LABEL(tray_hint), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(tray_hint), 0);
+    gtk_widget_set_size_request(tray_hint, 300, -1);
+    gtk_box_pack_start(GTK_BOX(preferences_page), tray_hint,
+                       FALSE, FALSE, 0);
+
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), preferences_page,
+                             gtk_label_new("Preferences"));
+
     /* About page */
     GtkWidget *about_page =
         gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
@@ -4904,7 +5176,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_box_pack_start(GTK_BOX(about_page), about_icon,
                        FALSE, FALSE, 0);
 
-    GtkWidget *about_title = gtk_label_new("XMP Module Player 1.4");
+    GtkWidget *about_title = gtk_label_new("XMP Module Player 1.4.1");
     gtk_widget_set_name(about_title, "about-title");
     gtk_box_pack_start(GTK_BOX(about_page), about_title,
                        FALSE, FALSE, 0);
