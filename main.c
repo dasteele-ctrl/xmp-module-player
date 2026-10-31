@@ -2328,6 +2328,8 @@ static void on_export_wav(GtkButton *button, gpointer data)
 }
 #endif
 
+static gboolean playlist_play_index(gint index);
+
 static void on_play(GtkButton *button, gpointer data)
 {
     (void)button;
@@ -2338,8 +2340,11 @@ static void on_play(GtkButton *button, gpointer data)
         set_status("Will play after ZX rendering finishes");
         return;
     }
-    if (playback_mode == PLAYBACK_NONE)
+    if (playback_mode == PLAYBACK_NONE) {
+        if (!playlist_play_index(0))
+            set_status("Add songs to the playlist to start playback");
         return;
+    }
 
     if (playback_mode == PLAYBACK_FFMPEG &&
         (stopped || audio_ended || !ffmpeg_audio)) {
@@ -2469,103 +2474,20 @@ static void on_stop(GtkButton *button, gpointer data)
     set_status("Stopped");
 }
 
+static gboolean playlist_skip_track(gint direction);
+
 static void on_previous(GtkButton *button, gpointer data)
 {
     (void)button;
     (void)data;
-    if (playback_mode == PLAYBACK_MIDI && midi_audio) {
-        SDL_LockAudioDevice(audio_device);
-        midi_audio_restart(midi_audio);
-        audio_ended = 0;
-        stopped = 0;
-        SDL_UnlockAudioDevice(audio_device);
-        return;
-    }
-    if (playback_mode == PLAYBACK_SID && sid_audio) {
-        SDL_LockAudioDevice(audio_device);
-        unsigned int count = sid_audio_song_count(sid_audio);
-        unsigned int current = sid_audio_current_song(sid_audio);
-        unsigned int target = (count > 0 && current > 1) ? current - 1 : count;
-        if (count > 0 && sid_audio_select_song(sid_audio, target) > 0) {
-            stopped = 0;
-            audio_ended = 0;
-        }
-        SDL_UnlockAudioDevice(audio_device);
-        return;
-    }
-    if (zx_active_wav && playback_mode == PLAYBACK_FFMPEG && ffmpeg_audio) {
-        SDL_LockAudioDevice(audio_device);
-        ffmpeg_seek_target_ms = 0;
-        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
-        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
-        audio_ended = 0;
-        SDL_UnlockAudioDevice(audio_device);
-        return;
-    }
-#ifdef ENABLE_ZXTUNE_NATIVE
-    if (playback_mode == PLAYBACK_ZX && zx_audio) {
-        SDL_LockAudioDevice(audio_device);
-        ffmpeg_seek_target_ms = 0;
-        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
-        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
-        audio_ended = 0;
-        SDL_UnlockAudioDevice(audio_device);
-        return;
-    }
-#endif
-    if (!module_loaded) return;
-
-    SDL_LockAudioDevice(audio_device);
-    xmp_prev_position(ctx);
-    SDL_UnlockAudioDevice(audio_device);
+    playlist_skip_track(-1);
 }
 
 static void on_next(GtkButton *button, gpointer data)
 {
     (void)button;
     (void)data;
-    if (playback_mode == PLAYBACK_MIDI && midi_audio) {
-        SDL_LockAudioDevice(audio_device);
-        midi_audio_seek(midi_audio, midi_audio_duration_ms(midi_audio));
-        audio_ended = 0;
-        SDL_UnlockAudioDevice(audio_device);
-        return;
-    }
-    if (playback_mode == PLAYBACK_SID && sid_audio) {
-        SDL_LockAudioDevice(audio_device);
-        unsigned int count = sid_audio_song_count(sid_audio);
-        unsigned int current = sid_audio_current_song(sid_audio);
-        unsigned int target = (count > 0 && current < count) ? current + 1 : 1;
-        if (count > 0 && sid_audio_select_song(sid_audio, target) > 0) {
-            stopped = 0;
-            audio_ended = 0;
-        }
-        SDL_UnlockAudioDevice(audio_device);
-        return;
-    }
-    if (zx_active_wav && playback_mode == PLAYBACK_FFMPEG && ffmpeg_audio) {
-        SDL_LockAudioDevice(audio_device);
-        ffmpeg_seek_target_ms = ffmpeg_duration_ms;
-        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
-        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
-        SDL_UnlockAudioDevice(audio_device);
-        return;
-    }
-#ifdef ENABLE_ZXTUNE_NATIVE
-    if (playback_mode == PLAYBACK_ZX && zx_audio) {
-        SDL_LockAudioDevice(audio_device);
-        ffmpeg_seek_target_ms = ffmpeg_duration_ms;
-        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
-        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
-        SDL_UnlockAudioDevice(audio_device);
-        return;
-    }
-#endif
-    if (!module_loaded) return;
-
-    SDL_LockAudioDevice(audio_device);
-    xmp_next_position(ctx);
-    SDL_UnlockAudioDevice(audio_device);
+    playlist_skip_track(1);
 }
 
 static void on_seek(GtkRange *range, gpointer data)
@@ -3300,6 +3222,115 @@ static void on_playlist_add(GtkButton *button, gpointer data)
     gtk_widget_destroy(dialog);
 }
 
+/* Match the formats offered by the playlist's Add Files dialog. */
+static gboolean playlist_is_audio_filename(const gchar *filename)
+{
+    static const gchar *extensions[] = {
+        ".mod", ".xm", ".it", ".mid", ".midi", ".kar",
+        ".s3m", ".mptm", ".mtm", ".669", ".amf", ".med",
+        ".okt", ".ult", ".sid", ".mp3", ".wav", ".m4a",
+        ".aac", ".ogg", ".oga", ".opus", ".flac", ".webm",
+        ".mka", ".aiff", ".aif", ".wma", ".mp4", ".pt3",
+        ".pt2", ".ay", ".vtx", ".ym", ".stc", ".sqt",
+        ".psg", ".asc"
+    };
+
+    const gchar *dot = strrchr(filename, '.');
+    if (!dot)
+        return FALSE;
+
+    for (guint i = 0; i < G_N_ELEMENTS(extensions); ++i) {
+        if (g_ascii_strcasecmp(dot, extensions[i]) == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void playlist_collect_folder(const gchar *folder, GPtrArray *files,
+                                    guint *unreadable)
+{
+    GError *error = NULL;
+    GDir *dir = g_dir_open(folder, 0, &error);
+    if (!dir) {
+        ++*unreadable;
+        g_clear_error(&error);
+        return;
+    }
+
+    const gchar *name;
+    while ((name = g_dir_read_name(dir)) != NULL) {
+        gchar *path = g_build_filename(folder, name, NULL);
+
+        /* Do not follow symlinks: a linked parent could cause a scan loop. */
+        if (g_file_test(path, G_FILE_TEST_IS_SYMLINK)) {
+            g_free(path);
+            continue;
+        }
+        if (g_file_test(path, G_FILE_TEST_IS_DIR)) {
+            playlist_collect_folder(path, files, unreadable);
+            g_free(path);
+        } else if (g_file_test(path, G_FILE_TEST_IS_REGULAR) &&
+                   playlist_is_audio_filename(name)) {
+            g_ptr_array_add(files, path);
+        } else {
+            g_free(path);
+        }
+    }
+
+    g_dir_close(dir);
+}
+
+static gint playlist_compare_paths(gconstpointer a, gconstpointer b)
+{
+    return g_strcmp0(*(const gchar *const *)a,
+                     *(const gchar *const *)b);
+}
+
+static void on_playlist_add_folder(GtkButton *button, gpointer data)
+{
+    (void)button;
+    (void)data;
+
+    GtkWidget *dialog = gtk_file_chooser_dialog_new(
+        "Add Folder to Playlist", GTK_WINDOW(window),
+        GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Add Folder", GTK_RESPONSE_ACCEPT, NULL);
+    theme_dialog(dialog);
+    restore_last_folder(dialog);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        gchar *folder = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        if (folder) {
+            remember_last_folder(dialog);
+            GPtrArray *files = g_ptr_array_new_with_free_func(g_free);
+            guint unreadable = 0;
+            playlist_collect_folder(folder, files, &unreadable);
+            g_ptr_array_sort(files, playlist_compare_paths);
+
+            for (guint i = 0; i < files->len; ++i) {
+                const gchar *filename = g_ptr_array_index(files, i);
+                gchar *basename = g_path_get_basename(filename);
+                GtkTreeIter iter;
+                gtk_list_store_append(playlist_store, &iter);
+                gtk_list_store_set(playlist_store, &iter,
+                                   0, basename, 1, filename, -1);
+                g_free(basename);
+            }
+
+            gchar *message = g_strdup_printf(
+                "Added %u audio files from folder%s",
+                files->len, unreadable ? " (some subfolders unreadable)" : "");
+            set_status(message);
+            g_free(message);
+            g_ptr_array_free(files, TRUE);
+            g_free(folder);
+        }
+    }
+
+    gtk_widget_destroy(dialog);
+}
+
 static void on_playlist_remove(GtkButton *button, gpointer data)
 {
     (void)button;
@@ -3416,8 +3447,8 @@ static gboolean playlist_play_index(gint index)
     return TRUE;
 }
 
-/* Tray Previous/Next navigate playlist FILES, not positions/patterns inside
- * a tracker module. Keep the main player's subtune/position buttons intact. */
+/* Both the main and tray Previous/Next controls navigate playlist files,
+ * not positions or subtunes within an individual file. */
 static gboolean playlist_skip_track(gint direction)
 {
     if (!playlist_store || !playlist_view)
@@ -4690,6 +4721,15 @@ GtkWidget *playlist_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_box_pack_start(GTK_BOX(playlist_controls),
         make_button("Add Files", G_CALLBACK(on_playlist_add)),
         FALSE, FALSE, 0);
+
+    GtkWidget *add_folder_button = gtk_button_new_from_icon_name(
+        "folder-open-symbolic", GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(add_folder_button,
+        "Add a folder and all subfolders to the playlist");
+    g_signal_connect(add_folder_button, "clicked",
+                     G_CALLBACK(on_playlist_add_folder), NULL);
+    gtk_box_pack_start(GTK_BOX(playlist_controls), add_folder_button,
+                       FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(playlist_controls),
         make_button("Load M3U", G_CALLBACK(on_playlist_load_m3u)),
