@@ -26,6 +26,34 @@ UadeAudio *uade_audio_open(const char *path, char *error, size_t size)
     /* Overrides also allow a future AppImage to use its bundled runtime. */
     const char *base = getenv("XMP_UADE_BASE_DIR");
     const char *core = getenv("XMP_UADE_CORE");
+    const char *appdir = getenv("APPDIR");
+    char bundled_base[4096], bundled_core[4096];
+    char bundled_score[4096], bundled_config[4096];
+    if (appdir && *appdir) {
+        int nbase = snprintf(bundled_base, sizeof(bundled_base), "%s/usr/share/uade", appdir);
+        int ncore = snprintf(bundled_core, sizeof(bundled_core), "%s/usr/bin/uadecore", appdir);
+        if (nbase < 0 || nbase >= (int)sizeof(bundled_base) ||
+            ncore < 0 || ncore >= (int)sizeof(bundled_core)) {
+            if (size) snprintf(error, size, "AppImage runtime path is too long.");
+            free(config);
+            free(a);
+            return NULL;
+        }
+        if (!base || !*base) base = bundled_base;
+        if (!core || !*core) core = bundled_core;
+        /* score and uaerc otherwise can retain the build machine's prefix. */
+        int nscore = snprintf(bundled_score, sizeof(bundled_score), "%s/score", base);
+        int nconfig = snprintf(bundled_config, sizeof(bundled_config), "%s/uaerc", base);
+        if (nscore < 0 || nscore >= (int)sizeof(bundled_score) ||
+            nconfig < 0 || nconfig >= (int)sizeof(bundled_config)) {
+            if (size) snprintf(error, size, "UADE runtime path is too long.");
+            free(config);
+            free(a);
+            return NULL;
+        }
+        uade_config_set_option(config, UC_SCORE_FILE, bundled_score);
+        uade_config_set_option(config, UC_UAE_CONFIG_FILE, bundled_config);
+    }
     if (base && *base) uade_config_set_option(config, UC_BASE_DIR, base);
     if (core && *core) uade_config_set_option(config, UC_UADECORE_FILE, core);
     a->state = uade_new_state(config);

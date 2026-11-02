@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# First local AppImage packaging test. Run only after building xmp-linux.
+# v1.4.3 AppImage with the UADE runtime and the required default SoundFont.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,10 +40,45 @@ for utility_name in curl 7zz; do
     hvsc_utilities+=(--executable "$utility_path")
 done
 
+# Validate required assets before collecting any libraries. The SoundFont
+# defaults match the existing, reviewed MS Basic bank used for earlier builds.
+source_font="${XMP_BUNDLED_SOUNDFONT:-$HOME/Music/SoundFonts/MS Basic.sf3}"
+source_notice="${XMP_BUNDLED_SOUNDFONT_LICENSE:-$HOME/Music/SoundFonts/MS Basic_License.md}"
+if [[ ! -s "$source_font" || ! -s "$source_notice" ]]; then
+    echo "The bundled SoundFont and its license are required." >&2
+    echo "SoundFont: $source_font" >&2
+    echo "License: $source_notice" >&2
+    echo "Set XMP_BUNDLED_SOUNDFONT and XMP_BUNDLED_SOUNDFONT_LICENSE if they are elsewhere." >&2
+    exit 1
+fi
+case "${source_font,,}" in
+    *.sf2) bundled_font="default-GM.sf2" ;;
+    *.sf3) bundled_font="default-GM.sf3" ;;
+    *) echo "Bundled SoundFont must have an .sf2 or .sf3 extension." >&2; exit 1 ;;
+esac
+
+uade_core="${XMP_UADE_CORE:-/usr/local/lib/uade/uadecore}"
+uade_data_dir="${XMP_UADE_BASE_DIR:-/usr/local/share/uade}"
+if [[ ! -x "$uade_core" || "${uade_core##*/}" != uadecore ]]; then
+    echo "Missing UADE core: $uade_core (set XMP_UADE_CORE if needed)." >&2
+    exit 1
+fi
+for data_file in score uaerc uade.conf eagleplayer.conf; do
+    if [[ ! -s "$uade_data_dir/$data_file" ]]; then
+        echo "Missing UADE runtime file: $uade_data_dir/$data_file" >&2
+        exit 1
+    fi
+done
+if [[ ! -d "$uade_data_dir/players" ]] ||
+   [[ -z "$(find "$uade_data_dir/players" -type f -print -quit)" ]]; then
+    echo "Missing UADE player data: $uade_data_dir/players" >&2
+    exit 1
+fi
+
 mkdir -p -- "$dist_dir"
 build_root="$(mktemp -d /tmp/xmp-appimage.XXXXXXXX)"
 appdir="$build_root/XMP_Module_Player.AppDir"
-output_name="XMP_Module_Player-1.4.2-x86_64-$(date +%Y%m%d-%H%M%S).AppImage"
+output_name="XMP_Module_Player-1.4.3-x86_64-$(date +%Y%m%d-%H%M%S).AppImage"
 
 cleanup() {
     if [[ -n "${build_root:-}" && -d "$build_root" &&
@@ -64,6 +99,7 @@ fi
         --appdir "$appdir" \
         --executable "$project_dir/xmp-linux" \
         --executable "$project_dir/xmp-zx-helper" \
+        --executable "$uade_core" \
         "${hvsc_utilities[@]}" \
         --desktop-file "$script_dir/xmp-module-player.desktop" \
         --icon-file "$project_dir/icons/xmp.png" \
@@ -80,27 +116,44 @@ fi
 install -D -m 0755 "$hvsc_installer" \
     "$appdir/usr/share/xmp-module-player/hvsc-install-safe.sh"
 
-# Optional bundled General MIDI bank. Keep the exact license for the chosen
-# SoundFont with the AppImage; other sources may have different permissions.
-# No SoundFont is downloaded or silently redistributed by this script.
-if [[ -n "${XMP_BUNDLED_SOUNDFONT:-}" ]]; then
-    source_font="$XMP_BUNDLED_SOUNDFONT"
-    source_notice="${XMP_BUNDLED_SOUNDFONT_LICENSE:-}"
-    if [[ ! -f "$source_font" || ! -f "$source_notice" ]]; then
-        echo "Set XMP_BUNDLED_SOUNDFONT and XMP_BUNDLED_SOUNDFONT_LICENSE to existing files." >&2
-        exit 1
+# Include every UADE data file, following symlinks so no runtime asset points
+# outside the AppImage. linuxdeploy collects uadecore's ELF dependencies too.
+mkdir -p -- "$appdir/usr/share/uade"
+cp -aL -- "$uade_data_dir/." "$appdir/usr/share/uade/"
+
+install -D -m 0644 "$source_font" \
+    "$appdir/usr/share/sounds/sf2/$bundled_font"
+install -D -m 0644 "$source_notice" \
+    "$appdir/usr/share/doc/xmp-module-player/soundfonts/SOUNDFONT-LICENSE.txt"
+echo "Bundled SoundFont: $source_font ($bundled_font)"
+
+verify_bundle() {
+    local bundle="$1"
+    local asset library
+    for asset in usr/bin/xmp-linux usr/bin/xmp-zx-helper usr/bin/uadecore \
+        usr/share/uade/score usr/share/uade/uaerc usr/share/uade/uade.conf \
+        usr/share/uade/eagleplayer.conf; do
+        if [[ ! -s "$bundle/$asset" ]]; then
+            echo "Bundle verification failed: missing $asset" >&2
+            return 1
+        fi
+    done
+    if [[ ! -x "$bundle/usr/bin/uadecore" ]] ||
+       [[ -z "$(find "$bundle/usr/share/uade/players" -type f -print -quit)" ]]; then
+        echo "Bundle verification failed: UADE core or player data missing." >&2
+        return 1
     fi
-    case "${source_font,,}" in
-        *.sf2) bundled_font="default-GM.sf2" ;;
-        *.sf3) bundled_font="default-GM.sf3" ;;
-        *) echo "Bundled SoundFont must have an .sf2 or .sf3 extension." >&2; exit 1 ;;
-    esac
-    install -D -m 0644 "$source_font" \
-        "$appdir/usr/share/sounds/sf2/$bundled_font"
-    install -D -m 0644 "$source_notice" \
-        "$appdir/usr/share/doc/xmp-module-player/soundfonts/SOUNDFONT-LICENSE.txt"
-    echo "Bundled SoundFont: $source_font ($bundled_font)"
-fi
+    for library in libuade libbencodetools libfluidsynth; do
+        if [[ -z "$(find "$bundle/usr" -type f -name "$library.so*" -print -quit)" ]]; then
+            echo "Bundle verification failed: missing $library." >&2
+            return 1
+        fi
+    done
+    cmp -- "$source_font" "$bundle/usr/share/sounds/sf2/$bundled_font"
+    cmp -- "$source_notice" \
+        "$bundle/usr/share/doc/xmp-module-player/soundfonts/SOUNDFONT-LICENSE.txt"
+}
+verify_bundle "$appdir"
 
 # Stage the notices after linuxdeploy has collected libraries, but before
 # producing the compressed AppImage.
@@ -117,6 +170,16 @@ if [[ ! -f "$dist_dir/$output_name" ]]; then
     echo "The packaging tool did not create the expected AppImage." >&2
     exit 1
 fi
+
+# Inspect the compressed result, not just its staging directory. This does
+# not start the player or require FUSE. The exit trap removes extracted bytes.
+mkdir -p -- "$build_root/verification"
+(
+    cd -- "$build_root/verification"
+    "$dist_dir/$output_name" --appimage-extract > "$build_root/extraction.log" 2>&1
+)
+verify_bundle "$build_root/verification/squashfs-root"
+echo "Verified: bundled UADE core/data/libraries and the exact SoundFont and license."
 
 echo "AppImage built: $dist_dir/$output_name"
 echo "Test it locally before distributing it to other machines."

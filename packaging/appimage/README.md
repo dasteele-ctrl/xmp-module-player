@@ -13,14 +13,14 @@ local test, not a distribution-ready release.
    into that same folder. Make both tools executable.
 4. Run `bash packaging/appimage/build.sh` from the repository root.
 
-The resulting version 1.4.2 AppImage is written under `dist/` with a timestamp in
-its filename (`XMP_Module_Player-1.4.2-x86_64-*.AppImage`). This script does not
+The resulting version 1.4.3 AppImage is written under `dist/` with a timestamp in
+its filename (`XMP_Module_Player-1.4.3-x86_64-*.AppImage`). This script does not
 overwrite an existing AppImage.
 
 GTK plugins and resources can be loaded dynamically, so `ldd` alone does
 not capture all runtime dependencies. Test the AppImage with ZX, tracker,
 SID, and FFmpeg-supported formats, and verify the file picker and desktop
-theme. For version 1.4.2, test the tray icon, minimize-to-tray preference,
+theme. For version 1.4.3, test the tray icon, minimize-to-tray preference,
 playlist controls, and high-contrast tooltip on an Xfce panel. Also test the
 IRC tab's TLS connection to EsperNet:
 the GTK GIO TLS backend and certificate handling may be dynamically loaded.
@@ -37,14 +37,13 @@ oldest supported target distribution and test on a separate system. Audit
 licenses and redistribution requirements for all included components before
 publishing.
 
-MIDI playback links against FluidSynth. Check that linuxdeploy gathers
-`libfluidsynth` and its codecs, and test the **SoundFonts** tab with both SF2
-and SF3 before releasing. A SoundFont is not bundled by this recipe yet;
-users can select a system-installed or personal SoundFont. Any future bundled
-font requires separate license review and an appropriate in-AppDir path.
+MIDI playback links against FluidSynth. The default SoundFont is required for
+this recipe. The default source paths are:
 
-To include a reviewed SF2 or SF3 without downloading it automatically, set
-these environment variables when invoking the build script:
+- `~/Music/SoundFonts/MS Basic.sf3`
+- `~/Music/SoundFonts/MS Basic_License.md`
+
+The build fails before staging if either is missing. Override them if needed:
 
 ```bash
 XMP_BUNDLED_SOUNDFONT="$HOME/Music/SoundFonts/MS Basic.sf3" \
@@ -52,8 +51,29 @@ XMP_BUNDLED_SOUNDFONT_LICENSE="$HOME/Music/SoundFonts/MS Basic_License.md" \
 bash packaging/appimage/build.sh
 ```
 
-The script refuses to bundle a font without its supplied license notice.
-It stages the selected bank as `default-GM.sf2` or `default-GM.sf3` inside
-`usr/share/sounds/sf2/`, where XMP detects it on first launch. The original
-file is not moved or modified. Review all applicable license and attribution
-terms for the exact SoundFont and version before distributing the AppImage.
+The font and its exact supplied license are copied into
+`usr/share/sounds/sf2/default-GM.sf3` (or `.sf2`) and
+`usr/share/doc/xmp-module-player/soundfonts/SOUNDFONT-LICENSE.txt`.
+No font is downloaded and the original files are not modified.
+
+UADE's core is staged as `usr/bin/uadecore`, with its data in
+`usr/share/uade`. The build defaults to `/usr/local/lib/uade/uadecore` and
+`/usr/local/share/uade`; `XMP_UADE_CORE` and `XMP_UADE_BASE_DIR` can override
+these source paths. All runtime data is copied, including players, score,
+uaerc, uade.conf, and eagleplayer.conf. linuxdeploy collects the core's
+libraries and the player's linked libuade, libbencodetools, and FluidSynth.
+
+Inside an AppImage, the UADE adapter resolves its core/data relative to
+APPDIR, including explicit bundled score/uaerc paths. A source-tree build
+continues to use its installed UADE runtime.
+
+After compression, the script extracts the finished AppImage into its
+private temporary directory. It verifies executable/data/library presence
+and compares the SoundFont and license byte for byte with their originals.
+The temporary directory is removed when the build finishes.
+
+Test the final AppImage with UADE music (including paired mdat/smpl files),
+seeking, WAV export, MIDI using the bundled font, MOD, SID and ZX playback,
+and a clean exit. Verify on a machine or environment without system UADE
+and without a system SoundFont before calling the build portable. An
+existing saved SoundFont selection may take priority over the bundled bank.
