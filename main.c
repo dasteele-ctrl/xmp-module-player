@@ -10,6 +10,8 @@
 #include <math.h>
 #include "ffmpeg_audio.h"
 #include "sid_audio.h"
+#include "uade_audio.h"
+#include <signal.h>
 #include "midi_audio.h"
 #include "equalizer.h"
 #include "hvsc_download.h"
@@ -32,7 +34,8 @@ typedef enum {
     PLAYBACK_FFMPEG,
     PLAYBACK_SID,
     PLAYBACK_MIDI,
-    PLAYBACK_ZX
+    PLAYBACK_ZX,
+    PLAYBACK_UADE
 } PlaybackMode;
 
 static PlaybackMode playback_mode = PLAYBACK_NONE;
@@ -108,6 +111,7 @@ static SDL_Thread *decoder_thread;
 static SDL_atomic_t decoder_stop;
 static FfmpegAudio *ffmpeg_audio;
 static SidAudio *sid_audio;
+static UadeAudio *uade_audio;
 static MidiAudio *midi_audio;
 static gchar *selected_soundfont;
 static GtkWidget *soundfont_label;
@@ -212,6 +216,9 @@ static int decoder_thread_fn(void *unused)
             got = zx_audio_read(zx_audio, chunk, request);
         else
 #endif
+        if (uade_audio)
+            got = uade_audio_read(uade_audio, chunk, request);
+        else
             got = ffmpeg_audio_read(ffmpeg_audio, chunk, request);
 
         if (generation != SDL_AtomicGet(&ffmpeg_seek_generation))
@@ -248,7 +255,8 @@ static int decoder_thread_fn(void *unused)
 
 static void stop_ffmpeg_decoder(void)
 {
-    /* Stop the shared PCM producer (FFmpeg or native ZXTune) before freeing it. */
+    /* Stop shared PCM playback before joining and freeing any renderer. */
+    if (audio_device) SDL_PauseAudioDevice(audio_device, 1);
     SDL_AtomicSet(&decoder_stop, 1);
 
     if (decoder_thread) {
@@ -256,6 +264,10 @@ static void stop_ffmpeg_decoder(void)
         decoder_thread = NULL;
     }
 
+    if (uade_audio) {
+        uade_audio_close(uade_audio);
+        uade_audio = NULL;
+    }
     if (ffmpeg_audio) {
         ffmpeg_audio_close(ffmpeg_audio);
         ffmpeg_audio = NULL;
@@ -340,6 +352,41 @@ static gboolean zx_is_music_path(const char *filename)
     return FALSE;
 }
 
+static const char *uade_name_tags[] = {
+    "mod", "mdat", "tfmx", "tfx", "cust", "custom", "dl", "dw", "hip", "hipc",
+    "bp", "bp3", "sfx", "smus", "jpn", "jpo", "jmf", "rjp", "rh",
+    "sid1", "sid2", "soc", "sog", "sun", "mon", "mosh", "fc", "fc13",
+    "fc14", "fred", "dm", "dm2", "dmu", "dss", "ahx", "thx", "hvl", "rmc"
+};
+
+static gboolean uade_is_music_name(const char *name)
+{
+    for (guint i = 0; i < G_N_ELEMENTS(uade_name_tags); ++i) {
+        gsize n = strlen(uade_name_tags[i]), len = strlen(name);
+        if ((len > n && name[n] == '.' &&
+             g_ascii_strncasecmp(name, uade_name_tags[i], n) == 0) ||
+            (len > n && name[len-n-1] == '.' &&
+             g_ascii_strcasecmp(name+len-n, uade_name_tags[i]) == 0))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void uade_add_file_patterns(GtkFileFilter *filter)
+{
+    for (guint i = 0; i < G_N_ELEMENTS(uade_name_tags); ++i) {
+        gchar *upper = g_ascii_strup(uade_name_tags[i], -1);
+        gchar *patterns[] = {g_strdup_printf("%s.*", uade_name_tags[i]),
+            g_strdup_printf("*.%s", uade_name_tags[i]),
+            g_strdup_printf("%s.*", upper), g_strdup_printf("*.%s", upper)};
+        for (guint j = 0; j < G_N_ELEMENTS(patterns); ++j) {
+            gtk_file_filter_add_pattern(filter, patterns[j]);
+            g_free(patterns[j]);
+        }
+        g_free(upper);
+    }
+}
+
 static char current_file[4096] = "";
 static GtkListStore *playlist_store;
 static GtkWidget *playlist_view;
@@ -363,7 +410,8 @@ static void audio_callback(void *userdata, Uint8 *stream, int len)
             playing = 0;
         }
     } else if (playback_mode == PLAYBACK_FFMPEG ||
-               playback_mode == PLAYBACK_ZX) {
+               playback_mode == PLAYBACK_ZX ||
+               playback_mode == PLAYBACK_UADE) {
         int16_t *out = (int16_t *)stream;
         int requested_frames = len / (int)(2 * sizeof(int16_t));
         int copied_frames = 0;
@@ -943,6 +991,51 @@ static int open_zx_native(const char *filename)
     return 1;
 }
 #endif
+
+/* Called after libxmp and SID reject a file. open_module has already
+ * released their state. UADE opens the original path for companion loading. */
+static int open_uade(const char *filename)
+{
+    char error[512] = "";
+    stop_ffmpeg_decoder();
+    uade_audio = uade_audio_open(filename, error, sizeof(error));
+    if (!uade_audio) return 0;
+    ffmpeg_position_frames = 0;
+    ffmpeg_duration_ms = 0;
+    SDL_AtomicSet(&decoder_stop, 0);
+    SDL_AtomicSet(&ffmpeg_decode_finished, 0);
+    SDL_AtomicSet(&ffmpeg_decode_error, 0);
+    SDL_AtomicSet(&ffmpeg_seek_requested, 0);
+    decoder_thread = SDL_CreateThread(decoder_thread_fn, "uade-decoder", NULL);
+    if (!decoder_thread) {
+        uade_audio_close(uade_audio);
+        uade_audio = NULL;
+        set_status("Could not start UADE decoder thread.");
+        return 0;
+    }
+    playback_mode = PLAYBACK_UADE;
+    playing = stopped = audio_ended = 0;
+    g_strlcpy(current_file, filename, sizeof(current_file));
+    gchar *base = g_path_get_basename(filename);
+    gtk_label_set_text(GTK_LABEL(title_label),
+        *uade_audio_title(uade_audio) ? uade_audio_title(uade_audio) : base);
+    gchar *format = g_strdup_printf("%s (UADE)",
+        *uade_audio_format(uade_audio) ? uade_audio_format(uade_audio) : "Amiga music");
+    gtk_label_set_text(GTK_LABEL(format_label), format);
+    g_free(format);
+    g_free(base);
+    gtk_label_set_text(GTK_LABEL(channels_label), "Stereo    44100 Hz");
+    gtk_label_set_text(GTK_LABEL(details_label), filename);
+    gtk_label_set_text(GTK_LABEL(time_label), "00:00");
+    gtk_widget_set_sensitive(seek_scale, FALSE);
+    updating_seek = 1;
+    gtk_range_set_value(GTK_RANGE(seek_scale), 0);
+    updating_seek = 0;
+    xmp_eq_reset_history(&equalizer);
+    update_play_button();
+    set_status("Amiga tune loaded (UADE)");
+    return 1;
+}
 
 static void open_module(const char *filename)
 {
@@ -2056,6 +2149,7 @@ static void on_open(GtkButton *button, gpointer data)
     for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
         gtk_file_filter_add_pattern(filter, patterns[i]);
 
+    uade_add_file_patterns(filter);
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
 
     GtkFileFilter *all_filter = gtk_file_filter_new();
@@ -2073,7 +2167,7 @@ static void on_open(GtkButton *button, gpointer data)
             } else {
                 open_module(filename);
                 if (!zx_is_music_path(filename) && !module_loaded &&
-                    !open_sid(filename))
+                    !open_sid(filename) && !open_uade(filename))
                     open_ffmpeg_audio(filename);
             }
             g_free(filename);
@@ -2191,6 +2285,11 @@ static void on_export_wav(GtkButton *button, gpointer data)
     }
     if (playback_mode == PLAYBACK_NONE || !current_file[0]) {
         set_status("Open a music file before exporting it");
+        return;
+    }
+
+    if (playback_mode == PLAYBACK_UADE) {
+        set_status("WAV export for UADE is not available in this first test build.");
         return;
     }
 
@@ -2366,6 +2465,18 @@ static void on_play(GtkButton *button, gpointer data)
     }
 #endif
 
+    if (playback_mode == PLAYBACK_UADE &&
+        (stopped || audio_ended || !uade_audio)) {
+        char filename[sizeof(current_file)];
+        g_strlcpy(filename, current_file, sizeof(filename));
+        if (!open_uade(filename)) {
+            playback_mode = PLAYBACK_NONE;
+            set_status("Could not restart UADE tune.");
+            update_play_button();
+            return;
+        }
+    }
+
     if (playing) {
         SDL_PauseAudioDevice(audio_device, 1);
         playing = 0;
@@ -2418,12 +2529,14 @@ static void on_play(GtkButton *button, gpointer data)
         playing = 1;
         SDL_PauseAudioDevice(audio_device, 0);
         set_status("Playing");
-    } else if (playback_mode == PLAYBACK_ZX) {
+    } else if (playback_mode == PLAYBACK_ZX ||
+               playback_mode == PLAYBACK_UADE) {
         stopped = 0;
         audio_ended = 0;
         playing = 1;
         SDL_PauseAudioDevice(audio_device, 0);
-        set_status("Playing ZX Spectrum tune");
+        set_status(playback_mode == PLAYBACK_UADE ?
+                   "Playing Amiga tune (UADE)" : "Playing ZX Spectrum tune");
     }
 
     update_play_button();
@@ -2450,7 +2563,8 @@ static void on_stop(GtkButton *button, gpointer data)
         xmp_stop_module(ctx);
         SDL_UnlockAudioDevice(audio_device);
     } else if (playback_mode == PLAYBACK_FFMPEG ||
-               playback_mode == PLAYBACK_ZX) {
+               playback_mode == PLAYBACK_ZX ||
+               playback_mode == PLAYBACK_UADE) {
         stop_ffmpeg_decoder();
     } else if (playback_mode == PLAYBACK_SID && sid_audio) {
         SDL_LockAudioDevice(audio_device);
@@ -2618,7 +2732,8 @@ static void update_visualizer_spectrum(void)
          playback_mode != PLAYBACK_MODULE &&
          playback_mode != PLAYBACK_FFMPEG &&
          playback_mode != PLAYBACK_MIDI &&
-         playback_mode != PLAYBACK_SID) ||
+         playback_mode != PLAYBACK_SID &&
+         playback_mode != PLAYBACK_UADE) ||
         !playing || audio_ended) {
         for (int i = 0; i < VIZ_BANDS; i++) {
             viz_levels[i] *= 0.82;
@@ -2726,7 +2841,8 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
     cairo_paint(cr);
 
     if (((zx_active_wav && playback_mode == PLAYBACK_FFMPEG) ||
-         playback_mode == PLAYBACK_ZX || playback_mode == PLAYBACK_MIDI) &&
+         playback_mode == PLAYBACK_ZX || playback_mode == PLAYBACK_MIDI ||
+         playback_mode == PLAYBACK_UADE) &&
         width >= 80 && height >= 20) {
         /* Both ZX backends expose mixed output. Do not represent this
          * waveform as separate AY chip channels. */
@@ -2742,6 +2858,8 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
         cairo_move_to(cr, 12, 17);
         cairo_show_text(cr, playback_mode == PLAYBACK_MIDI
                               ? "MIDI - mixed audio waveform"
+                              : playback_mode == PLAYBACK_UADE
+                              ? "Amiga (UADE) - mixed audio waveform"
                               : "ZX Spectrum - mixed audio waveform");
         cairo_set_source_rgb(cr, 0.35, 0.90, 0.65);
         cairo_set_line_width(cr, 1.0);
@@ -3015,7 +3133,7 @@ static void play_playlist_file(const char *filename)
         return;
     }
 
-    if (open_ffmpeg_audio(filename))
+    if (open_uade(filename) || open_ffmpeg_audio(filename))
         on_play(NULL, NULL);
 }
 
@@ -3193,6 +3311,7 @@ static void on_playlist_add(GtkButton *button, gpointer data)
     for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
         gtk_file_filter_add_pattern(filter, patterns[i]);
 
+    uade_add_file_patterns(filter);
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
 
     GtkFileFilter *all_filter = gtk_file_filter_new();
@@ -3235,6 +3354,8 @@ static gboolean playlist_is_audio_filename(const gchar *filename)
         ".psg", ".asc"
     };
 
+    if (uade_is_music_name(filename))
+        return TRUE;
     const gchar *dot = strrchr(filename, '.');
     if (!dot)
         return FALSE;
@@ -3702,7 +3823,8 @@ static gboolean update_display(gpointer data)
     int total;
 
     if (playback_mode == PLAYBACK_FFMPEG ||
-        playback_mode == PLAYBACK_ZX) {
+        playback_mode == PLAYBACK_ZX ||
+        playback_mode == PLAYBACK_UADE) {
         SDL_LockAudioDevice(audio_device);
         int64_t position_frames = ffmpeg_position_frames;
         int64_t duration_ms = ffmpeg_duration_ms;
@@ -3713,7 +3835,7 @@ static gboolean update_display(gpointer data)
         current = (int)(position_frames * 1000 / AUDIO_RATE);
         total = duration_ms > 0 ? (int)duration_ms : 1;
         if (current < 0) current = 0;
-        if (current > total) current = total;
+        if (playback_mode != PLAYBACK_UADE && current > total) current = total;
 
         if (is_playing || ended) {
             updating_seek = 1;
@@ -3725,13 +3847,20 @@ static gboolean update_display(gpointer data)
         snprintf(time_text, sizeof(time_text), "%02d:%02d / %02d:%02d",
                  current / 60000, (current / 1000) % 60,
                  total / 60000, (total / 1000) % 60);
+        if (playback_mode == PLAYBACK_UADE)
+            snprintf(time_text, sizeof(time_text), "%02d:%02d",
+                     current / 60000, (current / 1000) % 60);
         gtk_label_set_text(GTK_LABEL(time_label), time_text);
 
-        if (is_playing)
+        if (is_playing && playback_mode == PLAYBACK_UADE)
+            set_status("Playing Amiga tune (UADE)");
+        else if (is_playing)
             set_status(zx_active_source ? "Playing ZX Spectrum tune" :
                        "Playing audio file");
         else if (ended)
-            set_status("Playback finished");
+            set_status(playback_mode == PLAYBACK_UADE &&
+                       SDL_AtomicGet(&ffmpeg_decode_error) ?
+                       "UADE decoding failed" : "Playback finished");
     } else if (playback_mode == PLAYBACK_MIDI) {
         SDL_LockAudioDevice(audio_device);
         int64_t position = midi_audio ? midi_audio_position_ms(midi_audio) : 0;
@@ -4517,6 +4646,9 @@ static void on_destroy(GtkWidget *widget, gpointer data)
 
 int main(int argc, char **argv)
 {
+    /* libuade communicates with uadecore over pipes. A failed core must
+     * report an I/O error instead of terminating the GUI with SIGPIPE. */
+    signal(SIGPIPE, SIG_IGN);
     gtk_init(&argc, &argv);
 
     /* Request a dark GTK fallback for controls the application does not
