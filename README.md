@@ -1,6 +1,6 @@
 # XMP Module Player
 
-A native Linux music player built with **GTK3, SDL2, libxmp, and FFmpeg**.
+A native Linux music player built with **GTK3 and SDL2**, with playback powered by **libxmp, UADE, ZXTune, libsidplayfp, FluidSynth, and FFmpeg**.
 
 XMP Module Player brings classic tracker music and regular audio playback to the Linux desktop, with a graphical interface, real-time audio visualization, and detailed module and sample information.
 
@@ -9,14 +9,15 @@ XMP Module Player brings classic tracker music and regular audio playback to the
 ## Features
 
 - 🎵 **Tracker module playback** powered by libxmp
+- 🎵 **Additional Amiga music formats** powered by UADE, with libxmp retaining priority for formats supported by both engines
 - 🎧 **Regular audio playback** powered by FFmpeg: MP3, WAV, M4A/AAC, Ogg Vorbis, Opus, and FLAC
 - 🎵 **Commodore 64 SID playback** powered by libsidplayfp
 - 🎹 **MIDI playback** powered by FluidSynth, with user-selectable SF2/SF3 SoundFonts
 - 🎼 **SoundFont manager** with multi-file import, folder scanning, live switching, and a startup default
 - 🎵 **ZX Spectrum AY/YM playback** through bundled ZXTune, including PT3, AY, VTX, YM, STC, and SQT
-- 💾 **Offline WAV export** for supported audio formats, with cancellation and overwrite confirmation
+- 💾 **Offline WAV export** for all six playback engines, with cancellation and overwrite confirmation; UADE exports until song end by default, with an optional time limit
 - 🎚️ **Playback controls** with seeking and track timing
-- 📃 **Playlist management** with add, remove, clear, and drag-and-drop support
+- 📃 **Playlist management** with add, remove, clear, drag-and-drop support, and recursive music-folder importing
 - 📃 **High Voltage SID Collection (HVSC) browsing and integrated downloader**
 - 🔁 **Automatic track advancement**
 - 📂 **M3U playlist loading and saving**
@@ -25,7 +26,6 @@ XMP Module Player brings classic tracker music and regular audio playback to the
 - 🌊 **Channel scopes** for visualizing audio activity
 - 🧩 **Pattern viewer** for tracker data
 - 🔊 **Sample browser** with waveform visualization, sample details, loop information, and module comments
-- 📂 Offline WAV export: Render supported music to WAV without waiting through real-time playback.
 - 🖥️ **Native GTK3 interface** with SDL2 audio output
 - 💬 **Built-in IRC chat** with EsperNet/#modulez preset, TLS, channel tabs, and private messages
 
@@ -48,22 +48,24 @@ source files.
 
 ## Download
 
-Download the latest Linux AppImage from the project's **[Releases](../../releases)** page.
+**Version 1.4.3:** [Download the Linux x86_64 AppImage](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.4.3/XMP-Module-Player-v1.4.3-Linux-x86_64.AppImage).
+
+See the [v1.4.3 release notes](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.4.3) or browse [all releases](../../releases).
 
 ### Running the AppImage
 
-1. Download the versioned `XMP-Module-Player-v1.4.2-Linux-x86_64.AppImage` file from Release v1.4.2.
+1. Download the versioned `XMP-Module-Player-v1.4.3-Linux-x86_64.AppImage` file from Release v1.4.3.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x XMP-Module-Player-v1.4.2-Linux-x86_64.AppImage
-   ./XMP-Module-Player-v1.4.2-Linux-x86_64.AppImage
+   chmod +x XMP-Module-Player-v1.4.3-Linux-x86_64.AppImage
+   ./XMP-Module-Player-v1.4.3-Linux-x86_64.AppImage
    ```
 
 ## Requirements
 
-The AppImage bundles many of its required libraries. Compatibility with Linux distributions other than the development system has not yet been fully tested.
+The 1.4.3 AppImage includes the playback libraries, UADE core and player data, ZXTune helper, and default MIDI SoundFont with its license. A separate UADE installation or SoundFont download is not needed. Compatibility with Linux distributions other than the development system has not yet been fully tested.
 
 ### MIDI and SoundFonts
 
@@ -86,10 +88,44 @@ make -j4
 ./xmp-linux
 ```
 
-An AppImage must bundle a redistributable SoundFont to provide MIDI instruments
-on systems without one installed. The AppImage script can optionally include a
-chosen SF2/SF3 and its license, after both have been reviewed. See the AppImage
+The 1.4.3 AppImage bundles **MS Basic.sf3** as its default General MIDI
+SoundFont, together with its license. You can still import and select your
+own SF2/SF3 banks. A previously saved selection may take priority over the
+bundled default. Packaging details are in the
+[AppImage README](packaging/appimage/README.md).
+
 MIDI playback and the SoundFont Manager were introduced in **version 1.2**.
+
+### Amiga playback with UADE (introduced in version 1.4.3)
+
+**UADE** adds Amiga music formats that libxmp cannot play. libxmp retains
+priority for shared formats; UADE is used as a fallback. Existing dedicated
+SID, MIDI, and ZX Spectrum playback remains available.
+
+Open the music file itself, such as `mdat.song`, and keep any companion
+sample files, such as `smpl.song`, in the same folder with their original
+names. Folder importing recognizes common Amiga prefix and suffix names.
+For formats outside that initial filename list, choose **All files** in
+Open or Add Files.
+
+UADE supports seeking, pause/resume, playlist navigation, volume, EQ, and
+mixed waveform/spectrum visualization. Seeking uses background emulation,
+so larger jumps can take time. When no duration is known, the time display
+shows `--:--` and the seek bar uses an expanding navigation range rather
+than claiming a fixed song length.
+
+WAV export renders from the beginning using an independent decoder. By
+default, it continues until UADE reports song end. For looping songs, enable
+**Limit to** in the Save dialog and choose 1–3600 seconds. Exports stop at
+that limit or song end, whichever comes first. Natural-end mode does not
+guarantee automatic loop detection. Cancellation or a failed export leaves
+an existing destination file unchanged.
+
+The AppImage includes UADE's runtime and player data. For source builds,
+UADE development headers, `libuade.pc`, the installed core/data, and
+libbencodetools are required; development and testing used **UADE 3.05**.
+See [UADE integration notes](UADE_INTEGRATION.md) for runtime overrides
+and diagnostic commands.
 
 ### 10-Band Equalizer (introduced in version 1.3)
 
@@ -97,7 +133,7 @@ The integrated **Equalizer** tab provides ten adjustable bands (31 Hz to
 16 kHz), a preamp control, an aqua frequency-response graph with a subtle live
 spectrum, on/off bypass, and Flat, Rock, Pop, Classical, Jazz, Bass Boost and
 Vocal Clarity presets. Moving a slider creates a Custom preset. Changes are
-applied to the shared stereo output for tracker modules, SID, ZX, MIDI, and
+applied to the shared stereo output for tracker modules, UADE, SID, ZX, MIDI, and
 regular audio files without any additional audio library. The EQ uses smooth
 transitions when changing gains or toggling bypass.
 
@@ -161,13 +197,24 @@ in the distributed AppImage.
 - [GTK 3](https://www.gtk.org/) — graphical interface
 - [SDL 2](https://www.libsdl.org/) — audio output
 - [libxmp](https://github.com/libxmp/libxmp) — tracker module playback
+- [UADE](https://zakalwe.fi/uade/) — additional Amiga music formats
+- [libsidplayfp](https://github.com/libsidplayfp/libsidplayfp) — Commodore 64 SID playback
 - [FFmpeg](https://ffmpeg.org/) — decoding regular audio formats
 - [ZXTune](https://github.com/vitamin-caig/zxtune) — native ZX Spectrum and chiptune playback
 - [FluidSynth](https://www.fluidsynth.org/) — MIDI synthesis with SF2/SF3 SoundFonts
 
 ## Project Status
 
-**Current source version: 1.4.2**
+**Current source version: 1.4.3**
+
+Version 1.4.3 adds UADE fallback playback, seeking, and WAV export for
+additional Amiga music formats. The AppImage bundles UADE's core, libraries,
+player data, and the default MIDI SoundFont with its license. The About tab
+now lists all six playback engines and the main features.
+
+The 1.4.3 AppImage was tested locally for playback, engine switching,
+seeking, WAV export, and clean exit. Packaging verification checked the
+bundled UADE assets and compared the SoundFont and license with the originals.
 
 Version 1.4.2 fixes playlist navigation, makes Play start the first playlist track, and adds recursive folder loading.
 
