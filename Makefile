@@ -31,7 +31,7 @@ xmp-export-test: $(EXPORT_TEST_OBJECTS) xmp-zx-helper Makefile
 main_export.o: main.c uade_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h zx_audio.h export_wav.h xmp_irc_widget.h tray_icon.h
 	$(CC) $(CFLAGS) -DENABLE_ZXTUNE_NATIVE -DENABLE_WAV_EXPORT -c -o $@ main.c
 
-export_wav.o: export_wav.c export_wav.h ffmpeg_audio.h sid_audio.h midi_audio.h zx_audio.h
+export_wav.o: export_wav.c export_wav.h uade_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h zx_audio.h
 	$(CC) $(CFLAGS) -c -o $@ export_wav.c
 
 xmp-zx-helper: zx_helper.o zx_audio.o Makefile
@@ -132,7 +132,7 @@ uade_audio.o: uade_audio.c uade_audio.h
 # Run ./xmp-uade-test /absolute/path/to/mdat.song
 xmp-uade-test: test_uade_audio.c uade_audio.c uade_audio.h
 	$(CC) -O2 -Wall -Wextra -o $@ test_uade_audio.c uade_audio.c \
-	    $(shell pkg-config --cflags --libs libuade)
+	    $(shell pkg-config --cflags --libs libuade) -lbencodetools
 
 .PHONY: check-uade-syntax
 check-uade-syntax:

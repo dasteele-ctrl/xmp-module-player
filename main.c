@@ -168,6 +168,7 @@ static int decoder_thread_fn(void *unused)
         if (SDL_AtomicGet(&ffmpeg_seek_requested)) {
             SDL_LockAudioDevice(audio_device);
             int64_t target_ms = ffmpeg_seek_target_ms;
+            int seek_generation = SDL_AtomicGet(&ffmpeg_seek_generation);
             SDL_AtomicSet(&ffmpeg_seek_requested, 0);
             SDL_UnlockAudioDevice(audio_device);
 
@@ -177,6 +178,9 @@ static int decoder_thread_fn(void *unused)
                 seek_result = zx_audio_seek(zx_audio, target_ms);
             else
 #endif
+            if (uade_audio)
+                seek_result = uade_audio_seek(uade_audio, target_ms);
+            else
                 seek_result = ffmpeg_audio_seek(ffmpeg_audio, target_ms);
             if (seek_result < 0) {
                 SDL_AtomicSet(&ffmpeg_decode_error, 1);
@@ -185,14 +189,25 @@ static int decoder_thread_fn(void *unused)
             }
 
             SDL_LockAudioDevice(audio_device);
-            audio_ring_read_pos = 0;
-            audio_ring_write_pos = 0;
-            ffmpeg_position_frames = target_ms * AUDIO_RATE / 1000;
+            if (seek_generation == SDL_AtomicGet(&ffmpeg_seek_generation)) {
+                audio_ring_read_pos = 0;
+                audio_ring_write_pos = 0;
+                ffmpeg_position_frames = target_ms * AUDIO_RATE / 1000;
+            }
             SDL_UnlockAudioDevice(audio_device);
 
             SDL_AtomicSet(&ffmpeg_decode_finished, 0);
             SDL_AtomicSet(&ffmpeg_decode_error, 0);
         }
+
+        /* UADE's worker stays alive at EOF so a paused/finished song can
+         * still accept a new seek. Stop joins it via decoder_stop. */
+        if (uade_audio && SDL_AtomicGet(&ffmpeg_decode_finished)) {
+            SDL_Delay(5);
+            continue;
+        }
+        if (SDL_AtomicGet(&ffmpeg_seek_requested))
+            continue;
 
         SDL_LockAudioDevice(audio_device);
         unsigned int read_pos = audio_ring_read_pos;
@@ -232,6 +247,7 @@ static int decoder_thread_fn(void *unused)
 
         if (got == 0) {
             SDL_AtomicSet(&ffmpeg_decode_finished, 1);
+            if (uade_audio) continue;
             break;
         }
 
@@ -1001,7 +1017,7 @@ static int open_uade(const char *filename)
     uade_audio = uade_audio_open(filename, error, sizeof(error));
     if (!uade_audio) return 0;
     ffmpeg_position_frames = 0;
-    ffmpeg_duration_ms = 0;
+    ffmpeg_duration_ms = uade_audio_duration_ms(uade_audio);
     SDL_AtomicSet(&decoder_stop, 0);
     SDL_AtomicSet(&ffmpeg_decode_finished, 0);
     SDL_AtomicSet(&ffmpeg_decode_error, 0);
@@ -1027,8 +1043,11 @@ static int open_uade(const char *filename)
     gtk_label_set_text(GTK_LABEL(channels_label), "Stereo    44100 Hz");
     gtk_label_set_text(GTK_LABEL(details_label), filename);
     gtk_label_set_text(GTK_LABEL(time_label), "00:00");
-    gtk_widget_set_sensitive(seek_scale, FALSE);
+    gtk_widget_set_sensitive(seek_scale, TRUE);
     updating_seek = 1;
+    /* Unknown song lengths use a growing seek window, not a fake duration. */
+    gtk_range_set_range(GTK_RANGE(seek_scale), 0,
+        ffmpeg_duration_ms > 0 ? (double)ffmpeg_duration_ms : 300000.0);
     gtk_range_set_value(GTK_RANGE(seek_scale), 0);
     updating_seek = 0;
     xmp_eq_reset_history(&equalizer);
@@ -2288,11 +2307,6 @@ static void on_export_wav(GtkButton *button, gpointer data)
         return;
     }
 
-    if (playback_mode == PLAYBACK_UADE) {
-        set_status("WAV export for UADE is not available in this first test build.");
-        return;
-    }
-
     ExportWavFormat format = EXPORT_WAV_FFMPEG;
     unsigned int sid_subtune = 0;
     const char *source = current_file;
@@ -2303,6 +2317,8 @@ static void on_export_wav(GtkButton *button, gpointer data)
         SDL_LockAudioDevice(audio_device);
         if (sid_audio) sid_subtune = sid_audio_current_song(sid_audio);
         SDL_UnlockAudioDevice(audio_device);
+    } else if (playback_mode == PLAYBACK_UADE) {
+        format = EXPORT_WAV_UADE;
     } else if (playback_mode == PLAYBACK_MIDI) {
         format = EXPORT_WAV_MIDI;
     } else if (playback_mode == PLAYBACK_ZX ||
@@ -2311,12 +2327,40 @@ static void on_export_wav(GtkButton *button, gpointer data)
         if (zx_active_source) source = zx_active_source;
     }
 
+    /* Modal dialogs still run timers: playlist advancement must not change
+     * the source selected for this export or free its backing path. */
+    g_autofree gchar *source_snapshot = g_strdup(source);
+    source = source_snapshot;
+
     GtkWidget *chooser = gtk_file_chooser_dialog_new(
         "Export audio to WAV", GTK_WINDOW(window),
         GTK_FILE_CHOOSER_ACTION_SAVE,
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Export", GTK_RESPONSE_ACCEPT, NULL);
     theme_dialog(chooser);
+
+    GtkWidget *uade_limit_toggle = NULL;
+    GtkWidget *uade_limit_seconds = NULL;
+    if (format == EXPORT_WAV_UADE) {
+        GtkWidget *options = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+        GtkWidget *description = gtk_label_new(
+            "Export until song ends. For looping tunes, enable a time limit.");
+        gtk_label_set_xalign(GTK_LABEL(description), 0.0f);
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        uade_limit_toggle = gtk_check_button_new_with_label("Limit to");
+        uade_limit_seconds = gtk_spin_button_new_with_range(1, 3600, 5);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(uade_limit_seconds), 180);
+        g_object_bind_property(uade_limit_toggle, "active",
+                               uade_limit_seconds, "sensitive",
+                               G_BINDING_SYNC_CREATE);
+        gtk_box_pack_start(GTK_BOX(row), uade_limit_toggle, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), uade_limit_seconds, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), gtk_label_new("seconds"), FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(options), description, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(options), row, FALSE, FALSE, 0);
+        gtk_widget_show_all(options);
+        gtk_file_chooser_set_extra_widget(GTK_FILE_CHOOSER(chooser), options);
+    }
 
     gchar *base = g_path_get_basename(source);
     char *extension = strrchr(base, '.');
@@ -2327,8 +2371,14 @@ static void on_export_wav(GtkButton *button, gpointer data)
     g_free(base);
 
     gchar *destination = NULL;
-    if (gtk_dialog_run(GTK_DIALOG(chooser)) == GTK_RESPONSE_ACCEPT)
+    unsigned int uade_seconds = 0;
+    if (gtk_dialog_run(GTK_DIALOG(chooser)) == GTK_RESPONSE_ACCEPT) {
         destination = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+        if (uade_limit_toggle &&
+            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(uade_limit_toggle)))
+            uade_seconds = gtk_spin_button_get_value_as_int(
+                GTK_SPIN_BUTTON(uade_limit_seconds));
+    }
     gtk_widget_destroy(chooser);
     if (!destination) return;
 
@@ -2364,7 +2414,8 @@ static void on_export_wav(GtkButton *button, gpointer data)
     unsigned int sid_seconds = 180;
     if (format == EXPORT_WAV_SID) {
         GtkWidget *duration_dialog = gtk_dialog_new_with_buttons(
-            "SID export duration", GTK_WINDOW(window), GTK_DIALOG_MODAL,
+            "SID export duration",
+            GTK_WINDOW(window), GTK_DIALOG_MODAL,
             "_Cancel", GTK_RESPONSE_CANCEL,
             "_Continue", GTK_RESPONSE_ACCEPT, NULL);
         theme_dialog(duration_dialog);
@@ -2395,6 +2446,7 @@ static void on_export_wav(GtkButton *button, gpointer data)
     task->request.destination = task->destination;
     task->request.format = format;
     task->request.sid_seconds = sid_seconds;
+    task->request.uade_seconds = uade_seconds;
     task->request.sid_subtune = sid_subtune;
     task->request.soundfont = NULL;
     if (format == EXPORT_WAV_MIDI) {
@@ -2407,9 +2459,6 @@ static void on_export_wav(GtkButton *button, gpointer data)
     theme_dialog(task->dialog);
     gtk_window_set_default_size(GTK_WINDOW(task->dialog), 420, -1);
     GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(task->dialog));
-    GtkWidget *description = gtk_label_new(
-        "Rendering the music as fast as possible, without playback.");
-    gtk_box_pack_start(GTK_BOX(area), description, FALSE, FALSE, 8);
     task->progress_bar = gtk_progress_bar_new();
     gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(task->progress_bar), TRUE);
     gtk_progress_bar_set_text(GTK_PROGRESS_BAR(task->progress_bar), "Starting…");
@@ -2612,6 +2661,36 @@ static void on_seek(GtkRange *range, gpointer data)
         return;
 
     int ms = (int)gtk_range_get_value(range);
+
+    if (playback_mode == PLAYBACK_UADE) {
+        /* Stop destroys the state. Reopen it before queueing a seek. */
+        if (!uade_audio || SDL_AtomicGet(&ffmpeg_decode_error)) {
+            char filename[sizeof(current_file)];
+            g_strlcpy(filename, current_file, sizeof(filename));
+            if (!open_uade(filename)) {
+                playback_mode = PLAYBACK_NONE;
+                set_status("Could not reopen UADE tune for seeking.");
+                update_play_button();
+                return;
+            }
+        }
+        SDL_LockAudioDevice(audio_device);
+        ffmpeg_seek_target_ms = ms;
+        SDL_AtomicAdd(&ffmpeg_seek_generation, 1);
+        /* Discard buffered pre-seek PCM immediately. libuade is only called
+         * by the worker, even when seeking while paused. */
+        audio_ring_read_pos = audio_ring_write_pos = 0;
+        ffmpeg_position_frames = (int64_t)ms * AUDIO_RATE / 1000;
+        SDL_AtomicSet(&ffmpeg_decode_finished, 0);
+        SDL_AtomicSet(&ffmpeg_decode_error, 0);
+        SDL_AtomicSet(&ffmpeg_seek_requested, 1);
+        audio_ended = stopped = 0;
+        xmp_eq_reset_history(&equalizer);
+        SDL_UnlockAudioDevice(audio_device);
+        set_status("Seeking Amiga tune…");
+        update_play_button();
+        return;
+    }
 
     if (playback_mode == PLAYBACK_MODULE && module_loaded) {
         SDL_LockAudioDevice(audio_device);
@@ -3837,8 +3916,15 @@ static gboolean update_display(gpointer data)
         if (current < 0) current = 0;
         if (playback_mode != PLAYBACK_UADE && current > total) current = total;
 
-        if (is_playing || ended) {
+        if (playback_mode == PLAYBACK_UADE || is_playing || ended) {
             updating_seek = 1;
+            if (playback_mode == PLAYBACK_UADE && duration_ms <= 0) {
+                double upper = gtk_adjustment_get_upper(
+                    gtk_range_get_adjustment(GTK_RANGE(seek_scale)));
+                double needed = MIN((double)INT_MAX, (double)current + 60000.0);
+                if (needed > upper)
+                    gtk_range_set_range(GTK_RANGE(seek_scale), 0, needed);
+            }
             gtk_range_set_value(GTK_RANGE(seek_scale), current);
             updating_seek = 0;
         }
@@ -3847,8 +3933,8 @@ static gboolean update_display(gpointer data)
         snprintf(time_text, sizeof(time_text), "%02d:%02d / %02d:%02d",
                  current / 60000, (current / 1000) % 60,
                  total / 60000, (total / 1000) % 60);
-        if (playback_mode == PLAYBACK_UADE)
-            snprintf(time_text, sizeof(time_text), "%02d:%02d",
+        if (playback_mode == PLAYBACK_UADE && duration_ms <= 0)
+            snprintf(time_text, sizeof(time_text), "%02d:%02d / --:--",
                      current / 60000, (current / 1000) % 60);
         gtk_label_set_text(GTK_LABEL(time_label), time_text);
 
@@ -5348,7 +5434,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_box_pack_start(GTK_BOX(about_page), about_icon,
                        FALSE, FALSE, 0);
 
-    GtkWidget *about_title = gtk_label_new("XMP Module Player 1.4.2");
+    GtkWidget *about_title = gtk_label_new("XMP Module Player 1.4.3");
     gtk_widget_set_name(about_title, "about-title");
     gtk_box_pack_start(GTK_BOX(about_page), about_title,
                        FALSE, FALSE, 0);
@@ -5357,11 +5443,20 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         "A native Linux music player built with GTK3 and SDL2.\n"
         "\n"
         "Tracker modules powered by libxmp\n"
+        "Additional Amiga formats powered by UADE\n"
+        "libxmp takes priority for shared formats\n"
+        "UADE playback seeking\n"
         "Commodore 64 SID music powered by libsidplayfp\n"
+        "ZX Spectrum music powered by ZXTune\n"
         "Digital audio powered by FFmpeg\n"
         "MIDI powered by FluidSynth with a SoundFont library\n"
         "Built-in 10-band equalizer with presets and live spectrum\n"
         "MP3, WAV, M4A/AAC, Ogg Vorbis, Opus, FLAC and more\n"
+        "\n"
+        "WAV export for all supported playback engines\n"
+        "Built-in IRC chat\n"
+        "System tray playback controls\n"
+        "Recursive music-folder importing\n"
         "\n"
         "High Voltage SID Collection (HVSC) browsing\n"
         "and integrated collection downloader.");

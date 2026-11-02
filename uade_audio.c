@@ -3,11 +3,13 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 struct UadeAudio {
     struct uade_state *state;
     char title[256];
     char format[256];
+    int64_t duration_ms;
 };
 
 UadeAudio *uade_audio_open(const char *path, char *error, size_t size)
@@ -43,6 +45,9 @@ UadeAudio *uade_audio_open(const char *path, char *error, size_t size)
     if (info) {
         snprintf(a->title, sizeof(a->title), "%s", info->modulename);
         snprintf(a->format, sizeof(a->format), "%s", info->formatname);
+        if (isfinite(info->duration) && info->duration > 0 &&
+            info->duration < (double)INT64_MAX / 1000.0)
+            a->duration_ms = (int64_t)(info->duration * 1000.0);
     }
     return a;
 }
@@ -60,6 +65,12 @@ int uade_audio_read(UadeAudio *a, int16_t *pcm, int frames)
 
 const char *uade_audio_title(const UadeAudio *a) { return a ? a->title : ""; }
 const char *uade_audio_format(const UadeAudio *a) { return a ? a->format : ""; }
+int64_t uade_audio_duration_ms(const UadeAudio *a) { return a ? a->duration_ms : 0; }
+int uade_audio_seek(UadeAudio *a, int64_t ms)
+{
+    if (!a || ms < 0) return -1;
+    return uade_seek(UADE_SEEK_SONG_RELATIVE, ms / 1000.0, 0, a->state);
+}
 void uade_audio_close(UadeAudio *a)
 {
     if (!a) return;

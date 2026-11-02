@@ -25,11 +25,21 @@ int main(int argc, char **argv)
                 if (pcm[i]) nonzero = 1;
             frames += got;
         }
-        uade_audio_close(a);
         if (got < 0 || !frames || !nonzero) {
             fprintf(stderr, "Decode failed or produced only silence.\n");
+            uade_audio_close(a);
             return 1;
         }
+        const int64_t targets[] = {5000, 0};
+        for (unsigned i = 0; i < sizeof(targets) / sizeof(targets[0]); ++i) {
+            if (uade_audio_seek(a, targets[i]) < 0 ||
+                uade_audio_read(a, pcm, 1024) <= 0) {
+                fprintf(stderr, "Seek to %lld ms failed.\n", (long long)targets[i]);
+                uade_audio_close(a);
+                return 1;
+            }
+        }
+        uade_audio_close(a);
         printf("Decoded %d stereo frames; cleanup completed.\n", frames);
     }
     return 0;
