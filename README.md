@@ -2,6 +2,9 @@
 
 **Formerly XMP Module Player.** Version 1.5 introduces the new name and icon.
 
+**In memory of modulez.org (2000-2013)**  
+[http://misc.yero.org/modulez/](http://misc.yero.org/modulez/)
+
 A native Linux music player built with **GTK3 and SDL2**, with playback powered by **libxmp, UADE, ZXTune, libsidplayfp, FluidSynth, and FFmpeg**.
 
 Modulez Player brings classic tracker music and regular audio playback to the Linux desktop, with a graphical interface, real-time audio visualization, and detailed module and sample information.

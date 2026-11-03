@@ -5469,6 +5469,13 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_box_pack_start(GTK_BOX(about_page), about_description,
                        FALSE, FALSE, 0);
 
+    GtkWidget *about_tribute = gtk_link_button_new_with_label(
+        "http://misc.yero.org/modulez/",
+        "In memory of modulez.org (2000-2013)");
+    gtk_widget_set_halign(about_tribute, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(about_page), about_tribute,
+                       FALSE, FALSE, 0);
+
     GtkWidget *about_developer = gtk_label_new(
         "Developed by David (DaSteele) Harryman");
     gtk_box_pack_start(GTK_BOX(about_page), about_developer,
