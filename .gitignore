@@ -1,5 +1,6 @@
 # Compiled executable
-/xmp-linux
+/modulez-player
+xmp-linux
 
 # Generated GTK resource source
 /xmp-resources.c

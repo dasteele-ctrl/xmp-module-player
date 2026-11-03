@@ -154,7 +154,7 @@ ZxAudio *zx_audio_open(const char *filename, char *error,
         !read_exact(audio->fd, &response, sizeof(response)) ||
         !read_exact(audio->fd, helper_error, sizeof(helper_error))) {
         copy_error(error, error_size,
-                   "ZXTune helper did not respond; check that xmp-zx-helper is beside xmp-linux");
+                   "ZXTune helper did not respond; check that xmp-zx-helper is beside modulez-player");
         zx_audio_close(audio);
         return NULL;
     }

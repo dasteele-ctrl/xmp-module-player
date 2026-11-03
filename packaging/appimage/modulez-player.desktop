@@ -1,9 +1,12 @@
 [Desktop Entry]
 Type=Application
-Name=XMP Module Player
+Name=Modulez Player
 Comment=Tracker, Amiga, SID, ZX Spectrum, MIDI, and audio file player
-Exec=xmp-linux %f
-Icon=xmp
+Exec=modulez-player %f
+Icon=modulez-player
 Terminal=false
 Categories=AudioVideo;Audio;Player;
 StartupNotify=true
+X-AppImage-Name=Modulez Player
+X-AppImage-Version=1.5
+X-AppImage-Arch=x86_64

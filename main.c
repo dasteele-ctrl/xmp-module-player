@@ -4587,12 +4587,12 @@ static void save_preferences(void)
         gchar *contents = g_key_file_to_data(settings, &length, NULL);
         GError *error = NULL;
         if (!g_file_set_contents(path, contents, length, &error)) {
-            g_warning("Could not save XMP preferences: %s", error->message);
+            g_warning("Could not save Modulez Player preferences: %s", error->message);
             g_clear_error(&error);
         }
         g_free(contents);
     } else {
-        g_warning("Could not create XMP preferences directory: %s", directory);
+        g_warning("Could not create Modulez Player preferences directory: %s", directory);
     }
 
     g_key_file_free(settings);
@@ -4735,6 +4735,7 @@ int main(int argc, char **argv)
     /* libuade communicates with uadecore over pipes. A failed core must
      * report an I/O error instead of terminating the GUI with SIGPIPE. */
     signal(SIGPIPE, SIG_IGN);
+    g_set_application_name("Modulez Player");
     gtk_init(&argc, &argv);
 
     /* Request a dark GTK fallback for controls the application does not
@@ -4786,11 +4787,11 @@ int main(int argc, char **argv)
     }
     g_free(saved_soundfont_file);
 
-    GdkPixbuf *app_icon = gdk_pixbuf_new_from_resource(
-        "/org/helllabs/xmp/icons/xmp.png", NULL);
+    GdkPixbuf *app_icon = gdk_pixbuf_new_from_resource_at_scale(
+        "/org/helllabs/xmp/icons/xmp.png", 192, 192, TRUE, NULL);
 
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(window), "XMP Module Player");
+    gtk_window_set_title(GTK_WINDOW(window), "Modulez Player");
 
     /* Size the initial window to the monitor's usable area. GTK will not
      * honor a smaller default size if notebook pages request more space, so
@@ -5399,7 +5400,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
                        FALSE, FALSE, 0);
 
     GtkWidget *minimize_check = gtk_check_button_new_with_label(
-        "Minimize to tray when closing XMP");
+        "Minimize to tray when closing Modulez Player");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(minimize_check),
                                  minimize_to_tray);
     g_signal_connect(minimize_check, "toggled",
@@ -5408,10 +5409,10 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
                        FALSE, FALSE, 0);
 
     GtkWidget *tray_hint = gtk_label_new(
-        "When enabled, the window's close button hides XMP in the system "
+        "When enabled, the window's close button hides Modulez Player in the system "
         "tray while music keeps playing. Click the tray icon to reopen "
-        "the player, or choose Quit XMP in its menu to exit completely.\n\n"
-        "If your desktop has no working system tray, closing XMP exits "
+        "the player, or choose Quit Modulez Player in its menu to exit completely.\n\n"
+        "If your desktop has no working system tray, closing Modulez Player exits "
         "normally instead.");
     gtk_label_set_line_wrap(GTK_LABEL(tray_hint), TRUE);
     gtk_label_set_xalign(GTK_LABEL(tray_hint), 0);
@@ -5434,13 +5435,14 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_box_pack_start(GTK_BOX(about_page), about_icon,
                        FALSE, FALSE, 0);
 
-    GtkWidget *about_title = gtk_label_new("XMP Module Player 1.4.3");
+    GtkWidget *about_title = gtk_label_new("Modulez Player 1.5");
     gtk_widget_set_name(about_title, "about-title");
     gtk_box_pack_start(GTK_BOX(about_page), about_title,
                        FALSE, FALSE, 0);
 
     GtkWidget *about_description = gtk_label_new(
         "A native Linux music player built with GTK3 and SDL2.\n"
+        "Formerly XMP Module Player.\n"
         "\n"
         "Tracker modules powered by libxmp\n"
         "Additional Amiga formats powered by UADE\n"

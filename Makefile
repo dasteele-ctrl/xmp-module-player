@@ -4,7 +4,7 @@ CFLAGS += -O2 -Wall -Wextra $(shell pkg-config --cflags gtk+-3.0 gio-2.0 sdl2 li
 CXXFLAGS += -O2 -Wall -Wextra -std=c++11 $(shell pkg-config --cflags libsidplayfp)
 LDLIBS += $(shell pkg-config --libs gtk+-3.0 gio-2.0 sdl2 libxmp libuade libavformat libavcodec libavutil libswresample fluidsynth) $(shell pkg-config --libs libsidplayfp) -lm
 
-all: xmp-linux
+all: modulez-player
 
 # Native ZX Spectrum playback is the default for xmp-linux. The original
 # zxtune123 -> temporary WAV implementation remains available as xmp-zx-wav.
@@ -21,7 +21,7 @@ ZX_WAV_OBJECTS = main.o xmp-resources.o ffmpeg_audio.o sid_audio.o midi_audio.o 
 
 # The tested default isolates libsidplayfp and ZXTune in different processes.
 # Both render PCM directly, without a temporary WAV or conflicting SID symbols.
-xmp-linux xmp-zx-native xmp-zx-isolated-test: $(ZX_ISOLATED_OBJECTS) xmp-zx-helper Makefile
+modulez-player xmp-linux xmp-zx-native xmp-zx-isolated-test: $(ZX_ISOLATED_OBJECTS) xmp-zx-helper Makefile
 	$(CXX) -o $@ $(ZX_ISOLATED_OBJECTS) $(LDLIBS) -ldl -lpthread -lz
 
 # Keep the WAV-export regression-test executable available alongside the main build.
@@ -95,11 +95,11 @@ equalizer.o: equalizer.c equalizer.h
 xmp-resources.o: xmp-resources.c
 	$(CC) $(CFLAGS) -c -o $@ xmp-resources.c
 
-xmp-resources.c: xmp.gresource.xml icons/xmp.png
+xmp-resources.c: xmp.gresource.xml icons/modulez-player.png
 	glib-compile-resources --generate-source --target=$@ $<
 
 clean:
-	rm -f xmp-uade-test xmp-linux xmp-zx-native xmp-zx-wav xmp-zx-sid-test xmp-zx-isolated-test xmp-zx-helper xmp-export-test main_export.o export_wav.o main_zx_native.o zx_audio.o zx_audio_proxy.o zx_helper.o hvsc_download.o main.o xmp-resources.o ffmpeg_audio.o midi_audio.o uade_audio.o equalizer.o sid_audio.o sid_audio_zx.o tray_icon.o xmp-resources.c $(IRC_OBJECTS)
+	rm -f modulez-player xmp-uade-test xmp-linux xmp-zx-native xmp-zx-wav xmp-zx-sid-test xmp-zx-isolated-test xmp-zx-helper xmp-export-test main_export.o export_wav.o main_zx_native.o zx_audio.o zx_audio_proxy.o zx_helper.o hvsc_download.o main.o xmp-resources.o ffmpeg_audio.o midi_audio.o uade_audio.o equalizer.o sid_audio.o sid_audio_zx.o tray_icon.o xmp-resources.c $(IRC_OBJECTS)
 
 .PHONY: all clean
 

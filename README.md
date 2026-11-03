@@ -1,10 +1,14 @@
-# XMP Module Player
+# Modulez Player
+
+**Formerly XMP Module Player.** Version 1.5 introduces the new name and icon.
 
 A native Linux music player built with **GTK3 and SDL2**, with playback powered by **libxmp, UADE, ZXTune, libsidplayfp, FluidSynth, and FFmpeg**.
 
-XMP Module Player brings classic tracker music and regular audio playback to the Linux desktop, with a graphical interface, real-time audio visualization, and detailed module and sample information.
+Modulez Player brings classic tracker music and regular audio playback to the Linux desktop, with a graphical interface, real-time audio visualization, and detailed module and sample information.
 
-![XMP Module Player running on Linux](xmp-1.4.1.png)
+![Earlier XMP Module Player interface](xmp-1.4.1.png)
+
+*Screenshot from an earlier XMP Module Player release.*
 
 ## Features
 
@@ -31,7 +35,7 @@ XMP Module Player brings classic tracker music and regular audio playback to the
 
 ## IRC community chat
 
-The **IRC** tab is a simple, classic IRC client integrated into XMP's GTK3
+The **IRC** tab is a simple, classic IRC client integrated into Modulez Player's GTK3
 interface. It defaults to EsperNet (`irc.esper.net`, TLS port 6697) and
 auto-joins `#modulez` after a successful connection. Change the network,
 nickname, and auto-join channel with the **Connect** or **Settings** buttons.
@@ -41,26 +45,29 @@ such as `/join`, `/part`, `/nick`, and `/me`. It does not connect until you
 click **Connect**. Network settings are saved to
 `~/.config/xmp-irc/settings.ini`; no IRC passwords are stored.
 
-The IRC widget uses XMP's existing dark teal GTK palette, with green
+The IRC widget uses Modulez Player's existing dark teal GTK palette, with green
 nicknames for a classic terminal look. The parser can be checked using
 `make check-irc`; that command also performs a syntax check of the GTK/GIO
 source files.
 
 ## Download
 
-**Version 1.4.3:** [Download the Linux x86_64 AppImage](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.4.3/XMP-Module-Player-v1.4.3-Linux-x86_64.AppImage).
+**Modulez Player 1.5 is in development.** Until its release, the latest
+published build is [XMP Module Player v1.4.3](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.4.3).
+See [all releases](../../releases) for published downloads.
 
-See the [v1.4.3 release notes](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.4.3) or browse [all releases](../../releases).
+The instructions below use the planned 1.5 release filename. Development
+AppImage builds also include a timestamp in the filename.
 
 ### Running the AppImage
 
-1. Download the versioned `XMP-Module-Player-v1.4.3-Linux-x86_64.AppImage` file from Release v1.4.3.
+1. Download the versioned `Modulez-Player-v1.5-Linux-x86_64.AppImage` file from Release v1.5 when available.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x XMP-Module-Player-v1.4.3-Linux-x86_64.AppImage
-   ./XMP-Module-Player-v1.4.3-Linux-x86_64.AppImage
+   chmod +x Modulez-Player-v1.5-Linux-x86_64.AppImage
+   ./Modulez-Player-v1.5-Linux-x86_64.AppImage
    ```
 
 ### Add the player to your application menu
@@ -71,10 +78,10 @@ integration tool described in the official AppImage documentation.
 1. Follow the installation instructions in the
    [official AppImageLauncher project](https://github.com/TheAssassin/AppImageLauncher).
    Choose the package appropriate for your Linux distribution and architecture.
-2. Download the XMP Module Player AppImage from this project's Releases page.
+2. Download the Modulez Player AppImage from this project's Releases page.
 3. Open the downloaded AppImage. When AppImageLauncher offers the choice,
    select **Integrate and run**.
-4. Launch **XMP Module Player** from your application menu on future runs.
+4. Launch **Modulez Player** from your application menu on future runs.
 
 AppImageLauncher uses the desktop entry and icon already inside the AppImage;
 there is no need to extract them or find an icon yourself. By default, it moves
@@ -88,7 +95,7 @@ for more information.
 
 ## Requirements
 
-The 1.4.3 AppImage includes the playback libraries, UADE core and player data, ZXTune helper, and default MIDI SoundFont with its license. A separate UADE installation or SoundFont download is not needed. Compatibility with Linux distributions other than the development system has not yet been fully tested.
+The 1.5 AppImage includes the playback libraries, UADE core and player data, ZXTune helper, and default MIDI SoundFont with its license. A separate UADE installation or SoundFont download is not needed. Compatibility with Linux distributions other than the development system has not yet been fully tested.
 
 ### MIDI and SoundFonts
 
@@ -108,10 +115,10 @@ library and a General MIDI SoundFont:
 ```bash
 sudo apt install libfluidsynth-dev fluid-soundfont-gm
 make -j4
-./xmp-linux
+./modulez-player
 ```
 
-The 1.4.3 AppImage bundles **MS Basic.sf3** as its default General MIDI
+The 1.5 AppImage bundles **MS Basic.sf3** as its default General MIDI
 SoundFont, together with its license. You can still import and select your
 own SF2/SF3 banks. A previously saved selection may take priority over the
 bundled default. Packaging details are in the
@@ -176,7 +183,7 @@ make check-eq
 
 ### ZX Spectrum playback
 
-XMP Module Player 1.1 includes native ZX Spectrum playback powered
+Modulez Player 1.1 includes native ZX Spectrum playback powered
 by ZXTune.
 
 The Linux AppImage bundles the ZXTune playback engine and its required
@@ -198,18 +205,18 @@ formats, but is not currently available for ZX Spectrum files.
 
 #### Building from source
 
-Developers compiling XMP Module Player from source must first build
+Developers compiling Modulez Player from source must first build
 ZXTune's static libraries:
 
 ```bash
 make platform=linux system.zlib=1 -C ~/zxtune/apps/zxtune123 -j4
 ```
 
-Then compile XMP Module Player:
+Then compile Modulez Player:
 
 ```bash
 make -j4
-./xmp-linux
+./modulez-player
 ```
 
 The optional legacy `zxtune123` WAV-based fallback is not included
@@ -228,14 +235,27 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.4.3**
+**Current source version: 1.5 (in development)**
+
+Version 1.5 rebrands XMP Module Player as **Modulez Player**, with a new
+application icon, About title, tray/menu text, desktop entry, and AppImage
+filename. Playback features from 1.4.3 are retained.
+
+Existing settings remain in `~/.config/xmp-module-player` and
+`~/.config/xmp-irc`. The rebrand does not move or erase SoundFont selections,
+EQ presets, preferences, or stored paths. The repository address remains
+`dasteele-ctrl/xmp-module-player` so existing links continue to work.
+
+The release also provides `modulez-player.png` as a separate download for
+users who prefer to create their own launcher. Integration tools can use the
+same icon bundled inside the AppImage.
 
 Version 1.4.3 adds UADE fallback playback, seeking, and WAV export for
 additional Amiga music formats. The AppImage bundles UADE's core, libraries,
 player data, and the default MIDI SoundFont with its license. The About tab
 now lists all six playback engines and the main features.
 
-The 1.4.3 AppImage was tested locally for playback, engine switching,
+The 1.5 AppImage was tested locally for playback, engine switching,
 seeking, WAV export, and clean exit. Packaging verification checked the
 bundled UADE assets and compared the SoundFont and license with the originals.
 
@@ -252,17 +272,17 @@ This project is actively being developed. Features and compatibility may change 
 
 ## System tray and preferences
 
-XMP shows a tray icon on desktops with a GTK3-compatible notification area.
+Modulez Player shows a tray icon on desktops with a GTK3-compatible notification area.
 Click the icon to bring the player back; right-click for playback controls,
-current-track information, and **Quit XMP**. The tray icon uses a bright
-white version of the XMP mark for visibility on dark panels. Its excess
-transparent margins are cropped so the X fills the tray icon slot. Previous and
+current-track information, and **Quit Modulez Player**. The tray icon uses a bright
+white version of the Modulez mark for visibility on dark panels. Its excess
+transparent margins are cropped so the logo fills the tray icon slot. Previous and
 Next in the tray menu move between playlist files, wrapping at either end;
 they do not skip positions within a tracker module. If nothing is loaded,
 Play in the tray menu starts the first file in the playlist. The tooltip
 shows the current track title in bold white text against a charcoal surface.
 
-The **Preferences** tab includes **Minimize to tray when closing XMP**,
+The **Preferences** tab includes **Minimize to tray when closing Modulez Player**,
 enabled by default. When checked, closing the main window keeps the player
 running in the tray. Uncheck it to make the close button quit normally.
 This choice is saved in `~/.config/xmp-module-player/preferences.ini`.

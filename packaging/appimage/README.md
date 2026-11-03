@@ -1,6 +1,6 @@
 # AppImage packaging (local test)
 
-This recipe packages the already-built `xmp-linux` and `xmp-zx-helper`
+This recipe packages the already-built `modulez-player` and `xmp-zx-helper`
 executables with `linuxdeploy` and the experimental GTK bundling plugin. It is an initial
 local test, not a distribution-ready release.
 
@@ -13,20 +13,20 @@ local test, not a distribution-ready release.
    into that same folder. Make both tools executable.
 4. Run `bash packaging/appimage/build.sh` from the repository root.
 
-The resulting version 1.4.3 AppImage is written under `dist/` with a timestamp in
-its filename (`XMP_Module_Player-1.4.3-x86_64-*.AppImage`). This script does not
+The resulting version 1.5 AppImage is written under `dist/` with a timestamp in
+its filename (`Modulez-Player-v1.5-Linux-x86_64-*.AppImage`). This script does not
 overwrite an existing AppImage.
 
 GTK plugins and resources can be loaded dynamically, so `ldd` alone does
 not capture all runtime dependencies. Test the AppImage with ZX, tracker,
 SID, and FFmpeg-supported formats, and verify the file picker and desktop
-theme. For version 1.4.3, test the tray icon, minimize-to-tray preference,
+theme. For version 1.5, test the tray icon, minimize-to-tray preference,
 playlist controls, and high-contrast tooltip on an Xfce panel. Also test the
 IRC tab's TLS connection to EsperNet:
 the GTK GIO TLS backend and certificate handling may be dynamically loaded.
 ZXTune is linked statically into `xmp-zx-helper`, not the main player.
 The two executables communicate directly over a local PCM stream, so the
-system libsidplayfp in `xmp-linux` cannot conflict with ZXTune's bundled
+system libsidplayfp in `modulez-player` cannot conflict with ZXTune's bundled
 libsidplayfp. Both executables and their runtime dependencies are included
 in the AppImage: end users do not need ZXTune source or a compiler. The
 optional command-line `zxtune123` WAV fallback is not included.
@@ -77,3 +77,15 @@ seeking, WAV export, MIDI using the bundled font, MOD, SID and ZX playback,
 and a clean exit. Verify on a machine or environment without system UADE
 and without a system SoundFont before calling the build portable. An
 existing saved SoundFont selection may take priority over the bundled bank.
+
+## Modulez Player rebrand (1.5)
+
+The output AppImage uses the Modulez Player name and includes the Modulez
+desktop entry and icon. The PNG is also copied beside the AppImage as
+`modulez-player.png` for manual launcher creation.
+
+Legacy `xmp-module-player`/`xmp-irc` settings directories, internal helper
+names, environment variables, and bundled data/documentation paths remain
+compatible with existing installations. The `xmp-linux` make target remains
+available for existing development scripts; the default binary is now
+`modulez-player`. The GitHub repository URL has not changed.

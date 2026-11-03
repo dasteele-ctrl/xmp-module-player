@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# v1.4.3 AppImage with the UADE runtime and the required default SoundFont.
+# Modulez Player v1.5 AppImage with the UADE runtime and the required default SoundFont.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,8 +9,8 @@ linuxdeploy="$tool_dir/linuxdeploy-x86_64.AppImage"
 gtk_plugin="$tool_dir/linuxdeploy-plugin-gtk.sh"
 dist_dir="$project_dir/dist"
 
-if [[ ! -x "$project_dir/xmp-linux" ]]; then
-    echo "Missing xmp-linux. Build the native player with: make -j4" >&2
+if [[ ! -x "$project_dir/modulez-player" ]]; then
+    echo "Missing modulez-player. Build the native player with: make -j4" >&2
     exit 1
 fi
 if [[ ! -x "$project_dir/xmp-zx-helper" ]]; then
@@ -77,8 +77,8 @@ fi
 
 mkdir -p -- "$dist_dir"
 build_root="$(mktemp -d /tmp/xmp-appimage.XXXXXXXX)"
-appdir="$build_root/XMP_Module_Player.AppDir"
-output_name="XMP_Module_Player-1.4.3-x86_64-$(date +%Y%m%d-%H%M%S).AppImage"
+appdir="$build_root/Modulez_Player.AppDir"
+output_name="Modulez-Player-v1.5-Linux-x86_64-$(date +%Y%m%d-%H%M%S).AppImage"
 
 cleanup() {
     if [[ -n "${build_root:-}" && -d "$build_root" &&
@@ -97,12 +97,12 @@ fi
     cd -- "$dist_dir"
     LDAI_OUTPUT="$output_name" "$linuxdeploy" \
         --appdir "$appdir" \
-        --executable "$project_dir/xmp-linux" \
+        --executable "$project_dir/modulez-player" \
         --executable "$project_dir/xmp-zx-helper" \
         --executable "$uade_core" \
         "${hvsc_utilities[@]}" \
-        --desktop-file "$script_dir/xmp-module-player.desktop" \
-        --icon-file "$project_dir/icons/xmp.png" \
+        --desktop-file "$script_dir/modulez-player.desktop" \
+        --icon-file "$project_dir/icons/modulez-player.png" \
         --plugin gtk
 )
 
@@ -130,7 +130,8 @@ echo "Bundled SoundFont: $source_font ($bundled_font)"
 verify_bundle() {
     local bundle="$1"
     local asset library
-    for asset in usr/bin/xmp-linux usr/bin/xmp-zx-helper usr/bin/uadecore \
+    for asset in usr/bin/modulez-player usr/bin/xmp-zx-helper usr/bin/uadecore \
+        usr/share/applications/modulez-player.desktop \
         usr/share/uade/score usr/share/uade/uaerc usr/share/uade/uade.conf \
         usr/share/uade/eagleplayer.conf; do
         if [[ ! -s "$bundle/$asset" ]]; then
@@ -138,6 +139,10 @@ verify_bundle() {
             return 1
         fi
     done
+    if [[ -z "$(find "$bundle/usr/share/icons" -type f -name modulez-player.png -print -quit)" ]]; then
+        echo "Bundle verification failed: missing Modulez Player icon." >&2
+        return 1
+    fi
     if [[ ! -x "$bundle/usr/bin/uadecore" ]] ||
        [[ -z "$(find "$bundle/usr/share/uade/players" -type f -print -quit)" ]]; then
         echo "Bundle verification failed: UADE core or player data missing." >&2
@@ -181,5 +186,7 @@ mkdir -p -- "$build_root/verification"
 verify_bundle "$build_root/verification/squashfs-root"
 echo "Verified: bundled UADE core/data/libraries and the exact SoundFont and license."
 
+install -m 0644 "$project_dir/icons/modulez-player.png" "$dist_dir/modulez-player.png"
+echo "Launcher icon: $dist_dir/modulez-player.png"
 echo "AppImage built: $dist_dir/$output_name"
 echo "Test it locally before distributing it to other machines."

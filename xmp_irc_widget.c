@@ -258,7 +258,7 @@ static gchar *config_filename(void)
 static void load_config(XmpIrcUi *ui)
 {
     ui->host = g_strdup("irc.esper.net");
-    ui->nick = g_strdup_printf("XMPGuest%04u", g_random_int_range(0, 10000));
+    ui->nick = g_strdup_printf("ModulezGuest%04u", g_random_int_range(0, 10000));
     ui->auto_channel = g_strdup("#modulez");
     ui->port = 6697;
     ui->tls = TRUE;
@@ -712,7 +712,7 @@ GtkWidget *xmp_irc_widget_new(void)
 
     ChatTab *status = get_tab(ui, "Status", TRUE);
     append_text(status, NULL,
-        "XMP IRC — classic compact chat with buttons. Connect to begin. /help lists commands.", "status");
+        "Modulez IRC — classic compact chat with buttons. Connect to begin. /help lists commands.", "status");
     append_text(status, NULL,
         "Default: EsperNet TLS 6697, #modulez preset. Change server/channel in Connect or Settings.", "status");
 

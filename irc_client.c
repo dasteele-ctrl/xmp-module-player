@@ -247,7 +247,7 @@ static void connect_finished(GObject *source, GAsyncResult *result, gpointer dat
         gchar *nickname = g_strdup_printf("NICK %s", client->nick);
         irc_client_send(client, nickname);
         g_free(nickname);
-        irc_client_send(client, "USER xmpirc 0 * :XMP IRC Client");
+        irc_client_send(client, "USER modulez 0 * :Modulez Player IRC");
         if (client->on_state)
             client->on_state(TRUE, "Connected; registering nickname...", client->user_data);
         read_next(client);

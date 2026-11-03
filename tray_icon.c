@@ -96,7 +96,7 @@ static GdkPixbuf *make_white_tray_icon(GdkPixbuf *source)
         return NULL;
 
     /* The application PNG contains substantial transparent padding, making
-     * the X look tiny in the panel. Crop to the visible alpha bounds (with a
+     * the logo look tiny in the panel. Crop to the visible alpha bounds (with a
      * small safety margin) before GTK scales it into the tray's icon slot.
      * This does not increase the panel height or change the window icon. */
     gint source_width = gdk_pixbuf_get_width(source);
@@ -140,7 +140,7 @@ static GdkPixbuf *make_white_tray_icon(GdkPixbuf *source)
     }
 
     /* Recolor only the tray copy to white. Its alpha is untouched, so only
-     * the X appears; the tray's actual background stays fully transparent. */
+     * the logo appears; the tray's actual background stays fully transparent. */
     guchar *pixels = gdk_pixbuf_get_pixels(white);
     gint width = gdk_pixbuf_get_width(white);
     gint height = gdk_pixbuf_get_height(white);
@@ -171,21 +171,21 @@ XmpTrayIcon *xmp_tray_icon_new(GdkPixbuf *icon, const XmpTrayActions *actions)
     gtk_widget_set_sensitive(tray->track_item, FALSE);
     gtk_menu_shell_append(GTK_MENU_SHELL(tray->menu), tray->track_item);
     append_separator(tray);
-    append_item(tray, "Show XMP Player", G_CALLBACK(on_show));
+    append_item(tray, "Show Modulez Player", G_CALLBACK(on_show));
     append_separator(tray);
     append_item(tray, "Previous", G_CALLBACK(on_previous));
     tray->play_item = append_item(tray, "Play", G_CALLBACK(on_play_pause));
     append_item(tray, "Stop", G_CALLBACK(on_stop));
     append_item(tray, "Next", G_CALLBACK(on_next));
     append_separator(tray);
-    append_item(tray, "Quit XMP", G_CALLBACK(on_quit));
+    append_item(tray, "Quit Modulez Player", G_CALLBACK(on_quit));
 
     GdkPixbuf *tray_pixbuf = make_white_tray_icon(icon);
     tray->status_icon = tray_pixbuf ? gtk_status_icon_new_from_pixbuf(tray_pixbuf)
                              : gtk_status_icon_new_from_icon_name("multimedia-player");
     if (tray_pixbuf)
         g_object_unref(tray_pixbuf);
-    gtk_status_icon_set_title(tray->status_icon, "XMP Module Player");
+    gtk_status_icon_set_title(tray->status_icon, "Modulez Player");
     gtk_status_icon_set_visible(tray->status_icon, TRUE);
     g_signal_connect(tray->status_icon, "activate",
                      G_CALLBACK(on_icon_activate), tray);
@@ -228,7 +228,7 @@ void xmp_tray_icon_update(XmpTrayIcon *tray, gboolean playing,
     gchar *escaped_title = g_markup_escape_text(title, -1);
     gchar *tooltip = g_strdup_printf(
         "<span foreground=\"#ffffff\" weight=\"bold\" size=\"large\">%s</span>\n"
-        "<span foreground=\"#e0e9eb\" weight=\"bold\">XMP Module Player · %s</span>",
+        "<span foreground=\"#e0e9eb\" weight=\"bold\">Modulez Player · %s</span>",
         escaped_title, playing ? "Playing" : "Not playing");
 
     gtk_menu_item_set_label(GTK_MENU_ITEM(tray->track_item), menu_title);

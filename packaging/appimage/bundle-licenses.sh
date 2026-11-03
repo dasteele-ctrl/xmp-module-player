@@ -90,7 +90,7 @@ if command -v ffmpeg >/dev/null 2>&1; then
 fi
 
 cat > "$notice_dir/READ-BEFORE-REDISTRIBUTION.txt" <<'EON'
-XMP Module Player: third-party license inventory (not a compliance certificate)
+Modulez Player: third-party license inventory (not a compliance certificate)
 
 The accompanying library inventory and copyright files were collected from
 packages on the build machine. They must be reviewed for completeness and

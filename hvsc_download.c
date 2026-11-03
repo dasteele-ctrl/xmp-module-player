@@ -103,7 +103,7 @@ static gpointer download_worker(gpointer data)
     g_free(executable);
 
     if (!script || !g_file_test(script, G_FILE_TEST_IS_REGULAR)) {
-        startup_error = g_strdup("ERROR: HVSC installer script not found. Reinstall or rebuild XMP.");
+        startup_error = g_strdup("ERROR: HVSC installer script not found. Reinstall or rebuild Modulez Player.");
         goto finish;
     }
 
