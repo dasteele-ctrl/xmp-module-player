@@ -9,9 +9,7 @@ A native Linux music player built with **GTK3 and SDL2**, with playback powered 
 
 Modulez Player brings classic tracker music and regular audio playback to the Linux desktop, with a graphical interface, real-time audio visualization, and detailed module and sample information.
 
-![Earlier XMP Module Player interface](xmp-1.4.1.png)
-
-*Screenshot from an earlier XMP Module Player release.*
+![Modulez Player 1.5](modulez-player-1.5.png)
 
 ## Features
 
@@ -55,16 +53,14 @@ source files.
 
 ## Download
 
-**Modulez Player 1.5 is in development.** Until its release, the latest
-published build is [XMP Module Player v1.4.3](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.4.3).
-See [all releases](../../releases) for published downloads.
+Download [Modulez Player v1.5](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.5).
 
-The instructions below use the planned 1.5 release filename. Development
-AppImage builds also include a timestamp in the filename.
+The release includes the Linux x86_64 AppImage and a separate launcher icon.
+See [all releases](../../releases) for earlier versions.
 
 ### Running the AppImage
 
-1. Download the versioned `Modulez-Player-v1.5-Linux-x86_64.AppImage` file from Release v1.5 when available.
+1. Download the versioned `Modulez-Player-v1.5-Linux-x86_64.AppImage` file from Release v1.5.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
@@ -238,7 +234,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.5 (in development)**
+**Current version: 1.5**
 
 Version 1.5 rebrands XMP Module Player as **Modulez Player**, with a new
 application icon, About title, tray/menu text, desktop entry, and AppImage
