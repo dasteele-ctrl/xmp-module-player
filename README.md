@@ -312,3 +312,23 @@ If there is no usable tray, closing the window always exits normally.
 ## License
 
 Licensing information for the application source
+
+<details>
+<summary><strong>View 10 screenshots</strong></summary>
+
+Click a thumbnail to view the full screenshot.
+
+<p>
+  <a href="docs/screenshots/1-player.png"><img src="docs/screenshots/thumbnails/1-player.png" width="160" alt="Player" title="Player"></a>
+  <a href="docs/screenshots/2-playlist.png"><img src="docs/screenshots/thumbnails/2-playlist.png" width="160" alt="Playlist" title="Playlist"></a>
+  <a href="docs/screenshots/3-samples.png"><img src="docs/screenshots/thumbnails/3-samples.png" width="160" alt="Samples" title="Samples"></a>
+  <a href="docs/screenshots/4-soundfonts.png"><img src="docs/screenshots/thumbnails/4-soundfonts.png" width="160" alt="SoundFonts" title="SoundFonts"></a>
+  <a href="docs/screenshots/5-eq.png"><img src="docs/screenshots/thumbnails/5-eq.png" width="160" alt="Equalizer" title="Equalizer"></a>
+  <a href="docs/screenshots/6-hvsc.png"><img src="docs/screenshots/thumbnails/6-hvsc.png" width="160" alt="HVSC" title="HVSC"></a>
+  <a href="docs/screenshots/7-irc.png"><img src="docs/screenshots/thumbnails/7-irc.png" width="160" alt="IRC" title="IRC"></a>
+  <a href="docs/screenshots/8-vis.png"><img src="docs/screenshots/thumbnails/8-vis.png" width="160" alt="Visualizer 1" title="Visualizer 1"></a>
+  <a href="docs/screenshots/9-vis.png"><img src="docs/screenshots/thumbnails/9-vis.png" width="160" alt="Visualizer 2" title="Visualizer 2"></a>
+  <a href="docs/screenshots/10-vis.png"><img src="docs/screenshots/thumbnails/10-vis.png" width="160" alt="Visualizer 3" title="Visualizer 3"></a>
+</p>
+
+</details>
