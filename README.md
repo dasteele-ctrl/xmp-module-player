@@ -63,6 +63,29 @@ See the [v1.4.3 release notes](https://github.com/dasteele-ctrl/xmp-module-playe
    ./XMP-Module-Player-v1.4.3-Linux-x86_64.AppImage
    ```
 
+### Add the player to your application menu
+
+For a menu entry with the player icon, use **AppImageLauncher**, an
+integration tool described in the official AppImage documentation.
+
+1. Follow the installation instructions in the
+   [official AppImageLauncher project](https://github.com/TheAssassin/AppImageLauncher).
+   Choose the package appropriate for your Linux distribution and architecture.
+2. Download the XMP Module Player AppImage from this project's Releases page.
+3. Open the downloaded AppImage. When AppImageLauncher offers the choice,
+   select **Integrate and run**.
+4. Launch **XMP Module Player** from your application menu on future runs.
+
+AppImageLauncher uses the desktop entry and icon already inside the AppImage;
+there is no need to extract them or find an icon yourself. By default, it moves
+the AppImage to `~/Applications`. Keep that integrated file in place so the
+menu entry continues to work.
+
+Desktop integration is optional. You can still run the AppImage directly,
+use another integration tool, or create a launcher yourself. See the
+[AppImage desktop integration guide](https://docs.appimage.org/user-guide/run-appimages.html#integrating-appimages-into-the-desktop)
+for more information.
+
 ## Requirements
 
 The 1.4.3 AppImage includes the playback libraries, UADE core and player data, ZXTune helper, and default MIDI SoundFont with its license. A separate UADE installation or SoundFont download is not needed. Compatibility with Linux distributions other than the development system has not yet been fully tested.
