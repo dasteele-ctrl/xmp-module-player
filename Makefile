@@ -2,7 +2,7 @@ CC ?= cc
 CXX ?= c++
 CFLAGS += -O2 -Wall -Wextra $(shell pkg-config --cflags gtk+-3.0 gio-2.0 sdl2 libxmp libuade libavformat libavcodec libavutil libswresample fluidsynth)
 CXXFLAGS += -O2 -Wall -Wextra -std=c++11 $(shell pkg-config --cflags libsidplayfp)
-LDLIBS += $(shell pkg-config --libs gtk+-3.0 gio-2.0 sdl2 libxmp libuade libavformat libavcodec libavutil libswresample fluidsynth) $(shell pkg-config --libs libsidplayfp) -lm
+LDLIBS += $(shell pkg-config --libs gtk+-3.0 gio-2.0 sdl2 libxmp libuade libavformat libavcodec libavutil libswresample fluidsynth) $(shell pkg-config --libs libsidplayfp) -lm $(shell pkg-config --libs webkit2gtk-4.1 libsoup-3.0)
 
 all: modulez-player
 
@@ -12,12 +12,13 @@ all: modulez-player
 ZX_ROOT ?= $(HOME)/zxtune
 ZX_INCLUDE = -I$(ZX_ROOT) -I$(ZX_ROOT)/include -I$(ZX_ROOT)/src
 ZX_LIBRARIES = $(wildcard $(ZX_ROOT)/lib/linux/release/*.a)
+VIS_OBJECTS = visualizer.o visualizer_pcm.o visualizer-resources.o
 IRC_OBJECTS = xmp_irc_widget.o irc_client.o irc_protocol.o
-ZX_NATIVE_OBJECTS = main_zx_native.o zx_audio.o xmp-resources.o ffmpeg_audio.o sid_audio.o midi_audio.o uade_audio.o equalizer.o hvsc_download.o tray_icon.o $(IRC_OBJECTS)
+ZX_NATIVE_OBJECTS = main_zx_native.o zx_audio.o xmp-resources.o ffmpeg_audio.o sid_audio.o midi_audio.o uade_audio.o equalizer.o hvsc_download.o tray_icon.o $(IRC_OBJECTS) $(VIS_OBJECTS)
 ZX_ISOLATED_OBJECTS = $(filter-out zx_audio.o main_zx_native.o,$(ZX_NATIVE_OBJECTS)) zx_audio_proxy.o main_export.o export_wav.o
 EXPORT_TEST_OBJECTS = $(ZX_ISOLATED_OBJECTS)
 ZX_SID_TEST_OBJECTS = $(filter-out sid_audio.o,$(ZX_NATIVE_OBJECTS)) sid_audio_zx.o
-ZX_WAV_OBJECTS = main.o xmp-resources.o ffmpeg_audio.o sid_audio.o midi_audio.o uade_audio.o equalizer.o hvsc_download.o tray_icon.o $(IRC_OBJECTS)
+ZX_WAV_OBJECTS = main.o xmp-resources.o ffmpeg_audio.o sid_audio.o midi_audio.o uade_audio.o equalizer.o hvsc_download.o tray_icon.o $(IRC_OBJECTS) $(VIS_OBJECTS)
 
 # The tested default isolates libsidplayfp and ZXTune in different processes.
 # Both render PCM directly, without a temporary WAV or conflicting SID symbols.
@@ -28,7 +29,7 @@ modulez-player xmp-linux xmp-zx-native xmp-zx-isolated-test: $(ZX_ISOLATED_OBJEC
 xmp-export-test: $(EXPORT_TEST_OBJECTS) xmp-zx-helper Makefile
 	$(CXX) -o $@ $(EXPORT_TEST_OBJECTS) $(LDLIBS) -ldl -lpthread -lz
 
-main_export.o: main.c uade_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h zx_audio.h export_wav.h xmp_irc_widget.h tray_icon.h
+main_export.o: main.c uade_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h zx_audio.h export_wav.h xmp_irc_widget.h tray_icon.h visualizer.h visualizer_pcm.h
 	$(CC) $(CFLAGS) -DENABLE_ZXTUNE_NATIVE -DENABLE_WAV_EXPORT -c -o $@ main.c
 
 export_wav.o: export_wav.c export_wav.h uade_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h zx_audio.h
@@ -56,7 +57,7 @@ sid_audio_zx.o: sid_audio.cpp sid_audio.h
 	$(CXX) $(CXXFLAGS) -std=c++20 -DXMP_USE_ZXTUNE_SID_HEADERS \
 	    -I$(ZX_ROOT)/3rdparty/sidplayfp/src -c -o $@ sid_audio.cpp
 
-main_zx_native.o: main.c uade_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h zx_audio.h xmp_irc_widget.h tray_icon.h
+main_zx_native.o: main.c uade_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h zx_audio.h xmp_irc_widget.h tray_icon.h visualizer.h visualizer_pcm.h
 	$(CC) $(CFLAGS) -DENABLE_ZXTUNE_NATIVE -c -o $@ main.c
 
 zx_audio.o: zx_audio.cpp zx_audio.h
@@ -65,7 +66,7 @@ zx_audio.o: zx_audio.cpp zx_audio.h
 xmp-zx-wav: $(ZX_WAV_OBJECTS) Makefile
 	$(CXX) -o $@ $(ZX_WAV_OBJECTS) $(LDLIBS)
 
-main.o: main.c uade_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h xmp_irc_widget.h tray_icon.h
+main.o: main.c uade_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h xmp_irc_widget.h tray_icon.h visualizer.h visualizer_pcm.h
 	$(CC) $(CFLAGS) -c -o $@ main.c
 
 tray_icon.o: tray_icon.c tray_icon.h
@@ -99,7 +100,7 @@ xmp-resources.c: xmp.gresource.xml icons/modulez-player.png
 	glib-compile-resources --generate-source --target=$@ $<
 
 clean:
-	rm -f modulez-player xmp-uade-test xmp-linux xmp-zx-native xmp-zx-wav xmp-zx-sid-test xmp-zx-isolated-test xmp-zx-helper xmp-export-test main_export.o export_wav.o main_zx_native.o zx_audio.o zx_audio_proxy.o zx_helper.o hvsc_download.o main.o xmp-resources.o ffmpeg_audio.o midi_audio.o uade_audio.o equalizer.o sid_audio.o sid_audio_zx.o tray_icon.o xmp-resources.c $(IRC_OBJECTS)
+	rm -f modulez-player xmp-uade-test xmp-linux xmp-zx-native xmp-zx-wav xmp-zx-sid-test xmp-zx-isolated-test xmp-zx-helper xmp-export-test main_export.o export_wav.o main_zx_native.o zx_audio.o zx_audio_proxy.o zx_helper.o hvsc_download.o main.o xmp-resources.o ffmpeg_audio.o midi_audio.o uade_audio.o equalizer.o sid_audio.o sid_audio_zx.o tray_icon.o xmp-resources.c $(IRC_OBJECTS) $(VIS_OBJECTS) visualizer-resources.c
 
 .PHONY: all clean
 
@@ -140,3 +141,29 @@ check-uade-syntax:
 	    $(shell pkg-config --cflags libuade)
 
 LDLIBS += -lbencodetools
+
+
+# Bundled, offline visualization assets. Fetch the pinned engine once at build time.
+visualizer/projectm/projectm.wasm:
+	python3 visualizer/fetch-engine.py
+
+VIS_ASSETS = visualizer/index.html visualizer/viewer.js visualizer/wavescope.js \
+             visualizer/presets.js visualizer/projectm-adapter.js \
+             visualizer/projectm/projectm.js visualizer/projectm/projectm.wasm
+
+visualizer-resources.c: visualizer/visualizer.gresource.xml $(VIS_ASSETS)
+	glib-compile-resources --sourcedir=visualizer --generate-source --c-name=modulez_visualizer --target=$@ $<
+
+visualizer-resources.o: visualizer-resources.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+visualizer.o: visualizer.c visualizer.h visualizer_pcm.h
+	$(CC) $(CFLAGS) $(shell pkg-config --cflags webkit2gtk-4.1 libsoup-3.0) -c -o $@ $<
+
+visualizer_pcm.o: visualizer_pcm.c visualizer_pcm.h
+	$(CC) $(CFLAGS) -std=c11 -c -o $@ $<
+
+.PHONY: check-vis-pcm
+check-vis-pcm:
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -pthread -o /tmp/modulez-check-vis-pcm test_visualizer_pcm.c visualizer_pcm.c
+	/tmp/modulez-check-vis-pcm

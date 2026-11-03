@@ -1,0 +1,9 @@
+Engine wrapper and pinned build command:
+https://github.com/jasonulbright/wavescope/blob/29d3f8c5c3b577890143c9e6d8abe267bb1628bf/scripts/projectm-wrapper.cpp
+https://github.com/jasonulbright/wavescope/blob/29d3f8c5c3b577890143c9e6d8abe267bb1628bf/scripts/build-projectm.ps1
+Build context:
+https://github.com/jasonulbright/wavescope/blob/29d3f8c5c3b577890143c9e6d8abe267bb1628bf/ROADMAP-V2.md
+Core source pin:
+https://github.com/projectM-visualizer/projectm/tree/149bfc43963e54e397ccdb42f27019d22b659098
+Original JS glue is unmodified. PCM enters sv_add_pcm_float directly, as defined
+by the C wrapper; no AudioGraphSource or microphone adapter is involved.

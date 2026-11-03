@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/org/modulez/visualizer">
+    <file>index.html</file>
+    <file>viewer.js</file>
+    <file>wavescope.js</file>
+    <file>presets.js</file>
+    <file>projectm-adapter.js</file>
+    <file>projectm/projectm.js</file>
+    <file>projectm/projectm.wasm</file>
+  </gresource>
+</gresources>
