@@ -9,9 +9,7 @@ A native Linux music player built with **GTK3 and SDL2**, with playback powered 
 
 Modulez Player brings classic tracker music and regular audio playback to the Linux desktop, with a graphical interface, real-time audio visualization, and detailed module and sample information.
 
-![Modulez Player 1.5 reference screenshot](modulez-player-1.5.png)
-
-*Reference screenshot from 1.5; the 1.6 screenshot will be updated before publication.*
+![Modulez Player 1.6 showing the Player tab](modulez-player-1.6.png)
 
 ## Features
 
@@ -57,32 +55,32 @@ nicknames for a classic terminal look. The parser can be checked using
 `make check-irc`; that command also performs a syntax check of the GTK/GIO
 source files.
 
-## Version 1.6 build status
+## Version 1.6
 
-Version 1.6 is being prepared for release. See [1.6 release notes](RELEASE_NOTES_1.6.md).
-The native Vis build has been tested locally; final AppImage runtime testing is pending.
-The final artifact name is `Modulez-Player-v1.6-Linux-x86_64.AppImage`.
+Version 1.6 is available now. See the [release notes](RELEASE_NOTES_1.6.md).
+The Linux x86_64 AppImage passed packaging verification and desktop testing on
+Linux Mint 22.3 XFCE. Compatibility on other Linux systems has not yet been verified.
 Wavescope is credited to Signal Ridge Labs (MIT), and projectM uses LGPL-2.1;
 license notices and source references are included with the visualization assets.
 
 ## Download
 
-Until 1.6 is published, the stable download below remains version 1.5.
+**[Download Modulez Player v1.6 for Linux x86_64](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.6/Modulez-Player-v1.6-Linux-x86_64.AppImage)**
 
-Download [Modulez Player v1.5](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.5).
+[Release notes and downloads](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.6).
 
-The release includes the Linux x86_64 AppImage and a separate launcher icon.
+The AppImage includes the application launcher icon.
 See [all releases](../../releases) for earlier versions.
 
 ### Running the AppImage
 
-1. Download the versioned `Modulez-Player-v1.5-Linux-x86_64.AppImage` file from Release v1.5.
+1. Download the versioned `Modulez-Player-v1.6-Linux-x86_64.AppImage` file from Release v1.6.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x Modulez-Player-v1.5-Linux-x86_64.AppImage
-   ./Modulez-Player-v1.5-Linux-x86_64.AppImage
+   chmod +x Modulez-Player-v1.6-Linux-x86_64.AppImage
+   ./Modulez-Player-v1.6-Linux-x86_64.AppImage
    ```
 
 ### Add the player to your application menu
@@ -110,7 +108,7 @@ for more information.
 
 ## Requirements
 
-The 1.5 AppImage includes the playback libraries, UADE core and player data, ZXTune helper, and default MIDI SoundFont with its license. A separate UADE installation or SoundFont download is not needed. Compatibility with Linux distributions other than the development system has not yet been fully tested.
+The 1.6 AppImage includes the playback libraries, UADE core and player data, ZXTune helper, and default MIDI SoundFont with its license. A separate UADE installation or SoundFont download is not needed. Compatibility with Linux distributions other than the development system has not yet been fully tested.
 
 ### MIDI and SoundFonts
 
@@ -133,7 +131,7 @@ make -j4
 ./modulez-player
 ```
 
-The 1.5 AppImage bundles **MS Basic.sf3** as its default General MIDI
+The 1.6 AppImage bundles **MS Basic.sf3** as its default General MIDI
 SoundFont, together with its license. You can still import and select your
 own SF2/SF3 banks. A previously saved selection may take priority over the
 bundled default. Packaging details are in the
@@ -266,9 +264,8 @@ Existing settings remain in `~/.config/xmp-module-player` and
 EQ presets, preferences, or stored paths. The repository address remains
 `dasteele-ctrl/xmp-module-player` so existing links continue to work.
 
-The release also provides `modulez-player.png` as a separate download for
-users who prefer to create their own launcher. Integration tools can use the
-same icon bundled inside the AppImage.
+The launcher icon is bundled inside the AppImage and is also available in
+the repository as [`icons/modulez-player.png`](icons/modulez-player.png).
 
 Version 1.4.3 adds UADE fallback playback, seeking, and WAV export for
 additional Amiga music formats. The AppImage bundles UADE's core, libraries,
