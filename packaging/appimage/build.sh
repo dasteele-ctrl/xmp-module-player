@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Modulez Player v1.5 AppImage with the UADE runtime and the required default SoundFont.
+# Modulez Player v1.6 AppImage: WebKit runtime, bundled visualizer assets, UADE and SoundFont.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,6 +13,10 @@ if [[ ! -x "$project_dir/modulez-player" ]]; then
     echo "Missing modulez-player. Build the native player with: make -j4" >&2
     exit 1
 fi
+if ! grep -aFq 'Modulez Player 1.6' "$project_dir/modulez-player"; then
+    echo "The compiled player does not report version 1.6. Run make -j4 modulez-player first." >&2
+    exit 1
+fi
 if [[ ! -x "$project_dir/xmp-zx-helper" ]]; then
     echo "Missing xmp-zx-helper. Build both executables with: make -j4" >&2
     exit 1
@@ -23,6 +27,41 @@ if [[ ! -x "$linuxdeploy" || ! -x "$gtk_plugin" ]]; then
     echo "then make both executable and rerun this script." >&2
     exit 1
 fi
+
+# WebKit needs subprocesses and an injected bundle in addition to its .so.
+for command in pkg-config python3 patchelf gresource; do
+    command -v "$command" >/dev/null || { echo "Missing build tool: $command" >&2; exit 1; }
+done
+webkit_libdir="$(pkg-config --variable=libdir webkit2gtk-4.1)"
+webkit_helper_dir="$webkit_libdir/webkit2gtk-4.1"
+if [[ ! -x "$webkit_helper_dir/WebKitWebProcess" ]]; then
+    webkit_helper_dir=/usr/libexec/webkit2gtk-4.1
+fi
+case "$webkit_helper_dir" in
+    /usr/*) ;;
+    *) echo "Unsupported WebKit helper location: $webkit_helper_dir" >&2; exit 1 ;;
+esac
+webkit_utilities=()
+webkit_process_names=()
+for process_path in "$webkit_helper_dir"/WebKit*Process; do
+    [[ -x "$process_path" ]] || continue
+    webkit_utilities+=(--executable "$process_path")
+    webkit_process_names+=("${process_path##*/}")
+done
+for required in WebKitWebProcess WebKitNetworkProcess; do
+    [[ -x "$webkit_helper_dir/$required" ]] || { echo "Missing WebKit helper: $required" >&2; exit 1; }
+done
+injected_bundle="$webkit_helper_dir/injected-bundle/libwebkit2gtkinjectedbundle.so"
+[[ -f "$injected_bundle" ]] || { echo "Missing injected WebKit bundle" >&2; exit 1; }
+webkit_utilities+=(--library "$injected_bundle")
+for sandbox_tool in bwrap xdg-dbus-proxy; do
+    sandbox_path="$(command -v "$sandbox_tool" || true)"
+    [[ -x "$sandbox_path" ]] || { echo "Install bubblewrap and xdg-dbus-proxy" >&2; exit 1; }
+    webkit_utilities+=(--executable "$sandbox_path")
+done
+for packaging_file in relocate-webkit.py vis-AppRun; do
+    [[ -f "$script_dir/$packaging_file" ]] || { echo "Missing packaging helper: $packaging_file" >&2; exit 1; }
+done
 
 # The HVSC downloader uses these executables at runtime. Bundle curl and the
 # standalone 7zz (rather than plugin-dependent 7z) with their ELF dependencies.
@@ -78,7 +117,7 @@ fi
 mkdir -p -- "$dist_dir"
 build_root="$(mktemp -d /tmp/xmp-appimage.XXXXXXXX)"
 appdir="$build_root/Modulez_Player.AppDir"
-output_name="Modulez-Player-v1.5-Linux-x86_64-$(date +%Y%m%d-%H%M%S).AppImage"
+output_name="Modulez-Player-v1.6-Linux-x86_64.AppImage"
 
 cleanup() {
     if [[ -n "${build_root:-}" && -d "$build_root" &&
@@ -101,6 +140,7 @@ fi
         --executable "$project_dir/xmp-zx-helper" \
         --executable "$uade_core" \
         "${hvsc_utilities[@]}" \
+        "${webkit_utilities[@]}" \
         --desktop-file "$script_dir/modulez-player.desktop" \
         --icon-file "$project_dir/icons/modulez-player.png" \
         --plugin gtk
@@ -127,6 +167,37 @@ install -D -m 0644 "$source_notice" \
     "$appdir/usr/share/doc/xmp-module-player/soundfonts/SOUNDFONT-LICENSE.txt"
 echo "Bundled SoundFont: $source_font ($bundled_font)"
 
+# Keep the collected/patched ELF helpers under WebKit's expected runtime tree.
+bundled_webkit_dir="$appdir$webkit_helper_dir"
+mkdir -p -- "$bundled_webkit_dir/injected-bundle"
+for name in "${webkit_process_names[@]}"; do
+    install -m 0755 "$appdir/usr/bin/$name" "$bundled_webkit_dir/$name"
+done
+install -m 0644 "$appdir/usr/lib/libwebkit2gtkinjectedbundle.so" \
+    "$bundled_webkit_dir/injected-bundle/libwebkit2gtkinjectedbundle.so"
+# Preserve any non-executable runtime data supplied by this WebKit package.
+for entry in "$webkit_helper_dir"/*; do
+    [[ -e "$entry" ]] || continue
+    [[ "${entry##*/}" == injected-bundle ]] && continue
+    if [[ -d "$entry" || ! -x "$entry" ]]; then cp -aL -- "$entry" "$bundled_webkit_dir/"; fi
+done
+for data_dir in /usr/share/webkitgtk-4.1 /usr/share/webkit2gtk-4.1; do
+    if [[ -d "$data_dir" ]]; then mkdir -p -- "$appdir${data_dir%/*}"; cp -aL -- "$data_dir" "$appdir${data_dir%/*}/"; fi
+done
+python3 "$script_dir/relocate-webkit.py" "$appdir" --source-dir "$webkit_helper_dir"
+install -D -m 0644 /dev/null "$appdir/usr/share/modulez-player/webkit-helper-dir"
+printf '%s\n' "$webkit_helper_dir" > "$appdir/usr/share/modulez-player/webkit-helper-dir"
+[[ -e "$appdir/AppRun" ]] || { echo "linuxdeploy did not create AppRun" >&2; exit 1; }
+mv -- "$appdir/AppRun" "$appdir/AppRun.modulez"
+install -m 0755 "$script_dir/vis-AppRun" "$appdir/AppRun"
+# Preserve visualizer notices alongside the existing dependency notices.
+notice_dir="$appdir/usr/share/doc/xmp-module-player/visualizer"
+mkdir -p -- "$notice_dir/projectm"
+cp -a -- "$project_dir/visualizer/upstream" "$notice_dir/"
+for notice in COPYING LICENSE.txt BUILD-SOURCES.txt; do
+    install -m 0644 "$project_dir/visualizer/projectm/$notice" "$notice_dir/projectm/$notice"
+done
+
 verify_bundle() {
     local bundle="$1"
     local asset library
@@ -148,11 +219,19 @@ verify_bundle() {
         echo "Bundle verification failed: UADE core or player data missing." >&2
         return 1
     fi
-    for library in libuade libbencodetools libfluidsynth; do
+    for library in libuade libbencodetools libfluidsynth libwebkit2gtk-4.1 libjavascriptcoregtk-4.1 libsoup-3.0; do
         if [[ -z "$(find "$bundle/usr" -type f -name "$library.so*" -print -quit)" ]]; then
             echo "Bundle verification failed: missing $library." >&2
             return 1
         fi
+    done
+    python3 "$script_dir/relocate-webkit.py" "$bundle" --source-dir "$webkit_helper_dir" --verify
+    grep -q 'MODULEZ_WEBKIT_RELOCATION_V1' "$bundle/AppRun"
+    [[ -e "$bundle/AppRun.modulez" ]]
+    local resources
+    resources="$(gresource list "$bundle/usr/bin/modulez-player")"
+    for asset in index.html viewer.js wavescope.js presets.js projectm-adapter.js projectm/projectm.js projectm/projectm.wasm; do
+        grep -Fxq "/org/modulez/visualizer/$asset" <<< "$resources" || { echo "Missing embedded visualizer asset: $asset" >&2; return 1; }
     done
     cmp -- "$source_font" "$bundle/usr/share/sounds/sf2/$bundled_font"
     cmp -- "$source_notice" \
@@ -164,11 +243,15 @@ verify_bundle "$appdir"
 # producing the compressed AppImage.
 bash "$script_dir/bundle-licenses.sh" "$appdir" "$project_dir"
 
+# Run the output plugin directly: a second linuxdeploy deployment pass
+# replaces AppRun and can undo the custom WebKit launcher.
+mkdir -p -- "$build_root/packaging-tools"
+( cd -- "$build_root/packaging-tools"; "$linuxdeploy" --appimage-extract > extraction.log 2>&1 )
+output_plugin="$(find "$build_root/packaging-tools/squashfs-root" -type f -name linuxdeploy-plugin-appimage -perm /111 -print -quit)"
+[[ -n "$output_plugin" ]] || { echo "Bundled AppImage output plugin not found." >&2; exit 1; }
 (
     cd -- "$dist_dir"
-    LDAI_OUTPUT="$output_name" "$linuxdeploy" \
-        --appdir "$appdir" \
-        --output appimage
+    ARCH=x86_64 LDAI_OUTPUT="$output_name" "$output_plugin" --appdir "$appdir"
 )
 
 if [[ ! -f "$dist_dir/$output_name" ]]; then
@@ -184,7 +267,7 @@ mkdir -p -- "$build_root/verification"
     "$dist_dir/$output_name" --appimage-extract > "$build_root/extraction.log" 2>&1
 )
 verify_bundle "$build_root/verification/squashfs-root"
-echo "Verified: bundled UADE core/data/libraries and the exact SoundFont and license."
+echo "Verified: WebKit helpers/relocation, embedded Vis assets, UADE runtime and exact SoundFont."
 
 install -m 0644 "$project_dir/icons/modulez-player.png" "$dist_dir/modulez-player.png"
 echo "Launcher icon: $dist_dir/modulez-player.png"

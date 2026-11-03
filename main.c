@@ -17,6 +17,7 @@
 #include "hvsc_download.h"
 #include "xmp_irc_widget.h"
 #include "tray_icon.h"
+#include "visualizer.h"
 #ifdef ENABLE_WAV_EXPORT
 #include "export_wav.h"
 #endif
@@ -24,6 +25,7 @@
 #include "zx_audio.h"
 #endif
 
+#define MODULEZ_VERSION "1.6"
 #define AUDIO_RATE 44100
 #define SCOPE_ROW_HEIGHT 76
 #define SCOPE_MARGIN 8
@@ -482,6 +484,10 @@ static void audio_callback(void *userdata, Uint8 *stream, int len)
         for (int i = 0; i < pcm_samples; i++)
             volume_pcm[i] = (int16_t)(((int32_t)volume_pcm[i] * master_volume) / 100);
     }
+
+    /* The Vis tab consumes a bounded, nonblocking copy of the final PCM. */
+    modulez_vis_pcm_push((const int16_t *)stream,
+                         (size_t)len / (2 * sizeof(int16_t)));
 
     /* Capture mono samples for the visualizer; audio is S16 stereo. */
     const int16_t *pcm = (const int16_t *)stream;
@@ -4537,9 +4543,11 @@ static void apply_style(void)
         "#eq-sliders scale slider { background: #65eee0;"
         " border: 1px solid #b1fff4; min-width: 19px; min-height: 19px; }"
         ".module-title { font-size: 19px; font-weight: bold; }"
-        "label#about-title { font-size: 24px; font-weight: bold; }"
+        "#about-page label { font-size: 13pt; }"
+        "#about-page label#about-title { font-size: 20px; font-weight: bold; }"
+        "#about-page button { padding: 2px 6px; min-height: 0; font-size: 13pt; }"
         "label#about-description { background-color: #0d1e25;"
-        " color: #dbeff0; padding: 18px;"
+        " color: #dbeff0; padding: 8px;"
         " border: 1px solid #34616a; border-radius: 6px; }"
         ".muted { color: #9dbfc2; }";
 
@@ -4730,6 +4738,13 @@ static void on_destroy(GtkWidget *widget, gpointer data)
     gtk_main_quit();
 }
 
+static GtkWidget *compact_tab_label(const char *name, const char *description)
+{
+    GtkWidget *label = gtk_label_new(name);
+    gtk_widget_set_tooltip_text(label, description);
+    return label;
+}
+
 int main(int argc, char **argv)
 {
     /* libuade communicates with uadecore over pipes. A failed core must
@@ -4791,7 +4806,7 @@ int main(int argc, char **argv)
         "/org/helllabs/xmp/icons/xmp.png", 192, 192, TRUE, NULL);
 
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(window), "Modulez Player");
+    gtk_window_set_title(GTK_WINDOW(window), "Modulez Player " MODULEZ_VERSION);
 
     /* Size the initial window to the monitor's usable area. GTK will not
      * honor a smaller default size if notebook pages request more space, so
@@ -5124,7 +5139,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     gtk_notebook_append_page(
         GTK_NOTEBOOK(notebook), samples_page,
-        gtk_label_new("Samples & Notes"));
+        compact_tab_label("Samples", "Module samples and notes"));
 
     /* MIDI SoundFont library: persistent paths, startup default, live switching. */
     GtkWidget *soundfont_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
@@ -5209,7 +5224,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
                        FALSE, FALSE, 0);
     update_soundfont_label();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), soundfont_page,
-                             gtk_label_new("SoundFonts"));
+                             compact_tab_label("SF2/SF3", "MIDI SoundFont library"));
 
     /* A built-in, tabbed EQ rather than a second floating window. */
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), eq_create_page(compact_ui),
@@ -5386,6 +5401,10 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     /* Classic IRC chat, using the same GTK notebook and dark theme. */
     xmp_irc_add_notebook_page(GTK_NOTEBOOK(notebook));
 
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
+        modulez_visualizer_page_new(),
+        compact_tab_label("Vis", "Wavescope visualization and projectM / MilkDrop"));
+
     /* General preferences. A missing preferences file defaults to hiding
      * the window on close, provided the desktop has a usable system tray. */
     GtkWidget *preferences_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
@@ -5421,21 +5440,26 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
                        FALSE, FALSE, 0);
 
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), preferences_page,
-                             gtk_label_new("Preferences"));
+                             compact_tab_label("Prefs", "General preferences"));
 
     /* About page */
     GtkWidget *about_page =
-        gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
-    gtk_container_set_border_width(GTK_CONTAINER(about_page), 30);
+        gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_name(about_page, "about-page");
+    gtk_container_set_border_width(GTK_CONTAINER(about_page), 10);
     gtk_widget_set_halign(about_page, GTK_ALIGN_CENTER);
     gtk_widget_set_valign(about_page, GTK_ALIGN_CENTER);
 
-    GtkWidget *about_icon = app_icon ? gtk_image_new_from_pixbuf(app_icon) : gtk_image_new();
-    gtk_widget_set_size_request(about_icon, 128, 128);
+    GdkPixbuf *about_small_icon = app_icon ?
+        gdk_pixbuf_scale_simple(app_icon, 48, 48, GDK_INTERP_BILINEAR) : NULL;
+    GtkWidget *about_icon = about_small_icon ?
+        gtk_image_new_from_pixbuf(about_small_icon) : gtk_image_new();
+    if (about_small_icon) g_object_unref(about_small_icon);
+    gtk_widget_set_size_request(about_icon, 48, 48);
     gtk_box_pack_start(GTK_BOX(about_page), about_icon,
                        FALSE, FALSE, 0);
 
-    GtkWidget *about_title = gtk_label_new("Modulez Player 1.5");
+    GtkWidget *about_title = gtk_label_new("Modulez Player " MODULEZ_VERSION);
     gtk_widget_set_name(about_title, "about-title");
     gtk_box_pack_start(GTK_BOX(about_page), about_title,
                        FALSE, FALSE, 0);
@@ -5443,7 +5467,6 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     GtkWidget *about_description = gtk_label_new(
         "A native Linux music player built with GTK3 and SDL2.\n"
         "Formerly XMP Module Player.\n"
-        "\n"
         "Tracker modules powered by libxmp\n"
         "Additional Amiga formats powered by UADE\n"
         "libxmp takes priority for shared formats\n"
@@ -5454,12 +5477,13 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         "MIDI powered by FluidSynth with a SoundFont library\n"
         "Built-in 10-band equalizer with presets and live spectrum\n"
         "MP3, WAV, M4A/AAC, Ogg Vorbis, Opus, FLAC and more\n"
-        "\n"
         "WAV export for all supported playback engines\n"
+        "Wavescope: 34 visualization modes (Signal Ridge Labs, MIT)\n"
+        "MilkDrop presets rendered by projectM (LGPL-2.1)\n"
+        "Vis tab with direct audio and saved preset importing\n"
         "Built-in IRC chat\n"
         "System tray playback controls\n"
         "Recursive music-folder importing\n"
-        "\n"
         "High Voltage SID Collection (HVSC) browsing\n"
         "and integrated collection downloader.");
     gtk_widget_set_name(about_description, "about-description");
@@ -5468,6 +5492,15 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_widget_set_size_request(about_description, 420, -1);
     gtk_box_pack_start(GTK_BOX(about_page), about_description,
                        FALSE, FALSE, 0);
+
+    GtkWidget *about_wavescope = gtk_link_button_new_with_label(
+        "https://github.com/jasonulbright/wavescope",
+        "Wavescope — Signal Ridge Labs (MIT)");
+    gtk_box_pack_start(GTK_BOX(about_page), about_wavescope, FALSE, FALSE, 0);
+    GtkWidget *about_projectm = gtk_link_button_new_with_label(
+        "https://github.com/projectM-visualizer/projectm",
+        "projectM / MilkDrop rendering (LGPL-2.1)");
+    gtk_box_pack_start(GTK_BOX(about_page), about_projectm, FALSE, FALSE, 0);
 
     GtkWidget *about_tribute = gtk_link_button_new_with_label(
         "http://misc.yero.org/modulez/",
@@ -5481,8 +5514,12 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_box_pack_start(GTK_BOX(about_page), about_developer,
                        FALSE, FALSE, 0);
 
+    GtkWidget *about_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(about_scroll),
+                                    GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(about_scroll), about_page);
     gtk_notebook_append_page(
-        GTK_NOTEBOOK(notebook), about_page,
+        GTK_NOTEBOOK(notebook), about_scroll,
         gtk_label_new("About"));
 
     g_timeout_add(33, update_display, NULL);

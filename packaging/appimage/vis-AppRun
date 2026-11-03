@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# MODULEZ_WEBKIT_RELOCATION_V1
+set -euo pipefail
+appdir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export APPDIR="$appdir"
+# Keep relative song/folder arguments valid after changing to WebKit's base dir.
+original_dir="$PWD"
+arguments=()
+for argument in "$@"; do
+    if [[ "$argument" != /* && -e "$argument" ]]; then
+        arguments+=("$original_dir/$argument")
+    else
+        arguments+=("$argument")
+    fi
+done
+export LD_LIBRARY_PATH="$appdir/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH="$appdir/usr/bin:$PATH"
+# Release WebKit builds use the relocated compiled paths; these exports also
+# cover developer builds. Keep the sandbox enabled (no disabling variables).
+helper_file="$appdir/usr/share/modulez-player/webkit-helper-dir"
+helper_dir="$(cat -- "$helper_file")"
+export WEBKIT_EXEC_PATH="$appdir$helper_dir"
+export WEBKIT_INJECTED_BUNDLE_PATH="$WEBKIT_EXEC_PATH/injected-bundle"
+cd -- "$appdir/usr"
+exec "$appdir/AppRun.modulez" "${arguments[@]}"

@@ -1,6 +1,6 @@
 # Modulez Player
 
-**Formerly XMP Module Player.** Version 1.5 introduces the new name and icon.
+**Formerly XMP Module Player.** Version **1.6** adds the Wavescope visualization tab and projectM / MilkDrop support. Version 1.5 introduced the new name and icon.
 
 **In memory of modulez.org (2000-2013)**  
 [http://misc.yero.org/modulez/](http://misc.yero.org/modulez/)
@@ -9,9 +9,15 @@ A native Linux music player built with **GTK3 and SDL2**, with playback powered 
 
 Modulez Player brings classic tracker music and regular audio playback to the Linux desktop, with a graphical interface, real-time audio visualization, and detailed module and sample information.
 
-![Modulez Player 1.5](modulez-player-1.5.png)
+![Modulez Player 1.5 reference screenshot](modulez-player-1.5.png)
+
+*Reference screenshot from 1.5; the 1.6 screenshot will be updated before publication.*
 
 ## Features
+
+- **Wavescope Vis tab** with 34 standard visualization modes and projectM / MilkDrop
+- **MilkDrop preset library** with 13 bundled starters, multi-file import, persistent user storage, and right-click next/previous/random controls
+- **Offline visualizations** fed directly from playback after EQ and volume; rendering pauses when hidden
 
 - 🎵 **Tracker module playback** powered by libxmp
 - 🎵 **Additional Amiga music formats** powered by UADE, with libxmp retaining priority for formats supported by both engines
@@ -51,7 +57,17 @@ nicknames for a classic terminal look. The parser can be checked using
 `make check-irc`; that command also performs a syntax check of the GTK/GIO
 source files.
 
+## Version 1.6 build status
+
+Version 1.6 is being prepared for release. See [1.6 release notes](RELEASE_NOTES_1.6.md).
+The native Vis build has been tested locally; final AppImage runtime testing is pending.
+The final artifact name is `Modulez-Player-v1.6-Linux-x86_64.AppImage`.
+Wavescope is credited to Signal Ridge Labs (MIT), and projectM uses LGPL-2.1;
+license notices and source references are included with the visualization assets.
+
 ## Download
+
+Until 1.6 is published, the stable download below remains version 1.5.
 
 Download [Modulez Player v1.5](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.5).
 
@@ -234,7 +250,12 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current version: 1.5**
+**Current source version: 1.6**
+
+Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
+right-click preset navigation, preset-collection links, compact tab labels and
+Vis-aware AppImage packaging. The About page includes visualization credits.
+
 
 Version 1.5 rebrands XMP Module Player as **Modulez Player**, with a new
 application icon, About title, tray/menu text, desktop entry, and AppImage

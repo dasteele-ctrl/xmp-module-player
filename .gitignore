@@ -14,3 +14,8 @@ xmp-linux
 # Editor and build artifacts
 *~
 *.o
+
+
+# Generated embedded visualization assets
+/visualizer-resources.c
+__pycache__/
