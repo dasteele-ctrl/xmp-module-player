@@ -5061,7 +5061,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     GtkWidget *separator = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_box_pack_start(GTK_BOX(outer), separator, FALSE, FALSE, 4);
 
-    details_label = gtk_label_new("The original Android project remains untouched.");
+    details_label = gtk_label_new(NULL);
     gtk_label_set_xalign(GTK_LABEL(details_label), 0);
     gtk_label_set_ellipsize(GTK_LABEL(details_label), PANGO_ELLIPSIZE_MIDDLE);
     gtk_box_pack_start(GTK_BOX(outer), details_label, FALSE, FALSE, 0);
