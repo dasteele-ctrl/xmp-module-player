@@ -26,6 +26,9 @@
 #endif
 
 #define MODULEZ_VERSION "1.6"
+#define MODULEZ_RELEASE_REVISION "1"
+#define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
+#define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
 #define AUDIO_RATE 44100
 #define SCOPE_ROW_HEIGHT 76
 #define SCOPE_MARGIN 8
@@ -4745,6 +4748,71 @@ static GtkWidget *compact_tab_label(const char *name, const char *description)
     return label;
 }
 
+/* Releases use vMAJOR.MINOR[.PATCH][-rREVISION]. Missing fields are zero. */
+static gboolean parse_release(const char *tag, guint64 parts[4])
+{
+    GMatchInfo *match = NULL;
+    GRegex *pattern = g_regex_new("^v?([0-9]{1,9})\\.([0-9]{1,9})(?:\\.([0-9]{1,9}))?(?:-r([0-9]{1,9}))?$",
+                                  0, 0, NULL);
+    gboolean valid = g_regex_match(pattern, tag, 0, &match);
+    if (valid) {
+        for (int i = 0; i < 4; ++i) {
+            gchar *field = g_match_info_fetch(match, i + 1);
+            parts[i] = field ? g_ascii_strtoull(field, NULL, 10) : 0;
+            g_free(field);
+        }
+    }
+    g_match_info_free(match);
+    g_regex_unref(pattern);
+    return valid;
+}
+
+static void update_check_finished(GObject *source, GAsyncResult *result, gpointer data)
+{
+    GtkLabel *label = GTK_LABEL(data);
+    GSubprocess *process = G_SUBPROCESS(source);
+    gchar *url = NULL;
+    gchar *message = NULL;
+    const char prefix[] = RELEASES_URL "/tag/";
+    guint64 latest[4], current[4];
+    if (g_subprocess_communicate_utf8_finish(process, result, &url, NULL, NULL) &&
+        g_subprocess_get_successful(process) && url && g_str_has_prefix(url, prefix) &&
+        parse_release(url + strlen(prefix), latest) &&
+        parse_release(MODULEZ_VERSION "-r" MODULEZ_RELEASE_REVISION, current)) {
+        int i = 0;
+        while (i < 4 && latest[i] == current[i]) ++i;
+        if (i < 4 && latest[i] > current[i])
+            message = g_markup_printf_escaped("%s is available. <a href=\"%s\">View release</a>",
+                                              url + strlen(prefix), url);
+        else
+            message = g_strdup("You’re up to date.");
+    }
+    gtk_label_set_markup(label, message ? message : "Couldn’t check for updates. " CHECK_LINK);
+    g_free(message);
+    g_free(url);
+    g_object_unref(label);
+}
+
+static gboolean about_update_link(GtkLabel *label, const gchar *uri, gpointer data)
+{
+    (void)data;
+    if (!g_str_equal(uri, "check")) return FALSE;
+    GSubprocess *process = g_subprocess_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE |
+                                            G_SUBPROCESS_FLAGS_STDERR_SILENCE, NULL,
+        "curl", "--disable", "--silent", "--fail", "--head", "--max-time", "12",
+        "--output", "/dev/null", "--write-out", "%{redirect_url}",
+        RELEASES_URL "/latest", NULL);
+    if (!process) {
+        gtk_label_set_markup(label, "Couldn’t start curl. " CHECK_LINK);
+        return TRUE;
+    }
+    gtk_label_set_text(label, "Checking…");
+    g_subprocess_communicate_utf8_async(process, NULL, NULL, update_check_finished,
+                                        g_object_ref(label));
+    g_object_unref(process);
+    return TRUE;
+}
+
 int main(int argc, char **argv)
 {
     /* libuade communicates with uadecore over pipes. A failed core must
@@ -5461,8 +5529,14 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     GtkWidget *about_title = gtk_label_new("Modulez Player " MODULEZ_VERSION);
     gtk_widget_set_name(about_title, "about-title");
-    gtk_box_pack_start(GTK_BOX(about_page), about_title,
-                       FALSE, FALSE, 0);
+    GtkWidget *version_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_halign(version_row, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(version_row), about_title, FALSE, FALSE, 0);
+    GtkWidget *updates = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(updates), CHECK_LINK);
+    g_signal_connect(updates, "activate-link", G_CALLBACK(about_update_link), NULL);
+    gtk_box_pack_start(GTK_BOX(version_row), updates, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(about_page), version_row, FALSE, FALSE, 0);
 
     GtkWidget *about_description = gtk_label_new(
         "A native Linux music player built with GTK3 and SDL2.\n"
