@@ -411,6 +411,8 @@ static void uade_add_file_patterns(GtkFileFilter *filter)
 static char current_file[4096] = "";
 static GtkListStore *playlist_store;
 static GtkWidget *playlist_view;
+static GtkTreeModelFilter *playlist_filter;
+static gchar *playlist_query;
 
 static void audio_callback(void *userdata, Uint8 *stream, int len)
 {
@@ -3540,6 +3542,32 @@ static void on_playlist_add_folder(GtkButton *button, gpointer data)
     gtk_widget_destroy(dialog);
 }
 
+static gboolean playlist_row_matches(GtkTreeModel *model, GtkTreeIter *iter,
+                                     gpointer data)
+{
+    (void)data;
+    if (!playlist_query || !*playlist_query)
+        return TRUE;
+
+    gchar *name = NULL;
+    gtk_tree_model_get(model, iter, 0, &name, -1);
+    gchar *display_name = g_utf8_make_valid(name ? name : "", -1);
+    gchar *folded = g_utf8_casefold(display_name, -1);
+    gboolean matches = strstr(folded, playlist_query) != NULL;
+    g_free(folded);
+    g_free(display_name);
+    g_free(name);
+    return matches;
+}
+
+static void on_playlist_search_changed(GtkSearchEntry *entry, gpointer data)
+{
+    (void)data;
+    g_free(playlist_query);
+    playlist_query = g_utf8_casefold(gtk_entry_get_text(GTK_ENTRY(entry)), -1);
+    gtk_tree_model_filter_refilter(playlist_filter);
+}
+
 static void on_playlist_remove(GtkButton *button, gpointer data)
 {
     (void)button;
@@ -3547,11 +3575,12 @@ static void on_playlist_remove(GtkButton *button, gpointer data)
 
     GtkTreeSelection *selection =
         gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view));
-    GtkTreeModel *model;
     GtkTreeIter iter;
-
-    if (gtk_tree_selection_get_selected(selection, &model, &iter))
-        gtk_list_store_remove(GTK_LIST_STORE(model), &iter);
+    if (gtk_tree_selection_get_selected(selection, NULL, &iter)) {
+        GtkTreeIter child;
+        gtk_tree_model_filter_convert_iter_to_child_iter(playlist_filter, &child, &iter);
+        gtk_list_store_remove(playlist_store, &child);
+    }
 }
 
 static void on_playlist_clear(GtkButton *button, gpointer data)
@@ -3564,18 +3593,16 @@ static void on_playlist_clear(GtkButton *button, gpointer data)
 static void on_playlist_activate(GtkTreeView *view, GtkTreePath *path,
                                  GtkTreeViewColumn *column, gpointer data)
 {
-    (void)view;
     (void)column;
     (void)data;
 
+    GtkTreeModel *model = gtk_tree_view_get_model(view);
     GtkTreeIter iter;
-    if (!gtk_tree_model_get_iter(GTK_TREE_MODEL(playlist_store),
-                                 &iter, path))
+    if (!gtk_tree_model_get_iter(model, &iter, path))
         return;
 
     char *filename = NULL;
-    gtk_tree_model_get(GTK_TREE_MODEL(playlist_store), &iter,
-                       1, &filename, -1);
+    gtk_tree_model_get(model, &iter, 1, &filename, -1);
 
     if (filename) {
         play_playlist_file(filename);
@@ -3643,12 +3670,15 @@ static gboolean playlist_play_index(gint index)
 
     GtkTreeSelection *selection = gtk_tree_view_get_selection(
         GTK_TREE_VIEW(playlist_view));
-    GtkTreePath *target_path = gtk_tree_model_get_path(model, &iter);
-    gtk_tree_selection_select_iter(selection, &iter);
-    if (target_path) {
+    GtkTreeIter visible;
+    if (gtk_tree_model_filter_convert_child_iter_to_iter(playlist_filter, &visible, &iter)) {
+        GtkTreePath *target_path = gtk_tree_model_get_path(GTK_TREE_MODEL(playlist_filter), &visible);
+        gtk_tree_selection_select_iter(selection, &visible);
         gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(playlist_view),
                                      target_path, NULL, TRUE, 0.5, 0.0);
         gtk_tree_path_free(target_path);
+    } else {
+        gtk_tree_selection_unselect_all(selection);
     }
 
     play_playlist_file(filename);
@@ -3688,7 +3718,9 @@ static gboolean playlist_skip_track(gint direction)
         GTK_TREE_VIEW(playlist_view));
     if (current_index < 0 &&
         gtk_tree_selection_get_selected(selection, NULL, &iter)) {
-        GtkTreePath *selected_path = gtk_tree_model_get_path(model, &iter);
+        GtkTreeIter child;
+        gtk_tree_model_filter_convert_iter_to_child_iter(playlist_filter, &child, &iter);
+        GtkTreePath *selected_path = gtk_tree_model_get_path(model, &child);
         if (selected_path) {
             gint *indices = gtk_tree_path_get_indices(selected_path);
             if (indices && gtk_tree_path_get_depth(selected_path) == 1)
@@ -4738,7 +4770,7 @@ static void on_destroy(GtkWidget *widget, gpointer data)
     g_free(selected_soundfont);
     g_free(favorite_soundfont);
     SDL_Quit();
-    gtk_main_quit();
+    g_application_quit(g_application_get_default());
 }
 
 static GtkWidget *compact_tab_label(const char *name, const char *description)
@@ -4813,14 +4845,8 @@ static gboolean about_update_link(GtkLabel *label, const gchar *uri, gpointer da
     return TRUE;
 }
 
-int main(int argc, char **argv)
+static int create_player(void)
 {
-    /* libuade communicates with uadecore over pipes. A failed core must
-     * report an I/O error instead of terminating the GUI with SIGPIPE. */
-    signal(SIGPIPE, SIG_IGN);
-    g_set_application_name("Modulez Player");
-    gtk_init(&argc, &argv);
-
     /* Request a dark GTK fallback for controls the application does not
      * explicitly style (notably file-chooser internals and popup menus). */
     g_object_set(gtk_settings_get_default(),
@@ -4928,7 +4954,7 @@ int main(int argc, char **argv)
 
     GtkWidget *player_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, compact_ui ? 8 : 12);
     gtk_container_set_border_width(GTK_CONTAINER(player_page), compact_ui ? 4 : 8);
-    gtk_container_add(GTK_CONTAINER(player_page), outer);
+    gtk_box_pack_start(GTK_BOX(player_page), outer, TRUE, TRUE, 0);
 
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
     gtk_box_pack_start(GTK_BOX(outer), top, FALSE, FALSE, 0);
@@ -5003,16 +5029,10 @@ int main(int argc, char **argv)
     g_signal_connect(volume_scale, "value-changed", G_CALLBACK(on_volume_changed), NULL);
     gtk_box_pack_start(GTK_BOX(controls), volume_scale, FALSE, FALSE, 0);
 
-   /* Adjustable playlist and pattern sections */
-GtkWidget *content_pane = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
-gtk_box_pack_start(GTK_BOX(outer), content_pane, TRUE, TRUE, 0);
-
-/* Playlist */
-GtkWidget *playlist_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-
+    /* Keep the search and toggle reachable when the track list is collapsed. */
     GtkWidget *playlist_controls =
         gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_box_pack_start(GTK_BOX(playlist_box), playlist_controls,
+    gtk_box_pack_start(GTK_BOX(outer), playlist_controls,
                        FALSE, FALSE, 0);
 
     GtkWidget *playlist_heading = gtk_label_new("Playlist");
@@ -5047,8 +5067,21 @@ GtkWidget *playlist_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
         FALSE, FALSE, 0);
 
     playlist_store = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_STRING);
-    playlist_view = gtk_tree_view_new_with_model(
-        GTK_TREE_MODEL(playlist_store));
+    playlist_filter = GTK_TREE_MODEL_FILTER(
+        gtk_tree_model_filter_new(GTK_TREE_MODEL(playlist_store), NULL));
+    gtk_tree_model_filter_set_visible_func(playlist_filter, playlist_row_matches, NULL, NULL);
+    playlist_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(playlist_filter));
+    g_object_unref(playlist_filter); /* The view now owns the model. */
+
+    GtkWidget *search_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_box_pack_start(GTK_BOX(outer), search_row, FALSE, FALSE, 0);
+    GtkWidget *search_entry = gtk_search_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry), "Search playlist…");
+    gtk_box_pack_start(GTK_BOX(search_row), search_entry, TRUE, TRUE, 0);
+    g_signal_connect(search_entry, "search-changed", G_CALLBACK(on_playlist_search_changed), NULL);
+
+    GtkWidget *show_patterns = gtk_check_button_new_with_label("Show pattern & scopes");
+    gtk_box_pack_start(GTK_BOX(search_row), show_patterns, FALSE, FALSE, 0);
     gtk_widget_set_name(playlist_view, "playlist-view");
     gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(playlist_view), FALSE);
 
@@ -5066,11 +5099,13 @@ GtkWidget *playlist_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(playlist_scroll),
                                    GTK_POLICY_AUTOMATIC,
                                    GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(playlist_scroll, -1, 60);
+    gtk_widget_set_size_request(playlist_scroll, -1, compact_ui ? 96 : 140);
+    gtk_scrolled_window_set_shadow_type(GTK_SCROLLED_WINDOW(playlist_scroll), GTK_SHADOW_IN);
     gtk_container_add(GTK_CONTAINER(playlist_scroll), playlist_view);
-   gtk_box_pack_start(GTK_BOX(playlist_box), playlist_scroll,
-                   TRUE, TRUE, 0);
-gtk_paned_pack1(GTK_PANED(content_pane), playlist_box, TRUE, TRUE);
+    GtkWidget *content_pane = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
+    gtk_paned_set_wide_handle(GTK_PANED(content_pane), TRUE);
+    gtk_paned_pack1(GTK_PANED(content_pane), playlist_scroll, TRUE, TRUE);
+    gtk_box_pack_start(GTK_BOX(outer), content_pane, TRUE, TRUE, 0);
 
     seek_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 1, 100);
     gtk_scale_set_draw_value(GTK_SCALE(seek_scale), FALSE);
@@ -5118,6 +5153,9 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     /* One divider: playlist above, pattern and scopes below. */
     gtk_paned_pack2(GTK_PANED(content_pane), lower_box, TRUE, TRUE);
+    gtk_widget_show_all(lower_box);
+    gtk_widget_set_no_show_all(lower_box, TRUE);
+    g_object_bind_property(show_patterns, "active", lower_box, "visible", G_BINDING_SYNC_CREATE);
     gtk_paned_set_position(GTK_PANED(content_pane), compact_ui ? 150 : 230);
 
     gtk_box_pack_start(GTK_BOX(outer), seek_scale, FALSE, FALSE, 0);
@@ -5598,19 +5636,55 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     g_timeout_add(33, update_display, NULL);
 
-    if (argc > 1) {
-        if (is_midi_path(argv[1])) {
-            open_midi(argv[1]);
-        } else {
-            open_module(argv[1]);
-            if (!zx_is_music_path(argv[1]) && !module_loaded &&
-                !open_sid(argv[1]))
-                open_ffmpeg_audio(argv[1]);
-        }
+    gtk_widget_show_all(window);
+    gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), 0);
+    return 0;
+}
+
+static int on_launch(GApplication *app, GApplicationCommandLine *command, gpointer data)
+{
+    (void)data;
+    if (!window) {
+        if (create_player() != 0)
+            return 1;
+        g_application_hold(app);
     }
 
-    gtk_widget_show_all(window);
-gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), 0);
-gtk_main();
+    int argc;
+    gchar **argv = g_application_command_line_get_arguments(command, &argc);
+    if (argc > 1) {
+        GFile *file = g_application_command_line_create_file_for_arg(command, argv[1]);
+        gchar *path = g_file_get_path(file);
+        g_object_unref(file);
+        if (path) {
+            if (is_midi_path(path)) {
+                open_midi(path);
+            } else {
+                open_module(path);
+                if (!zx_is_music_path(path) && !module_loaded &&
+                    !open_sid(path))
+                    open_ffmpeg_audio(path);
+            }
+            g_free(path);
+        }
+    }
+    g_strfreev(argv);
+    on_tray_show(NULL);
     return 0;
+}
+
+int main(int argc, char **argv)
+{
+    /* libuade communicates with uadecore over pipes. A failed core must
+     * report an I/O error instead of terminating the GUI with SIGPIPE. */
+    signal(SIGPIPE, SIG_IGN);
+    g_set_application_name("Modulez Player");
+    gtk_init(&argc, &argv);
+
+    GApplication *app = g_application_new("org.modulez.Player",
+                                          G_APPLICATION_HANDLES_COMMAND_LINE);
+    g_signal_connect(app, "command-line", G_CALLBACK(on_launch), NULL);
+    int status = g_application_run(app, argc, argv);
+    g_object_unref(app);
+    return status;
 }
