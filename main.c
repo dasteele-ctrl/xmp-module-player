@@ -25,7 +25,7 @@
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.6.1"
+#define MODULEZ_VERSION "1.6.2"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
