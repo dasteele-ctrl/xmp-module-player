@@ -65,9 +65,9 @@ license notices and source references are included with the visualization assets
 
 ## Download
 
-**[Download Modulez Player v1.6 for Linux x86_64](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.6-r1/Modulez-Player-v1.6-Linux-x86_64.AppImage)**
+**[Download Modulez Player v1.6.1 for Linux x86_64](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.6.1/Modulez-Player-v1.6.1-Linux-x86_64.AppImage)**
 
-[Release notes and downloads](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.6-r1).
+[Release notes and downloads](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.6.1).
 
 The AppImage includes the application launcher icon.
 See [all releases](../../releases) for earlier versions.
