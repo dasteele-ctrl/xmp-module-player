@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Modulez Player v1.6.3 AppImage: WebKit runtime, bundled visualizer assets, UADE and SoundFont.
+# Modulez Player v1.6.4 AppImage: WebKit runtime, bundled visualizer assets, UADE and SoundFont.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,8 +13,8 @@ if [[ ! -x "$project_dir/modulez-player" ]]; then
     echo "Missing modulez-player. Build the native player with: make -j4" >&2
     exit 1
 fi
-if ! grep -aFq 'Modulez Player 1.6.3' "$project_dir/modulez-player"; then
-    echo "The compiled player does not report version 1.6.3. Run make -j4 modulez-player first." >&2
+if ! grep -aFq 'Modulez Player 1.6.4' "$project_dir/modulez-player"; then
+    echo "The compiled player does not report version 1.6.4. Run make -j4 modulez-player first." >&2
     exit 1
 fi
 if [[ ! -x "$project_dir/xmp-zx-helper" ]]; then
@@ -117,7 +117,7 @@ fi
 mkdir -p -- "$dist_dir"
 build_root="$(mktemp -d /tmp/xmp-appimage.XXXXXXXX)"
 appdir="$build_root/Modulez_Player.AppDir"
-output_name="Modulez-Player-v1.6.3-Linux-x86_64.AppImage"
+output_name="Modulez-Player-v1.6.4-Linux-x86_64.AppImage"
 
 cleanup() {
     if [[ -n "${build_root:-}" && -d "$build_root" &&
