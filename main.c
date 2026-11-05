@@ -2969,10 +2969,9 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
     if (!module_loaded || !player_started || width < 80 || height < 20)
         return FALSE;
 
-    /*
-     * The SDL lock protects libxmp while we inspect playback state and
-     * module samples. Keep the drawing work short.
-     */
+    /* Bounded waveform snapshots: sample data can change during playback.
+     * Copy under the audio lock, then perform all Cairo work after unlocking. */
+    float waveform[XMP_MAX_CHANNELS][512] = {{0}};
     SDL_LockAudioDevice(audio_device);
 
     struct xmp_module_info mi;
@@ -2986,11 +2985,93 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
         return FALSE;
     }
 
-    const int channels = mod->chn;
+    const int channels = MIN(mod->chn, XMP_MAX_CHANNELS);
     const int row_height = SCOPE_ROW_HEIGHT;
     const int plot_left = 42;
     const int plot_right = width - 12;
     const int plot_width = plot_right - plot_left;
+
+    const int points = MIN(512, plot_width);
+    for (int ch = 0; ch < channels; ++ch) {
+        if (ch * row_height >= height) break;
+        const struct xmp_channel_info *ci = &fi.channel_info[ch];
+        /*
+         * ci->sample is documented as the current sample number.
+         * Treat positive values as one-based, and validate before access.
+         */
+        int sample_index = ci->sample > 0
+                         ? (int)ci->sample - 1 : -1;
+
+        if (sample_index >= 0 && sample_index < mod->smp &&
+            mod->xxs && plot_width > 1) {
+            struct xmp_sample *sp = &mod->xxs[sample_index];
+
+            if (sp->data && sp->len > 0) {
+                int sample_count = sp->len;
+                int stereo = !!(sp->flg & XMP_SAMPLE_STEREO);
+                int stride = stereo ? 2 : 1;
+                unsigned int position = ci->position;
+                int looping = !!(sp->flg & XMP_SAMPLE_LOOP);
+                int loop_start = sp->lps;
+                int loop_end = sp->lpe;
+
+                if (position >= (unsigned int)sample_count)
+                    position = (unsigned int)(sample_count - 1);
+
+                /*
+                 * Display a short moving section of the current sample.
+                 * The loop bounds are used only when they are valid.
+                 */
+                int valid_loop = looping &&
+                                 loop_start >= 0 &&
+                                 loop_end > loop_start &&
+                                 loop_end <= sample_count;
+
+                int window_samples = 512;
+                int step = window_samples / points;
+                if (step < 1)
+                    step = 1;
+
+                for (int x = 0; x < points; ++x) {
+                    long sample_pos = (long)position + (long)x * step;
+
+                    if (sample_pos >= sample_count) {
+                        if (valid_loop) {
+                            long loop_len = loop_end - loop_start;
+                            sample_pos = loop_start +
+                                (sample_pos - loop_start) % loop_len;
+                        } else {
+                            sample_pos = sample_count - 1;
+                        }
+                    }
+
+                    if (valid_loop && sample_pos >= loop_end) {
+                        long loop_len = loop_end - loop_start;
+                        sample_pos = loop_start +
+                            (sample_pos - loop_start) % loop_len;
+                    }
+
+                    if (sample_pos < 0 || sample_pos >= sample_count)
+                        continue;
+
+                    long data_index = sample_pos * stride;
+                    double amplitude;
+
+                    if (sp->flg & XMP_SAMPLE_16BIT) {
+                        const int16_t *pcm = (const int16_t *)sp->data;
+                        amplitude = pcm[data_index] / 32768.0;
+                    } else {
+                        const int8_t *pcm = (const int8_t *)sp->data;
+                        amplitude = pcm[data_index] / 128.0;
+                    }
+
+                    waveform[ch][x] = (float)amplitude;
+                }
+            }
+        }
+
+    }
+    SDL_UnlockAudioDevice(audio_device);
 
     for (int ch = 0; ch < channels; ++ch) {
         int y = ch * row_height;
@@ -3030,88 +3111,15 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
         cairo_line_to(cr, plot_right, mid);
         cairo_stroke(cr);
 
-        /*
-         * ci->sample is documented as the current sample number.
-         * Treat positive values as one-based, and validate before access.
-         */
-        int sample_index = ci->sample > 0
-                         ? (int)ci->sample - 1 : -1;
-
-        if (sample_index >= 0 && sample_index < mod->smp &&
-            mod->xxs && plot_width > 1) {
-            struct xmp_sample *sp = &mod->xxs[sample_index];
-
-            if (sp->data && sp->len > 0) {
-                int sample_count = sp->len;
-                int stereo = !!(sp->flg & XMP_SAMPLE_STEREO);
-                int stride = stereo ? 2 : 1;
-                unsigned int position = ci->position;
-                int looping = !!(sp->flg & XMP_SAMPLE_LOOP);
-                int loop_start = sp->lps;
-                int loop_end = sp->lpe;
-
-                if (position >= (unsigned int)sample_count)
-                    position = (unsigned int)(sample_count - 1);
-
-                /*
-                 * Display a short moving section of the current sample.
-                 * The loop bounds are used only when they are valid.
-                 */
-                int valid_loop = looping &&
-                                 loop_start >= 0 &&
-                                 loop_end > loop_start &&
-                                 loop_end <= sample_count;
-
-                int window_samples = 512;
-                int step = window_samples / plot_width;
-                if (step < 1)
-                    step = 1;
-
-                cairo_set_source_rgb(cr, 0.20, 0.96, 0.48);
-                cairo_set_line_width(cr, 1.15);
-
-                for (int x = 0; x < plot_width; ++x) {
-                    long sample_pos = (long)position + (long)x * step;
-
-                    if (sample_pos >= sample_count) {
-                        if (valid_loop) {
-                            long loop_len = loop_end - loop_start;
-                            sample_pos = loop_start +
-                                (sample_pos - loop_start) % loop_len;
-                        } else {
-                            sample_pos = sample_count - 1;
-                        }
-                    }
-
-                    if (valid_loop && sample_pos >= loop_end) {
-                        long loop_len = loop_end - loop_start;
-                        sample_pos = loop_start +
-                            (sample_pos - loop_start) % loop_len;
-                    }
-
-                    if (sample_pos < 0 || sample_pos >= sample_count)
-                        continue;
-
-                    long data_index = sample_pos * stride;
-                    double amplitude;
-
-                    if (sp->flg & XMP_SAMPLE_16BIT) {
-                        const int16_t *pcm = (const int16_t *)sp->data;
-                        amplitude = pcm[data_index] / 32768.0;
-                    } else {
-                        const int8_t *pcm = (const int8_t *)sp->data;
-                        amplitude = pcm[data_index] / 128.0;
-                    }
-
-                    double py = mid - amplitude * 17.0;
-                    if (x == 0)
-                        cairo_move_to(cr, plot_left + x, py);
-                    else
-                        cairo_line_to(cr, plot_left + x, py);
-                }
-                cairo_stroke(cr);
-            }
+        cairo_set_source_rgb(cr, 0.20, 0.96, 0.48);
+        cairo_set_line_width(cr, 1.15);
+        for (int x = 0; x < points; ++x) {
+            double px = plot_left + (double)x * (plot_width - 1) / (points - 1);
+            double py = mid - waveform[ch][x] * 17.0;
+            if (x == 0) cairo_move_to(cr, px, py);
+            else cairo_line_to(cr, px, py);
         }
+        cairo_stroke(cr);
 
         /* Volume meter and channel metadata */
         int volume = ci->volume;
@@ -3137,7 +3145,6 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
         cairo_fill(cr);
     }
 
-    SDL_UnlockAudioDevice(audio_device);
     return FALSE;
 }
 
@@ -3764,6 +3771,8 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
         return FALSE;
     }
 
+    /* Snapshot visible events before drawing; never render under the audio lock. */
+    struct xmp_event events[13][XMP_MAX_CHANNELS] = {0};
     SDL_LockAudioDevice(audio_device);
 
     struct xmp_module_info mi;
@@ -3783,7 +3792,7 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
     }
 
     struct xmp_pattern *pat = mod->xxp[display_pattern];
-    int channels = mod->chn;
+    int channels = MIN(mod->chn, XMP_MAX_CHANNELS);
     if (channels < 1) {
         SDL_UnlockAudioDevice(audio_device);
         return FALSE;
@@ -3802,6 +3811,19 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
     if (first_row > total_rows - visible_rows)
         first_row = total_rows > visible_rows
                   ? total_rows - visible_rows : 0;
+
+    for (int visible = 0; visible < visible_rows; ++visible) {
+        int row = first_row + visible;
+        if (row >= total_rows) break;
+        for (int ch = 0; ch < channels; ++ch) {
+            if (left + (ch + 1) * channel_width > width) break;
+            int index = pat->index[ch];
+            if (index >= 0 && index < mod->trk && mod->xxt[index] &&
+                row < mod->xxt[index]->rows)
+                events[visible][ch] = mod->xxt[index]->event[row];
+        }
+    }
+    SDL_UnlockAudioDevice(audio_device);
 
     char heading[96];
     snprintf(heading, sizeof(heading),
@@ -3867,16 +3889,7 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
             if (x + channel_width > width)
                 break;
 
-            int track_index = pat->index[ch];
-            if (track_index < 0 || track_index >= mod->trk ||
-                !mod->xxt[track_index])
-                continue;
-
-            struct xmp_track *track = mod->xxt[track_index];
-            if (row >= track->rows)
-                continue;
-
-            struct xmp_event *ev = &track->event[row];
+            const struct xmp_event *ev = &events[visible][ch];
 
             char note[8] = "...";
             if (ev->note == XMP_KEY_OFF)
@@ -3926,7 +3939,6 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
         }
     }
 
-    SDL_UnlockAudioDevice(audio_device);
     return FALSE;
 }
 
@@ -4069,15 +4081,17 @@ static gboolean update_display(gpointer data)
     if (ended && !playlist_advance())
         update_play_button();
 
-    update_visualizer_spectrum();
+    if ((visualizer_area && gtk_widget_get_mapped(visualizer_area)) ||
+        (eq_graph_area && gtk_widget_get_mapped(eq_graph_area)))
+        update_visualizer_spectrum();
 
-    if (scope_area)
+    if (scope_area && gtk_widget_get_mapped(scope_area))
         gtk_widget_queue_draw(scope_area);
-    if (pattern_area)
+    if (pattern_area && gtk_widget_get_mapped(pattern_area))
         gtk_widget_queue_draw(pattern_area);
-    if (visualizer_area)
+    if (visualizer_area && gtk_widget_get_mapped(visualizer_area))
         gtk_widget_queue_draw(visualizer_area);
-    if (eq_graph_area)
+    if (eq_graph_area && gtk_widget_get_mapped(eq_graph_area))
         gtk_widget_queue_draw(eq_graph_area);
 
     return G_SOURCE_CONTINUE;
