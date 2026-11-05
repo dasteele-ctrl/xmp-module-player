@@ -55,36 +55,38 @@ nicknames for a classic terminal look. The parser can be checked using
 `make check-irc`; that command also performs a syntax check of the GTK/GIO
 source files.
 
-## Version 1.6.3
+## Version 1.6.4
 
-Version 1.6.3 fixes audio stuttering when **Show pattern & scopes** is enabled.
+Opening a track from the command line, a file manager, or **Open File** now starts playback immediately. The player appends new tracks to the current playlist and reuses the existing entry when you reopen the same path. **Add Files** queues tracks for later.
+
+Version 1.6.3 fixed audio stuttering when **Show pattern & scopes** is enabled.
 The pattern view and channel scopes now draw while playback continues.
 
-See the [v1.6.3 release](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.6.3) or the [v1.6 visualizer release notes](RELEASE_NOTES_1.6.md).
+See the [v1.6.4 release](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.6.4) or the [v1.6 visualizer release notes](RELEASE_NOTES_1.6.md).
 
-The Linux x86_64 AppImage passed packaging verification and desktop testing on
+The v1.6.3 Linux x86_64 AppImage passed packaging verification and desktop testing on
 Linux Mint 22.3 XFCE. Compatibility on other Linux systems has not yet been verified.
 Wavescope is credited to Signal Ridge Labs (MIT), and projectM uses LGPL-2.1;
 license notices and source references are included with the visualization assets.
 
 ## Download
 
-**[Download Modulez Player v1.6.3 for Linux x86_64](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.6.3/Modulez-Player-v1.6.3-Linux-x86_64.AppImage)**
+**[Download Modulez Player v1.6.4 for Linux x86_64](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.6.4/Modulez-Player-v1.6.4-Linux-x86_64.AppImage)**
 
-[Release notes and downloads](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.6.3).
+[Release notes and downloads](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.6.4).
 
 The AppImage includes the application launcher icon.
 See [all releases](../../releases) for earlier versions.
 
 ### Running the AppImage
 
-1. Download the versioned `Modulez-Player-v1.6.3-Linux-x86_64.AppImage` file from Release v1.6.3.
+1. Download the versioned `Modulez-Player-v1.6.4-Linux-x86_64.AppImage` file from Release v1.6.4.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x Modulez-Player-v1.6.3-Linux-x86_64.AppImage
-   ./Modulez-Player-v1.6.3-Linux-x86_64.AppImage
+   chmod +x Modulez-Player-v1.6.4-Linux-x86_64.AppImage
+   ./Modulez-Player-v1.6.4-Linux-x86_64.AppImage
    ```
 
 ### Add the player to your application menu
@@ -252,7 +254,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.6.3**
+**Current source version: 1.6.4**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and

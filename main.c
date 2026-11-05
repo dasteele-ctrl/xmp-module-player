@@ -25,7 +25,7 @@
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.6.3"
+#define MODULEZ_VERSION "1.6.4"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
@@ -2146,6 +2146,8 @@ static void on_hvsc_open_folder(GtkButton *button, gpointer data)
     g_free(folder);
 }
 
+static void open_playlist_file(const char *filename);
+
 static void on_open(GtkButton *button, gpointer data)
 {
     (void)button;
@@ -2192,14 +2194,7 @@ static void on_open(GtkButton *button, gpointer data)
         char *filename =
             gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
         if (filename) {
-            if (is_midi_path(filename)) {
-                open_midi(filename);
-            } else {
-                open_module(filename);
-                if (!zx_is_music_path(filename) && !module_loaded &&
-                    !open_sid(filename) && !open_uade(filename))
-                    open_ffmpeg_audio(filename);
-            }
+            open_playlist_file(filename);
             g_free(filename);
         }
     }
@@ -3693,6 +3688,37 @@ static gboolean playlist_play_index(gint index)
     return TRUE;
 }
 
+static gint playlist_find_file(const char *filename)
+{
+    GtkTreeModel *model = GTK_TREE_MODEL(playlist_store);
+    GtkTreeIter iter;
+    gint index = 0;
+    for (gboolean valid = gtk_tree_model_get_iter_first(model, &iter); valid;
+         valid = gtk_tree_model_iter_next(model, &iter), ++index) {
+        gchar *entry = NULL;
+        gtk_tree_model_get(model, &iter, 1, &entry, -1);
+        gboolean matches = g_strcmp0(entry, filename) == 0;
+        g_free(entry);
+        if (matches)
+            return index;
+    }
+    return -1;
+}
+
+static void open_playlist_file(const char *filename)
+{
+    gint index = playlist_find_file(filename);
+    if (index < 0) {
+        GtkTreeIter iter;
+        gchar *base = g_path_get_basename(filename);
+        index = gtk_tree_model_iter_n_children(GTK_TREE_MODEL(playlist_store), NULL);
+        gtk_list_store_insert_with_values(playlist_store, &iter, index,
+                                          0, base, 1, filename, -1);
+        g_free(base);
+    }
+    playlist_play_index(index);
+}
+
 /* Both the main and tray Previous/Next controls navigate playlist files,
  * not positions or subtunes within an individual file. */
 static gboolean playlist_skip_track(gint direction)
@@ -3705,21 +3731,8 @@ static gboolean playlist_skip_track(gint direction)
     if (count == 0)
         return FALSE;
 
-    gint current_index = -1;
+    gint current_index = playlist_find_file(current_file);
     GtkTreeIter iter;
-    for (gint i = 0; i < count; ++i) {
-        if (!gtk_tree_model_iter_nth_child(model, &iter, NULL, i))
-            continue;
-        gchar *filename = NULL;
-        gtk_tree_model_get(model, &iter, 1, &filename, -1);
-        gboolean matches = current_file[0] &&
-                           g_strcmp0(filename, current_file) == 0;
-        g_free(filename);
-        if (matches) {
-            current_index = i;
-            break;
-        }
-    }
 
     GtkTreeSelection *selection = gtk_tree_view_get_selection(
         GTK_TREE_VIEW(playlist_view));
@@ -5671,14 +5684,7 @@ static int on_launch(GApplication *app, GApplicationCommandLine *command, gpoint
         gchar *path = g_file_get_path(file);
         g_object_unref(file);
         if (path) {
-            if (is_midi_path(path)) {
-                open_midi(path);
-            } else {
-                open_module(path);
-                if (!zx_is_music_path(path) && !module_loaded &&
-                    !open_sid(path))
-                    open_ffmpeg_audio(path);
-            }
+            open_playlist_file(path);
             g_free(path);
         }
     }
