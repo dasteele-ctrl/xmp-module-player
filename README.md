@@ -9,7 +9,7 @@ A native Linux music player built with **GTK3 and SDL2**, with playback powered 
 
 Modulez Player brings classic tracker music and regular audio playback to the Linux desktop, with a graphical interface, real-time audio visualization, and detailed module and sample information.
 
-![Modulez Player 1.6 showing the Player tab](modulez-player-1.6.png)
+![Modulez Player 1.6 showing the Player tab](1.6.3.png)
 
 ## Features
 
