@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Modulez Player v1.6.4 AppImage: WebKit runtime, bundled visualizer assets, UADE and SoundFont.
+# Modulez Player v1.6.5 AppImage: WebKit runtime, bundled visualizer assets, UADE and SoundFont.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,8 +13,8 @@ if [[ ! -x "$project_dir/modulez-player" ]]; then
     echo "Missing modulez-player. Build the native player with: make -j4" >&2
     exit 1
 fi
-if ! grep -aFq 'Modulez Player 1.6.4' "$project_dir/modulez-player"; then
-    echo "The compiled player does not report version 1.6.4. Run make -j4 modulez-player first." >&2
+if ! grep -aFq 'Modulez Player 1.6.5' "$project_dir/modulez-player"; then
+    echo "The compiled player does not report version 1.6.5. Run make -j4 modulez-player first." >&2
     exit 1
 fi
 if [[ ! -x "$project_dir/xmp-zx-helper" ]]; then
@@ -32,6 +32,12 @@ fi
 for command in pkg-config python3 patchelf gresource; do
     command -v "$command" >/dev/null || { echo "Missing build tool: $command" >&2; exit 1; }
 done
+pipewire_libdir="$(pkg-config --variable=libdir libpipewire-0.3)"
+pipewire_library="$pipewire_libdir/libpipewire-0.3.so.0"
+if [[ ! -f "$pipewire_library" ]]; then
+    echo "Missing PipeWire runtime library: $pipewire_library" >&2
+    exit 1
+fi
 webkit_libdir="$(pkg-config --variable=libdir webkit2gtk-4.1)"
 webkit_helper_dir="$webkit_libdir/webkit2gtk-4.1"
 if [[ ! -x "$webkit_helper_dir/WebKitWebProcess" ]]; then
@@ -117,7 +123,7 @@ fi
 mkdir -p -- "$dist_dir"
 build_root="$(mktemp -d /tmp/xmp-appimage.XXXXXXXX)"
 appdir="$build_root/Modulez_Player.AppDir"
-output_name="Modulez-Player-v1.6.4-Linux-x86_64.AppImage"
+output_name="Modulez-Player-v1.6.5-x86_64.AppImage"
 
 cleanup() {
     if [[ -n "${build_root:-}" && -d "$build_root" &&
@@ -139,6 +145,7 @@ fi
         --executable "$project_dir/modulez-player" \
         --executable "$project_dir/xmp-zx-helper" \
         --executable "$uade_core" \
+        --library "$pipewire_library" \
         "${hvsc_utilities[@]}" \
         "${webkit_utilities[@]}" \
         --desktop-file "$script_dir/modulez-player.desktop" \
@@ -219,7 +226,7 @@ verify_bundle() {
         echo "Bundle verification failed: UADE core or player data missing." >&2
         return 1
     fi
-    for library in libuade libbencodetools libfluidsynth libwebkit2gtk-4.1 libjavascriptcoregtk-4.1 libsoup-3.0; do
+    for library in libuade libbencodetools libfluidsynth libwebkit2gtk-4.1 libjavascriptcoregtk-4.1 libsoup-3.0 libpipewire-0.3; do
         if [[ -z "$(find "$bundle/usr" -type f -name "$library.so*" -print -quit)" ]]; then
             echo "Bundle verification failed: missing $library." >&2
             return 1

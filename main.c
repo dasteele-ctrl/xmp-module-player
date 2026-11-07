@@ -25,7 +25,7 @@
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.6.4"
+#define MODULEZ_VERSION "1.6.5"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
@@ -51,6 +51,8 @@ static int player_started = 0;
 static int playing = 0;
 static int stopped = 0;
 static int audio_ended = 0;
+typedef enum { REPEAT_OFF, REPEAT_ALL, REPEAT_ONE } RepeatMode;
+static RepeatMode repeat_mode = REPEAT_OFF;
 static int updating_seek = 0;
 static int master_volume = 100;
 static XmpEqualizer equalizer;
@@ -3617,6 +3619,20 @@ static gboolean playlist_advance(void)
     if (!playlist_store || !current_file[0])
         return FALSE;
 
+    if (repeat_mode == REPEAT_ONE) {
+        /* Restart the selected subsong when the engine supports it. */
+        if (playback_mode == PLAYBACK_MODULE ||
+            playback_mode == PLAYBACK_SID ||
+            playback_mode == PLAYBACK_MIDI)
+            on_play(NULL, NULL);
+        else {
+            char filename[sizeof(current_file)];
+            g_strlcpy(filename, current_file, sizeof(filename));
+            play_playlist_file(filename);
+        }
+        return playing || zx_pending != NULL;
+    }
+
     GtkTreeModel *model = GTK_TREE_MODEL(playlist_store);
     GtkTreeIter iter;
     gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
@@ -3630,8 +3646,11 @@ static gboolean playlist_advance(void)
         g_free(filename);
 
         if (matches) {
-            if (!gtk_tree_model_iter_next(model, &iter))
-                return FALSE;
+            if (!gtk_tree_model_iter_next(model, &iter)) {
+                if (repeat_mode != REPEAT_ALL ||
+                    !gtk_tree_model_get_iter_first(model, &iter))
+                    return FALSE;
+            }
 
             char *next_file = NULL;
             gtk_tree_model_get(model, &iter, 1, &next_file, -1);
@@ -4640,6 +4659,11 @@ static void load_preferences(void)
             minimize_to_tray = value;
         g_clear_error(&error);
     }
+    if (g_key_file_has_key(settings, "Playback", "repeat-mode", NULL)) {
+        gint mode = g_key_file_get_integer(settings, "Playback", "repeat-mode", NULL);
+        if (mode >= REPEAT_OFF && mode <= REPEAT_ONE)
+            repeat_mode = (RepeatMode)mode;
+    }
     g_key_file_free(settings);
     g_free(path);
 }
@@ -4651,6 +4675,7 @@ static void save_preferences(void)
     GKeyFile *settings = g_key_file_new();
     g_key_file_set_boolean(settings, "Window", "minimize-to-tray",
                            minimize_to_tray);
+    g_key_file_set_integer(settings, "Playback", "repeat-mode", repeat_mode);
 
     if (g_mkdir_with_parents(directory, 0700) == 0) {
         gsize length = 0;
@@ -4668,6 +4693,44 @@ static void save_preferences(void)
     g_key_file_free(settings);
     g_free(directory);
     g_free(path);
+}
+
+static void on_playlist_repeat_mode(GtkCheckMenuItem *item, gpointer data)
+{
+    if (!gtk_check_menu_item_get_active(item))
+        return;
+    repeat_mode = (RepeatMode)GPOINTER_TO_INT(data);
+    save_preferences();
+}
+
+static gboolean on_playlist_button_press(GtkWidget *widget,
+                                         GdkEventButton *event, gpointer data)
+{
+    (void)widget;
+    (void)data;
+    if (event->type != GDK_BUTTON_PRESS || event->button != GDK_BUTTON_SECONDARY)
+        return FALSE;
+
+    GtkWidget *menu = gtk_menu_new();
+    GtkWidget *heading = gtk_menu_item_new_with_label("Playlist repeat");
+    gtk_widget_set_sensitive(heading, FALSE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), heading);
+
+    const char *names[] = { "Off", "All", "One (current song/subsong)" };
+    GSList *group = NULL;
+    for (int i = REPEAT_OFF; i <= REPEAT_ONE; ++i) {
+        GtkWidget *item = gtk_radio_menu_item_new_with_label(group, names[i]);
+        group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(item));
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item), i == repeat_mode);
+        g_signal_connect(item, "toggled", G_CALLBACK(on_playlist_repeat_mode),
+                         GINT_TO_POINTER(i));
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    }
+    g_signal_connect_swapped(menu, "selection-done",
+                             G_CALLBACK(gtk_widget_destroy), menu);
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
+    return TRUE;
 }
 
 static void on_minimize_to_tray_changed(GtkToggleButton *button, gpointer data)
@@ -5046,6 +5109,7 @@ static int create_player(void)
     gtk_box_pack_start(GTK_BOX(controls),
         make_button("▶|", G_CALLBACK(on_next)), FALSE, FALSE, 0);
 
+
     GtkWidget *volume_label = gtk_label_new("Volume");
     gtk_box_pack_start(GTK_BOX(controls), volume_label, FALSE, FALSE, 0);
     volume_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 100, 1);
@@ -5098,6 +5162,8 @@ static int create_player(void)
         gtk_tree_model_filter_new(GTK_TREE_MODEL(playlist_store), NULL));
     gtk_tree_model_filter_set_visible_func(playlist_filter, playlist_row_matches, NULL, NULL);
     playlist_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(playlist_filter));
+    g_signal_connect(playlist_view, "button-press-event",
+                     G_CALLBACK(on_playlist_button_press), NULL);
     g_object_unref(playlist_filter); /* The view now owns the model. */
 
     GtkWidget *search_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
@@ -5623,6 +5689,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         "Built-in IRC chat\n"
         "System tray playback controls\n"
         "Recursive music-folder importing\n"
+        "Playlist repeat: Off, All, or One via right-click\n"
         "High Voltage SID Collection (HVSC) browsing\n"
         "and integrated collection downloader.");
     gtk_widget_set_name(about_description, "about-description");
