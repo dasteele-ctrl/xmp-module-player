@@ -27,7 +27,24 @@ let tone=false,lastPaint=0,analysis=newAnalysisState();
 const N=2048,ring=new Float32Array(N),re=new Float64Array(N),im=new Float64Array(N);
 const fft=new Uint8Array(N/2),wave=new Uint8Array(N),smoothed=new Float64Array(N/2);let write=0;
 function add(v){ring[write]=v;write=(write+1)%N;}
-window.modulezBridge={setVisible(value){visible=!!value;if(!visible){ring.fill(0);window.modulezProjectM?.clearAudio();}},feed(encoded){
+function setToolbarTheme(colors){
+ const paint=(element,properties)=>{
+  if(!element)return;
+  for(const [name,value] of Object.entries(properties))
+   element.style.setProperty(name,value,'important');
+ };
+ const header=document.querySelector('header');
+ paint(header,{'background-color':colors.panel,'border-color':colors.selection,'color':'#e6e6e6'});
+ for(const el of header.querySelectorAll('button,select,option,optgroup'))
+  paint(el,{'background-color':colors.panel,'border-color':colors.selection,'color':'#e6e6e6'});
+ paint(header.querySelector('strong'),{'color':colors.accent});
+ for(const el of header.querySelectorAll('.preset-links a'))
+  paint(el,{'color':colors.accent});
+ paint(document.getElementById('presetMenu'),{'background-color':colors.panel,'border-color':colors.selection});
+}
+window.modulezBridge={setVisible(value){visible=!!value;if(!visible){ring.fill(0);window.modulezProjectM?.clearAudio();}},
+ setToolbarTheme,
+ feed(encoded){
  try{
   const raw=atob(encoded);const s16=o=>{let v=raw.charCodeAt(o)|(raw.charCodeAt(o+1)<<8);return (v>=32768?v-65536:v)/32768;};
   for(let i=0;i+3<raw.length;i+=4)add((s16(i)+s16(i+2))/2);

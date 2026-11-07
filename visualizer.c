@@ -14,6 +14,34 @@ typedef struct {
     gboolean shown, ready, busy, destroyed, importing;
 } Visualizer;
 static Visualizer *active_visualizer;
+static gchar *toolbar_theme_command;
+static void toolbar_theme_done(GObject *object, GAsyncResult *result, gpointer data)
+{
+    (void)data;
+    GError *error = NULL;
+    JSCValue *value = webkit_web_view_evaluate_javascript_finish(
+        WEBKIT_WEB_VIEW(object), result, &error);
+    g_clear_object(&value);
+    if (error && !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        g_warning("Visualizer toolbar theme: %s", error->message);
+    g_clear_error(&error);
+}
+static void send_toolbar_theme(Visualizer *v)
+{
+    if (v && !v->destroyed && v->web && v->ready && toolbar_theme_command)
+        webkit_web_view_evaluate_javascript(v->web, toolbar_theme_command,
+            -1, NULL, NULL, v->cancel, toolbar_theme_done, NULL);
+}
+void modulez_visualizer_set_toolbar_theme(const char *panel,
+                                        const char *selection,
+                                        const char *accent)
+{
+    g_free(toolbar_theme_command);
+    toolbar_theme_command = g_strdup_printf(
+        "window.modulezBridge?.setToolbarTheme({panel:'%s',selection:'%s',accent:'%s'})",
+        panel, selection, accent);
+    send_toolbar_theme(active_visualizer);
+}
 static gboolean (*skip_track_callback)(gint);
 void modulez_visualizer_set_track_navigation(gboolean (*skip_track)(gint))
 {
@@ -347,6 +375,7 @@ static void script_message(WebKitUserContentManager *manager, WebKitJavascriptRe
         if (skip_track_callback) skip_track_callback(1);
     } else if (g_str_has_prefix(text, "Local Wavescope ready")) {
         v->ready = TRUE;
+        send_toolbar_theme(v);
         send_visible(v);
         modulez_vis_pcm_enable(v->shown);
         gtk_label_set_text(GTK_LABEL(v->message), "Wavescope • direct player audio");
@@ -555,7 +584,15 @@ GtkWidget *modulez_visualizer_page_new(void)
     gtk_box_pack_start(GTK_BOX(v->page), bar, FALSE, FALSE, 4);
     GtkWidget *hint = gtk_label_new("Tip: Right-click the visualization for modes, song controls, and fullscreen (F11).");
     gtk_label_set_xalign(GTK_LABEL(hint), 0);
-    gtk_style_context_add_class(gtk_widget_get_style_context(hint), "dim-label");
+    /* Match the 12px monospace status text inside the WebKit toolbar. */
+    gtk_widget_set_name(hint, "visualizer-hint");
+    GtkCssProvider *hint_style = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(hint_style,
+        "#visualizer-hint { font-family: monospace; font-size: 12px; color: #819fa2; }",
+        -1, NULL);
+    gtk_style_context_add_provider(gtk_widget_get_style_context(hint),
+        GTK_STYLE_PROVIDER(hint_style), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 2);
+    g_object_unref(hint_style);
     gtk_box_pack_start(GTK_BOX(v->page), hint, FALSE, FALSE, 2);
     g_signal_connect(v->page, "map", G_CALLBACK(page_mapped), v);
     g_signal_connect(v->page, "unmap", G_CALLBACK(page_unmapped), v);
