@@ -18,6 +18,7 @@
 #include "xmp_irc_widget.h"
 #include "tray_icon.h"
 #include "visualizer.h"
+static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event, gpointer data);
 #ifdef ENABLE_WAV_EXPORT
 #include "export_wav.h"
 #endif
@@ -4990,6 +4991,8 @@ static int create_player(void)
         "/org/helllabs/xmp/icons/xmp.png", 192, 192, TRUE, NULL);
 
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    g_signal_connect(window, "key-press-event",
+                     G_CALLBACK(on_visualizer_shortcut), NULL);
     gtk_window_set_title(GTK_WINDOW(window), "Modulez Player " MODULEZ_VERSION);
 
     /* Size the initial window to the monitor's usable area. GTK will not
@@ -5600,6 +5603,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     /* Classic IRC chat, using the same GTK notebook and dark theme. */
     xmp_irc_add_notebook_page(GTK_NOTEBOOK(notebook));
 
+    modulez_visualizer_set_track_navigation(playlist_skip_track);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
         modulez_visualizer_page_new(),
         compact_tab_label("Vis", "Wavescope visualization and projectM / MilkDrop"));
@@ -5758,6 +5762,15 @@ static int on_launch(GApplication *app, GApplicationCommandLine *command, gpoint
     g_strfreev(argv);
     on_tray_show(NULL);
     return 0;
+}
+
+static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event,
+                                       gpointer data)
+{
+    (void)widget; (void)data;
+    if (event->keyval == GDK_KEY_F11)
+        return modulez_visualizer_toggle_fullscreen();
+    return FALSE;
 }
 
 int main(int argc, char **argv)

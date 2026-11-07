@@ -6,13 +6,20 @@
 
 typedef struct {
     guint refs, timer;
-    GtkWidget *page, *message;
+    GtkWidget *page, *message, *fullscreen, *fullscreen_button;
     WebKitWebView *web;
     SoupServer *server;
     GCancellable *cancel;
     gchar *base;
     gboolean shown, ready, busy, destroyed, importing;
 } Visualizer;
+static Visualizer *active_visualizer;
+static gboolean (*skip_track_callback)(gint);
+void modulez_visualizer_set_track_navigation(gboolean (*skip_track)(gint))
+{
+    skip_track_callback = skip_track;
+}
+static void toggle_fullscreen(Visualizer *v);
 static Visualizer *vis_ref(Visualizer *v) { v->refs++; return v; }
 static void vis_unref(Visualizer *v)
 {
@@ -330,6 +337,14 @@ static void script_message(WebKitUserContentManager *manager, WebKitJavascriptRe
     gchar *text = jsc_value_to_string(webkit_javascript_result_get_js_value(result));
     if (!strcmp(text, "import-milk-presets")) {
         import_presets(v);
+    } else if (!strcmp(text, "toggle-fullscreen")) {
+        toggle_fullscreen(v);
+    } else if (!strcmp(text, "exit-fullscreen")) {
+        if (v->fullscreen) toggle_fullscreen(v);
+    } else if (!strcmp(text, "previous-song")) {
+        if (skip_track_callback) skip_track_callback(-1);
+    } else if (!strcmp(text, "next-song")) {
+        if (skip_track_callback) skip_track_callback(1);
     } else if (g_str_has_prefix(text, "Local Wavescope ready")) {
         v->ready = TRUE;
         send_visible(v);
@@ -430,9 +445,82 @@ static void page_unmapped(GtkWidget *page, gpointer data)
     discard_pcm();
     send_visible(v);
 }
+static gboolean fullscreen_key(GtkWidget *widget, GdkEventKey *event, gpointer data)
+{
+    (void)widget;
+    Visualizer *v = data;
+    if (event->keyval == GDK_KEY_Escape || event->keyval == GDK_KEY_F11) {
+        if (v->fullscreen) {
+            toggle_fullscreen(v);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+static gboolean fullscreen_delete(GtkWidget *widget, GdkEvent *event, gpointer data)
+{
+    (void)widget; (void)event;
+    Visualizer *v = data;
+    if (v->fullscreen) toggle_fullscreen(v);
+    return TRUE;
+}
+static void toggle_fullscreen(Visualizer *v)
+{
+    if (!v || v->destroyed || !v->web) return;
+    GtkWidget *view = GTK_WIDGET(v->web);
+    GtkWidget *old_parent = gtk_widget_get_parent(view);
+    if (!old_parent) return;
+    /* Retain the same WebKit instance: its JS state and current preset survive. */
+    g_object_ref(view);
+    gtk_container_remove(GTK_CONTAINER(old_parent), view);
+    if (v->fullscreen) {
+        GtkWidget *fullscreen = v->fullscreen;
+        v->fullscreen = NULL;
+        gtk_box_pack_start(GTK_BOX(v->page), view, TRUE, TRUE, 0);
+        gtk_widget_show(view);
+        gtk_widget_destroy(fullscreen);
+        gtk_button_set_label(GTK_BUTTON(v->fullscreen_button), "Fullscreen Vis");
+    } else {
+        GtkWidget *fullscreen = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+        v->fullscreen = fullscreen;
+        gtk_window_set_title(GTK_WINDOW(fullscreen), "Modulez Player — Visualizer");
+        gtk_window_set_default_size(GTK_WINDOW(fullscreen), 960, 600);
+        g_signal_connect(fullscreen, "delete-event", G_CALLBACK(fullscreen_delete), v);
+        g_signal_connect(fullscreen, "key-press-event", G_CALLBACK(fullscreen_key), v);
+        gtk_container_add(GTK_CONTAINER(fullscreen), view);
+        gtk_widget_show_all(fullscreen);
+        gtk_window_fullscreen(GTK_WINDOW(fullscreen));
+        gtk_button_set_label(GTK_BUTTON(v->fullscreen_button), "Exit Fullscreen");
+    }
+    g_object_unref(view);
+    /* Hide the web toolbar and expose the current mode to context-menu JS. */
+    webkit_web_view_evaluate_javascript(v->web,
+        v->fullscreen ? "document.querySelector('header').hidden=true;document.body.dataset.fullscreen='true'" :
+                        "document.querySelector('header').hidden=false;document.body.dataset.fullscreen='false'",
+        -1, NULL, NULL, v->cancel, NULL, NULL);
+}
+gboolean modulez_visualizer_toggle_fullscreen(void)
+{
+    Visualizer *v = active_visualizer;
+    if (!v || v->destroyed || !v->web) return FALSE;
+    if (!v->fullscreen && !gtk_widget_get_mapped(v->page)) return FALSE;
+    toggle_fullscreen(v);
+    return TRUE;
+}
+static void fullscreen_clicked(GtkButton *button, gpointer data)
+{
+    (void)button;
+    toggle_fullscreen(data);
+}
 static void page_destroyed(GtkWidget *page, gpointer data)
 {
     Visualizer *v = data;
+    if (v->fullscreen) {
+        GtkWidget *fullscreen = v->fullscreen;
+        v->fullscreen = NULL;
+        gtk_widget_destroy(fullscreen);
+    }
+    if (active_visualizer == v) active_visualizer = NULL;
     g_signal_handlers_disconnect_by_data(page, v);
     v->destroyed = TRUE;
     modulez_vis_pcm_enable(FALSE);
@@ -449,6 +537,7 @@ static void page_destroyed(GtkWidget *page, gpointer data)
 GtkWidget *modulez_visualizer_page_new(void)
 {
     Visualizer *v = g_new0(Visualizer, 1);
+    active_visualizer = v;
     v->refs = 1;
     v->cancel = g_cancellable_new();
     v->page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
@@ -460,7 +549,14 @@ GtkWidget *modulez_visualizer_page_new(void)
     GtkWidget *reload = gtk_button_new_with_label("Reload Vis");
     g_signal_connect(reload, "clicked", G_CALLBACK(reload_clicked), v);
     gtk_box_pack_end(GTK_BOX(bar), reload, FALSE, FALSE, 6);
+    v->fullscreen_button = gtk_button_new_with_label("Fullscreen Vis");
+    g_signal_connect(v->fullscreen_button, "clicked", G_CALLBACK(fullscreen_clicked), v);
+    gtk_box_pack_end(GTK_BOX(bar), v->fullscreen_button, FALSE, FALSE, 6);
     gtk_box_pack_start(GTK_BOX(v->page), bar, FALSE, FALSE, 4);
+    GtkWidget *hint = gtk_label_new("Tip: Right-click the visualization for modes, song controls, and fullscreen (F11).");
+    gtk_label_set_xalign(GTK_LABEL(hint), 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(hint), "dim-label");
+    gtk_box_pack_start(GTK_BOX(v->page), hint, FALSE, FALSE, 2);
     g_signal_connect(v->page, "map", G_CALLBACK(page_mapped), v);
     g_signal_connect(v->page, "unmap", G_CALLBACK(page_unmapped), v);
     g_signal_connect(v->page, "destroy", G_CALLBACK(page_destroyed), v);

@@ -97,13 +97,47 @@ async function changePreset(direction){
  else if(direction==='previous')index=(index+ids.length-1)%ids.length;
  presetSelect.value=ids[index];await presetSelect.onchange();
 }
+function changeWavescopeMode(direction){
+ const select=document.getElementById('mode');
+ const count=select.options.length;
+ if(!count)return;
+ let index=select.selectedIndex;
+ if(direction==='random'&&count>1)
+  index=(index+1+Math.floor(Math.random()*(count-1)))%count;
+ else if(direction==='next')index=(index+1)%count;
+ else if(direction==='previous')index=(index+count-1)%count;
+ select.selectedIndex=index;
+ select.dispatchEvent(new Event('change',{bubbles:true}));
+}
 const menu=document.getElementById('presetMenu');
+function menuCommand(label,command){
+ const button=document.createElement('button');
+ button.type='button';button.setAttribute('role','menuitem');button.textContent=label;
+ button.onclick=()=>{closeMenu();report(command);};
+ menu.appendChild(button);
+ return button;
+}
+const previousSongItem=menuCommand('Previous Song    Ctrl+←','previous-song');
+previousSongItem.style.borderTop='1px solid #34616a';
+const nextSongItem=menuCommand('Next Song    Ctrl+→','next-song');
+const fullscreenItem=menuCommand('Enter Fullscreen    F11','toggle-fullscreen');
+fullscreenItem.style.borderTop='1px solid #34616a';
 function closeMenu(){menu.hidden=true;}
-for(const button of menu.querySelectorAll('[data-preset-action]'))button.onclick=()=>{closeMenu();void changePreset(button.dataset.presetAction);};
+for(const button of menu.querySelectorAll('[data-preset-action]'))button.onclick=()=>{
+ closeMenu();
+ if(active)void changePreset(button.dataset.presetAction);
+ else changeWavescopeMode(button.dataset.presetAction);
+};
 document.getElementById('menuImport').onclick=()=>{closeMenu();report('import-milk-presets');};
 for(const canvas of [scope,glCanvas])canvas.addEventListener('contextmenu',event=>{
  event.preventDefault();
- for(const button of menu.querySelectorAll('[data-preset-action]'))button.disabled=!active;
+ for(const button of menu.querySelectorAll('[data-preset-action]')){
+  const action=button.dataset.presetAction;
+  button.disabled=active?!library.size:!document.getElementById('mode').options.length;
+  button.textContent=(action==='previous'?'Previous ':action==='next'?'Next ':'Random ')+(active?'Preset':'Mode');
+ }
+ document.getElementById('menuImport').hidden=!active;
+ fullscreenItem.textContent=(document.body.dataset.fullscreen==='true'?'Exit Fullscreen':'Enter Fullscreen')+'    F11';
  menu.hidden=false;
  menu.style.left=Math.max(0,Math.min(event.clientX,innerWidth-menu.offsetWidth-8))+'px';
  menu.style.top=Math.max(0,Math.min(event.clientY,innerHeight-menu.offsetHeight-8))+'px';

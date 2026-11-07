@@ -3,6 +3,18 @@ const {MODES, DEFAULT_MODE}=wsRequire('modes/index');
 const {PALETTES}=wsRequire('palettes');
 const {analyzeFrame,newAnalysisState}=wsRequire('analyze');
 const canvas=document.getElementById('scope'), ctx=canvas.getContext('2d');
+// The native GTK host owns the fullscreen window. Keep the rendering context
+// and active preset in this same WebKit page when switching modes.
+document.querySelector('main').addEventListener('dblclick', e=>{
+ if(e.target.tagName==='CANVAS') report('toggle-fullscreen');
+});
+document.addEventListener('keydown', e=>{
+ if(e.ctrlKey&&!e.altKey&&!e.metaKey&&(e.key==='ArrowLeft'||e.key==='ArrowRight')){
+  e.preventDefault();report(e.key==='ArrowLeft'?'previous-song':'next-song');
+ }
+ else if(e.key==='F11') {e.preventDefault();report('toggle-fullscreen');}
+ else if(e.key==='Escape') report('exit-fullscreen');
+});
 const modeSelect=document.getElementById('mode'),paletteSelect=document.getElementById('palette');
 const status=document.getElementById('status');
 for(const m of MODES)modeSelect.add(new Option(m.name,m.id));
