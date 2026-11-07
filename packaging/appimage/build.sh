@@ -87,8 +87,17 @@ done
 
 # Validate required assets before collecting any libraries. The SoundFont
 # defaults match the existing, reviewed MS Basic bank used for earlier builds.
-source_font="${XMP_BUNDLED_SOUNDFONT:-$HOME/Music/SoundFonts/MS Basic.sf3}"
-source_notice="${XMP_BUNDLED_SOUNDFONT_LICENSE:-$HOME/Music/SoundFonts/MS Basic_License.md}"
+# Locate the bundled SoundFont and its license.
+# Explicit environment variables always take priority.
+soundfont_dir="$HOME/Projects/XMP Dev Misc Files"
+
+if [[ ! -s "$soundfont_dir/MS Basic.sf3" ||
+      ! -s "$soundfont_dir/MS Basic_License.md" ]]; then
+    soundfont_dir="$HOME/Music/SoundFonts"
+fi
+
+source_font="${XMP_BUNDLED_SOUNDFONT:-$soundfont_dir/MS Basic.sf3}"
+source_notice="${XMP_BUNDLED_SOUNDFONT_LICENSE:-$soundfont_dir/MS Basic_License.md}"
 if [[ ! -s "$source_font" || ! -s "$source_notice" ]]; then
     echo "The bundled SoundFont and its license are required." >&2
     echo "SoundFont: $source_font" >&2

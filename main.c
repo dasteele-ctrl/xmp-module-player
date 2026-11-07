@@ -100,6 +100,7 @@ static GtkWidget *visualizer_area;
 static GdkRGBA mini_viz_background = {0.141, 0.141, 0.141, 1};
 static GdkRGBA mini_viz_accent = {0.08, 0.86, 1.0, 1};
 static GdkRGBA mini_viz_accent_second = {0.56, 0.34, 1.0, 1};
+static GdkRGBA eq_theme_accent = {0.467, 0.467, 0.467, 1};
 static GtkWidget *eq_graph_area;
 static GtkWidget *eq_band_scales[XMP_EQ_BANDS];
 static GtkWidget *eq_preamp_scale;
@@ -4360,8 +4361,11 @@ static gboolean eq_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
     const double plot_h = MAX(1.0, bottom - top);
 
     cairo_pattern_t *background = cairo_pattern_create_linear(0, 0, 0, height);
-    cairo_pattern_add_color_stop_rgb(background, 0, .029, .077, .098);
-    cairo_pattern_add_color_stop_rgb(background, 1, .017, .049, .063);
+    cairo_pattern_add_color_stop_rgb(background, 0,
+        mini_viz_background.red, mini_viz_background.green, mini_viz_background.blue);
+    cairo_pattern_add_color_stop_rgb(background, 1,
+        mini_viz_background.red * .7, mini_viz_background.green * .7,
+        mini_viz_background.blue * .7);
     cairo_set_source(cr, background);
     cairo_paint(cr);
     cairo_pattern_destroy(background);
@@ -4371,7 +4375,8 @@ static gboolean eq_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
     cairo_set_font_size(cr, 10.5);
     for (int db = -12; db <= 12; db += 6) {
         double y = top + (12.0 - db) / 24.0 * plot_h;
-        cairo_set_source_rgba(cr, .32, .68, .7, db == 0 ? .35 : .14);
+        cairo_set_source_rgba(cr, eq_theme_accent.red, eq_theme_accent.green,
+                              eq_theme_accent.blue, db == 0 ? .35 : .14);
         cairo_set_line_width(cr, db == 0 ? 1.1 : .7);
         cairo_move_to(cr, left, y);
         cairo_line_to(cr, right, y);
@@ -4387,7 +4392,8 @@ static gboolean eq_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
     const double loglow = log(20), logspan = log(20000.0 / 20.0);
     for (int i = 0; i < XMP_EQ_BANDS; ++i) {
         double x = left + (log(marks[i]) - loglow) / logspan * plot_w;
-        cairo_set_source_rgba(cr, .31, .62, .64, .12);
+        cairo_set_source_rgba(cr, eq_theme_accent.red, eq_theme_accent.green,
+                              eq_theme_accent.blue, .12);
         cairo_move_to(cr, x, top);
         cairo_line_to(cr, x, bottom);
         cairo_stroke(cr);
@@ -4402,8 +4408,10 @@ static gboolean eq_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
         double x0 = left + (i + .22) * plot_w / VIZ_BANDS;
         double bar_h = level * plot_h * .7;
         cairo_pattern_t *bar = cairo_pattern_create_linear(0, bottom - bar_h, 0, bottom);
-        cairo_pattern_add_color_stop_rgba(bar, 0, .22, .94, .88, .12);
-        cairo_pattern_add_color_stop_rgba(bar, 1, .12, .64, .67, .02);
+        cairo_pattern_add_color_stop_rgba(bar, 0,
+            eq_theme_accent.red, eq_theme_accent.green, eq_theme_accent.blue, .12);
+        cairo_pattern_add_color_stop_rgba(bar, 1,
+            eq_theme_accent.red, eq_theme_accent.green, eq_theme_accent.blue, .02);
         cairo_set_source(cr, bar);
         cairo_rectangle(cr, x0, bottom - bar_h, plot_w / VIZ_BANDS * .58, bar_h);
         cairo_fill(cr);
@@ -4427,13 +4435,16 @@ static gboolean eq_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
     cairo_line_to(cr, curve_x[points], bottom);
     cairo_close_path(cr);
     cairo_pattern_t *fill = cairo_pattern_create_linear(0, top, 0, bottom);
-    cairo_pattern_add_color_stop_rgba(fill, 0, .1, .94, .83, .21);
-    cairo_pattern_add_color_stop_rgba(fill, 1, .1, .65, .70, .015);
+    cairo_pattern_add_color_stop_rgba(fill, 0,
+        eq_theme_accent.red, eq_theme_accent.green, eq_theme_accent.blue, .21);
+    cairo_pattern_add_color_stop_rgba(fill, 1,
+        eq_theme_accent.red, eq_theme_accent.green, eq_theme_accent.blue, .015);
     cairo_set_source(cr, fill);
     cairo_fill(cr);
     cairo_pattern_destroy(fill);
     for (int glow = 5; glow >= 1; --glow) {
-        cairo_set_source_rgba(cr, .13, .94, .91, glow == 1 ? .93 : .045);
+        cairo_set_source_rgba(cr, eq_theme_accent.red, eq_theme_accent.green,
+                              eq_theme_accent.blue, glow == 1 ? .93 : .045);
         cairo_set_line_width(cr, glow == 1 ? 2.0 : glow * 2.7);
         cairo_move_to(cr, curve_x[0], curve_y[0]);
         for (int i = 1; i <= points; ++i)
@@ -4606,11 +4617,27 @@ static void update_custom_theme(void)
         "scale.rainbow-hue highlight {background:transparent;}"
         "scale.rainbow-hue slider {background:#f0f0f0;"
         "border:2px solid #333333;min-width:20px;min-height:20px;}"
+        /* Override IRC's fixed Deep Ocean surfaces, retaining text tags. */
+        "#xmp-irc-root {background-color:%s;color:#e6e6e6;}"
+        "#xmp-irc-root textview, #xmp-irc-root textview text,"
+        "#xmp-irc-root entry {background-color:%s;color:#e6e6e6;}"
+        "#xmp-irc-root button {background-color:%s;color:#e6e6e6;"
+        "border-color:#555555;}"
+        "#xmp-irc-root button:hover {background-color:%s;}"
+        "#xmp-irc-root notebook header {background-color:%s;"
+        "border-color:#555555;}"
+        "#xmp-irc-root notebook tab {background-color:%s;color:#e6e6e6;"
+        "border-color:#555555;}"
+        "#xmp-irc-root notebook tab:checked {background-color:%s;"
+        "color:#ffffff;border-bottom:2px solid %s;}"
+        "#xmp-irc-root label {color:#e6e6e6;}"
         ,base,panel,field,panel,hover,selection,accent,accent,
-        accent,accent,field,accent);
+        accent,accent,field,accent,
+        base,field,panel,hover,panel,panel,selection,accent);
     gtk_css_provider_load_from_data(custom_theme_provider, css, -1, NULL);
     modulez_visualizer_set_toolbar_theme(panel, selection, accent);
     gdk_rgba_parse(&mini_viz_background, base);
+    gdk_rgba_parse(&eq_theme_accent, accent);
     /* Neutral keeps the familiar cyan-violet spectrum. Custom hues move both
      * ends of the gradient together, maintaining roughly 75 degrees apart. */
     gint start_hue = accent_hue ? accent_hue : 181;
@@ -4622,6 +4649,7 @@ static void update_custom_theme(void)
     g_free(first);
     g_free(second);
     if (visualizer_area) gtk_widget_queue_draw(visualizer_area);
+    if (eq_graph_area) gtk_widget_queue_draw(eq_graph_area);
     g_free(css);
     g_free(base); g_free(panel); g_free(field); g_free(hover);
     g_free(accent); g_free(selection);
