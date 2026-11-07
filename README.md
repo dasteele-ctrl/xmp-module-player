@@ -1,6 +1,6 @@
 # Modulez Player
 
-**Formerly XMP Module Player.** Version **1.6** adds the Wavescope visualization tab and projectM / MilkDrop support. Version 1.5 introduced the new name and icon.
+**Formerly XMP Module Player.** Version **1.7.0** adds fullscreen visualizers and customizable charcoal themes. Version 1.6 introduced Wavescope/projectM, and version 1.5 introduced the new name and icon.
 
 **In memory of modulez.org (2000-2013)**  
 [http://misc.yero.org/modulez/](http://misc.yero.org/modulez/)
@@ -16,6 +16,10 @@ Modulez Player brings classic tracker music and regular audio playback to the Li
 - **Wavescope Vis tab** with 34 standard visualization modes and projectM / MilkDrop
 - **MilkDrop preset library** with 13 bundled starters, multi-file import, persistent user storage, and right-click next/previous/random controls
 - **Offline visualizations** fed directly from playback after EQ and volume; rendering pauses when hidden
+- **Fullscreen visualizers** with F11, double-click, Escape, and right-click controls
+- **Song navigation from the visualizer** with Ctrl+Left/Right and context-menu commands
+- **Customizable charcoal theme** with rainbow Background/Highlight Color sliders and brightness
+- **Theme-aware dual-color spectrum** on the Player tab
 
 - 🎵 **Tracker module playback** powered by libxmp
 - 🎵 **Additional Amiga music formats** powered by UADE, with libxmp retaining priority for formats supported by both engines
@@ -55,6 +59,12 @@ nicknames for a classic terminal look. The parser can be checked using
 `make check-irc`; that command also performs a syntax check of the GTK/GIO
 source files.
 
+## Version 1.7.0
+
+Version 1.7.0 adds fullscreen Wavescope and MilkDrop, convenient song and preset navigation, and a charcoal default theme with customizable colors and brightness. The Player spectrum retains a colorful two-hue gradient that follows the selected accent.
+
+See the [1.7 release notes](RELEASE_NOTES_1.7.md) for details and compatibility notes.
+
 ## Version 1.6.4
 
 Opening a track from the command line, a file manager, or **Open File** now starts playback immediately. The player appends new tracks to the current playlist and reuses the existing entry when you reopen the same path. **Add Files** queues tracks for later.
@@ -71,22 +81,22 @@ license notices and source references are included with the visualization assets
 
 ## Download
 
-**[Download Modulez Player v1.6.4 for Linux x86_64](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.6.4/Modulez-Player-v1.6.4-Linux-x86_64.AppImage)**
+**[Download Modulez Player v1.7.0 for Linux x86_64](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.7.0/Modulez-Player-v1.7.0-x86_64.AppImage)**
 
-[Release notes and downloads](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.6.4).
+[Release notes and downloads](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.7.0).
 
 The AppImage includes the application launcher icon.
 See [all releases](../../releases) for earlier versions.
 
 ### Running the AppImage
 
-1. Download the versioned `Modulez-Player-v1.6.4-Linux-x86_64.AppImage` file from Release v1.6.4.
+1. Download the versioned `Modulez-Player-v1.7.0-x86_64.AppImage` file from Release v1.7.0.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x Modulez-Player-v1.6.4-Linux-x86_64.AppImage
-   ./Modulez-Player-v1.6.4-Linux-x86_64.AppImage
+   chmod +x Modulez-Player-v1.7.0-x86_64.AppImage
+   ./Modulez-Player-v1.7.0-x86_64.AppImage
    ```
 
 ### Add the player to your application menu
@@ -254,7 +264,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.6.4**
+**Current source version: 1.7.0**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and
