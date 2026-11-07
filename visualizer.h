@@ -3,4 +3,9 @@
 #include <gtk/gtk.h>
 #include "visualizer_pcm.h"
 GtkWidget *modulez_visualizer_page_new(void);
+gboolean modulez_visualizer_toggle_fullscreen(void);
+void modulez_visualizer_set_track_navigation(gboolean (*skip_track)(gint));
+void modulez_visualizer_set_toolbar_theme(const char *panel,
+                                        const char *selection,
+                                        const char *accent);
 #endif

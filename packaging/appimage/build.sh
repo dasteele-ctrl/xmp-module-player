@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Modulez Player v1.6.5 AppImage: WebKit runtime, bundled visualizer assets, UADE and SoundFont.
+# Modulez Player v1.7.0 AppImage: WebKit runtime, bundled visualizer assets, UADE and SoundFont.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,8 +13,8 @@ if [[ ! -x "$project_dir/modulez-player" ]]; then
     echo "Missing modulez-player. Build the native player with: make -j4" >&2
     exit 1
 fi
-if ! grep -aFq 'Modulez Player 1.6.5' "$project_dir/modulez-player"; then
-    echo "The compiled player does not report version 1.6.5. Run make -j4 modulez-player first." >&2
+if ! grep -aFq 'Modulez Player 1.7.0' "$project_dir/modulez-player"; then
+    echo "The compiled player does not report version 1.7.0. Run make -j4 modulez-player first." >&2
     exit 1
 fi
 if [[ ! -x "$project_dir/xmp-zx-helper" ]]; then
@@ -87,8 +87,17 @@ done
 
 # Validate required assets before collecting any libraries. The SoundFont
 # defaults match the existing, reviewed MS Basic bank used for earlier builds.
-source_font="${XMP_BUNDLED_SOUNDFONT:-$HOME/Music/SoundFonts/MS Basic.sf3}"
-source_notice="${XMP_BUNDLED_SOUNDFONT_LICENSE:-$HOME/Music/SoundFonts/MS Basic_License.md}"
+# Locate the bundled SoundFont and its license.
+# Explicit environment variables always take priority.
+soundfont_dir="$HOME/Projects/XMP Dev Misc Files"
+
+if [[ ! -s "$soundfont_dir/MS Basic.sf3" ||
+      ! -s "$soundfont_dir/MS Basic_License.md" ]]; then
+    soundfont_dir="$HOME/Music/SoundFonts"
+fi
+
+source_font="${XMP_BUNDLED_SOUNDFONT:-$soundfont_dir/MS Basic.sf3}"
+source_notice="${XMP_BUNDLED_SOUNDFONT_LICENSE:-$soundfont_dir/MS Basic_License.md}"
 if [[ ! -s "$source_font" || ! -s "$source_notice" ]]; then
     echo "The bundled SoundFont and its license are required." >&2
     echo "SoundFont: $source_font" >&2
@@ -123,7 +132,7 @@ fi
 mkdir -p -- "$dist_dir"
 build_root="$(mktemp -d /tmp/xmp-appimage.XXXXXXXX)"
 appdir="$build_root/Modulez_Player.AppDir"
-output_name="Modulez-Player-v1.6.5-x86_64.AppImage"
+output_name="Modulez-Player-v1.7.0-x86_64.AppImage"
 
 cleanup() {
     if [[ -n "${build_root:-}" && -d "$build_root" &&

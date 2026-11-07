@@ -18,6 +18,7 @@
 #include "xmp_irc_widget.h"
 #include "tray_icon.h"
 #include "visualizer.h"
+static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event, gpointer data);
 #ifdef ENABLE_WAV_EXPORT
 #include "export_wav.h"
 #endif
@@ -25,7 +26,7 @@
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.6.5"
+#define MODULEZ_VERSION "1.7.0"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
@@ -94,6 +95,12 @@ static GtkWidget *sample_waveform_area;
 static GtkWidget *module_comments_view;
 
 static GtkWidget *visualizer_area;
+/* The small spectrum in the main player follows the GTK appearance sliders.
+ * This deliberately does not affect Wavescope or MilkDrop presets. */
+static GdkRGBA mini_viz_background = {0.141, 0.141, 0.141, 1};
+static GdkRGBA mini_viz_accent = {0.08, 0.86, 1.0, 1};
+static GdkRGBA mini_viz_accent_second = {0.56, 0.34, 1.0, 1};
+static GdkRGBA eq_theme_accent = {0.467, 0.467, 0.467, 1};
 static GtkWidget *eq_graph_area;
 static GtkWidget *eq_band_scales[XMP_EQ_BANDS];
 static GtkWidget *eq_preamp_scale;
@@ -2743,14 +2750,16 @@ static gboolean draw_visualizer(GtkWidget *widget, cairo_t *cr,
     double baseline = h - 8.0;
     double max_height = h - 22.0;
 
-    cairo_set_source_rgb(cr, 0.022, 0.060, 0.075);
+    cairo_set_source_rgb(cr, mini_viz_background.red,
+                         mini_viz_background.green, mini_viz_background.blue);
     cairo_paint(cr);
 
     /* Subtle horizontal guides for the rising spectrum. */
     cairo_set_line_width(cr, 1.0);
     for (int i = 1; i <= 4; i++) {
         double y = baseline - max_height * i / 4.0;
-        cairo_set_source_rgba(cr, 0.30, 0.48, 0.68, 0.14);
+        cairo_set_source_rgba(cr, mini_viz_accent.red, mini_viz_accent.green,
+                              mini_viz_accent.blue, 0.14);
         cairo_move_to(cr, 7, y);
         cairo_line_to(cr, w - 7, y);
         cairo_stroke(cr);
@@ -2774,10 +2783,10 @@ static gboolean draw_visualizer(GtkWidget *widget, cairo_t *cr,
         double ph = peak * max_height;
         double t = (double)i / (VIZ_BANDS - 1);
 
-        /* Cyan through blue into violet. */
-        double r = 0.08 + 0.48 * t;
-        double g = 0.86 - 0.52 * t;
-        double b = 1.0;
+        /* Preserve the original two-hue look, shifted with the accent slider. */
+        double r = mini_viz_accent.red * (1.0 - t) + mini_viz_accent_second.red * t;
+        double g = mini_viz_accent.green * (1.0 - t) + mini_viz_accent_second.green * t;
+        double b = mini_viz_accent.blue * (1.0 - t) + mini_viz_accent_second.blue * t;
 
         /* Diffuse glow behind each bar. */
         cairo_set_source_rgba(cr, r, g, b, 0.20);
@@ -2796,14 +2805,18 @@ static gboolean draw_visualizer(GtkWidget *widget, cairo_t *cr,
         cairo_pattern_destroy(grad);
 
         /* Bright peak-hold marker above each bar. */
-        cairo_set_source_rgba(cr, 0.78, 0.95, 1.0, 0.96);
+        cairo_set_source_rgba(cr,
+            0.35 + r * 0.65,
+            0.35 + g * 0.65,
+            0.35 + b * 0.65, 0.96);
         cairo_rectangle(cr, x, baseline - ph - 1.0,
                         bar_width, 2.0);
         cairo_fill(cr);
     }
 
     /* Crisp baseline. */
-    cairo_set_source_rgba(cr, 0.35, 0.80, 1.0, 0.75);
+    cairo_set_source_rgba(cr, mini_viz_accent.red, mini_viz_accent.green,
+                          mini_viz_accent.blue, 0.75);
     cairo_set_line_width(cr, 1.2);
     cairo_move_to(cr, 8, baseline);
     cairo_line_to(cr, w - 8, baseline);
@@ -4348,8 +4361,11 @@ static gboolean eq_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
     const double plot_h = MAX(1.0, bottom - top);
 
     cairo_pattern_t *background = cairo_pattern_create_linear(0, 0, 0, height);
-    cairo_pattern_add_color_stop_rgb(background, 0, .029, .077, .098);
-    cairo_pattern_add_color_stop_rgb(background, 1, .017, .049, .063);
+    cairo_pattern_add_color_stop_rgb(background, 0,
+        mini_viz_background.red, mini_viz_background.green, mini_viz_background.blue);
+    cairo_pattern_add_color_stop_rgb(background, 1,
+        mini_viz_background.red * .7, mini_viz_background.green * .7,
+        mini_viz_background.blue * .7);
     cairo_set_source(cr, background);
     cairo_paint(cr);
     cairo_pattern_destroy(background);
@@ -4359,7 +4375,8 @@ static gboolean eq_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
     cairo_set_font_size(cr, 10.5);
     for (int db = -12; db <= 12; db += 6) {
         double y = top + (12.0 - db) / 24.0 * plot_h;
-        cairo_set_source_rgba(cr, .32, .68, .7, db == 0 ? .35 : .14);
+        cairo_set_source_rgba(cr, eq_theme_accent.red, eq_theme_accent.green,
+                              eq_theme_accent.blue, db == 0 ? .35 : .14);
         cairo_set_line_width(cr, db == 0 ? 1.1 : .7);
         cairo_move_to(cr, left, y);
         cairo_line_to(cr, right, y);
@@ -4375,7 +4392,8 @@ static gboolean eq_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
     const double loglow = log(20), logspan = log(20000.0 / 20.0);
     for (int i = 0; i < XMP_EQ_BANDS; ++i) {
         double x = left + (log(marks[i]) - loglow) / logspan * plot_w;
-        cairo_set_source_rgba(cr, .31, .62, .64, .12);
+        cairo_set_source_rgba(cr, eq_theme_accent.red, eq_theme_accent.green,
+                              eq_theme_accent.blue, .12);
         cairo_move_to(cr, x, top);
         cairo_line_to(cr, x, bottom);
         cairo_stroke(cr);
@@ -4390,8 +4408,10 @@ static gboolean eq_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
         double x0 = left + (i + .22) * plot_w / VIZ_BANDS;
         double bar_h = level * plot_h * .7;
         cairo_pattern_t *bar = cairo_pattern_create_linear(0, bottom - bar_h, 0, bottom);
-        cairo_pattern_add_color_stop_rgba(bar, 0, .22, .94, .88, .12);
-        cairo_pattern_add_color_stop_rgba(bar, 1, .12, .64, .67, .02);
+        cairo_pattern_add_color_stop_rgba(bar, 0,
+            eq_theme_accent.red, eq_theme_accent.green, eq_theme_accent.blue, .12);
+        cairo_pattern_add_color_stop_rgba(bar, 1,
+            eq_theme_accent.red, eq_theme_accent.green, eq_theme_accent.blue, .02);
         cairo_set_source(cr, bar);
         cairo_rectangle(cr, x0, bottom - bar_h, plot_w / VIZ_BANDS * .58, bar_h);
         cairo_fill(cr);
@@ -4415,13 +4435,16 @@ static gboolean eq_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
     cairo_line_to(cr, curve_x[points], bottom);
     cairo_close_path(cr);
     cairo_pattern_t *fill = cairo_pattern_create_linear(0, top, 0, bottom);
-    cairo_pattern_add_color_stop_rgba(fill, 0, .1, .94, .83, .21);
-    cairo_pattern_add_color_stop_rgba(fill, 1, .1, .65, .70, .015);
+    cairo_pattern_add_color_stop_rgba(fill, 0,
+        eq_theme_accent.red, eq_theme_accent.green, eq_theme_accent.blue, .21);
+    cairo_pattern_add_color_stop_rgba(fill, 1,
+        eq_theme_accent.red, eq_theme_accent.green, eq_theme_accent.blue, .015);
     cairo_set_source(cr, fill);
     cairo_fill(cr);
     cairo_pattern_destroy(fill);
     for (int glow = 5; glow >= 1; --glow) {
-        cairo_set_source_rgba(cr, .13, .94, .91, glow == 1 ? .93 : .045);
+        cairo_set_source_rgba(cr, eq_theme_accent.red, eq_theme_accent.green,
+                              eq_theme_accent.blue, glow == 1 ? .93 : .045);
         cairo_set_line_width(cr, glow == 1 ? 2.0 : glow * 2.7);
         cairo_move_to(cr, curve_x[0], curve_y[0]);
         for (int i = 1; i <= points; ++i)
@@ -4510,6 +4533,126 @@ static GtkWidget *eq_create_page(gboolean compact_ui)
     gtk_box_pack_start(GTK_BOX(preamp_row),
         gtk_label_new("dB"), FALSE, FALSE, 0);
     return page;
+}
+
+static gint theme_hue = 0;  /* 0 = neutral charcoal; 1..360 = hue */
+static gint accent_hue = 0; /* 0 = neutral graphite; 1..360 = hue */
+static gint theme_brightness = 50; /* 50 = existing brightness */
+static GtkCssProvider *custom_theme_provider;
+
+static gchar *theme_color(gint hue, gdouble saturation, gdouble value,
+                          const char *neutral)
+{
+    gdouble red, green, blue;
+    /* 0..100 maps to 55..145% of the original value. Even the brightest
+     * setting keeps backgrounds dark; 50 reproduces the previous palette. */
+    const gdouble factor = .55 + theme_brightness * .009;
+    if (!hue) {
+        GdkRGBA neutral_rgb;
+        if (!gdk_rgba_parse(&neutral_rgb, neutral)) return g_strdup(neutral);
+        red = neutral_rgb.red;
+        green = neutral_rgb.green;
+        blue = neutral_rgb.blue;
+    } else {
+        gtk_hsv_to_rgb((hue - 1) / 360.0, saturation, value,
+                       &red, &green, &blue);
+    }
+    red = MIN(1.0, red * factor);
+    green = MIN(1.0, green * factor);
+    blue = MIN(1.0, blue * factor);
+    return g_strdup_printf("#%02x%02x%02x",
+        (guint)(red * 255 + 0.5), (guint)(green * 255 + 0.5),
+        (guint)(blue * 255 + 0.5));
+}
+
+static void update_custom_theme(void)
+{
+    if (!custom_theme_provider) return;
+    /* Pure HSV hues, with brightness controlled independently.
+     * Neutral slider positions retain the original charcoal grays. */
+    gchar *base = theme_color(theme_hue, 1.0, .12, "#242424");
+    gchar *panel = theme_color(theme_hue, 1.0, .19, "#303030");
+    gchar *field = theme_color(theme_hue, 1.0, .10, "#1f1f1f");
+    gchar *hover = theme_color(theme_hue, 1.0, .28, "#444444");
+    gchar *accent = theme_color(accent_hue, 1.0, .94, "#777777");
+    gchar *selection = theme_color(accent_hue, 1.0, .36, "#555555");
+    gchar *css = g_strdup_printf(
+        "window, notebook, notebook stack, window.dialog, window.dialog.background,"
+        "window.dialog box, window.dialog grid, window.dialog paned,"
+        "window.dialog stack, window.xmp-dialog, .xmp-dialog-surface,"
+        "window.xmp-dialog .dialog-action-box, filechooser,"
+        "filechooser actionbar, box#samples-page {background-color:%s;color:#e6e6e6;}"
+        "notebook header, notebook tab, window.dialog headerbar,"
+        "window.dialog .dialog-action-box, popover, popover.background,"
+        "menu, menu.background, window.popup, combobox window.popup,"
+        "filechooser placessidebar, filechooser placessidebar row,"
+        "label#sample-details, label#about-description {background-color:%s;color:#e6e6e6;}"
+        "entry, spinbutton, spinbutton entry, filechooser entry,"
+        "treeview#playlist-view, treeview#soundfont-view,"
+        "list#sample-list, list#sample-list row,"
+        "textview#module-comments, textview#module-comments text,"
+        "filechooser scrolledwindow, filechooser viewport, filechooser .view,"
+        "filechooser treeview, filechooser iconview {background-color:%s;color:#e6e6e6;}"
+        "button, combobox button, spinbutton button, notebook tab {"
+        "background-color:%s;color:#e6e6e6;border-color:#555555;}"
+        "button:hover, notebook tab:hover, menuitem:hover,"
+        "filechooser placessidebar row:hover {background-color:%s;}"
+        "notebook tab:checked, treeview#playlist-view:selected,"
+        "treeview#soundfont-view:selected, list#sample-list row:selected,"
+        "filechooser treeview:selected, filechooser iconview:selected,"
+        "menuitem:selected, menuitem:hover {background-color:%s;color:#ffffff;}"
+        "notebook tab:checked {border-bottom:2px solid %s;}"
+        "scale highlight, progressbar progress, switch:checked {background-color:%s;}"
+        "scale slider, #eq-sliders scale slider, switch slider {"
+        "background-color:%s;border-color:%s;}"
+        "scale trough, progressbar trough, switch {background-color:%s;}"
+        "entry, spinbutton, filechooser entry {caret-color:%s;}"
+        "label {color:#e6e6e6;}"
+        "scale.rainbow-hue trough {"
+        "min-height:16px;border-radius:9px;border:1px solid #555555;"
+        "background-image:linear-gradient(to right,#777777 0%%,"
+        "#d95b5b 12%%,#e1ab54 24%%,#d6d85a 36%%,"
+        "#59c977 48%%,#52c4ca 60%%,#618de0 72%%,"
+        "#ad6bd2 85%%,#d95b5b 100%%); }"
+        "scale.rainbow-hue highlight {background:transparent;}"
+        "scale.rainbow-hue slider {background:#f0f0f0;"
+        "border:2px solid #333333;min-width:20px;min-height:20px;}"
+        /* Override IRC's fixed Deep Ocean surfaces, retaining text tags. */
+        "#xmp-irc-root {background-color:%s;color:#e6e6e6;}"
+        "#xmp-irc-root textview, #xmp-irc-root textview text,"
+        "#xmp-irc-root entry {background-color:%s;color:#e6e6e6;}"
+        "#xmp-irc-root button {background-color:%s;color:#e6e6e6;"
+        "border-color:#555555;}"
+        "#xmp-irc-root button:hover {background-color:%s;}"
+        "#xmp-irc-root notebook header {background-color:%s;"
+        "border-color:#555555;}"
+        "#xmp-irc-root notebook tab {background-color:%s;color:#e6e6e6;"
+        "border-color:#555555;}"
+        "#xmp-irc-root notebook tab:checked {background-color:%s;"
+        "color:#ffffff;border-bottom:2px solid %s;}"
+        "#xmp-irc-root label {color:#e6e6e6;}"
+        ,base,panel,field,panel,hover,selection,accent,accent,
+        accent,accent,field,accent,
+        base,field,panel,hover,panel,panel,selection,accent);
+    gtk_css_provider_load_from_data(custom_theme_provider, css, -1, NULL);
+    modulez_visualizer_set_toolbar_theme(panel, selection, accent);
+    gdk_rgba_parse(&mini_viz_background, base);
+    gdk_rgba_parse(&eq_theme_accent, accent);
+    /* Neutral keeps the familiar cyan-violet spectrum. Custom hues move both
+     * ends of the gradient together, maintaining roughly 75 degrees apart. */
+    gint start_hue = accent_hue ? accent_hue : 181;
+    gint end_hue = (start_hue + 74 - 1) % 360 + 1;
+    gchar *first = theme_color(start_hue, 1.0, .94, "#777777");
+    gchar *second = theme_color(end_hue, 1.0, .94, "#777777");
+    gdk_rgba_parse(&mini_viz_accent, first);
+    gdk_rgba_parse(&mini_viz_accent_second, second);
+    g_free(first);
+    g_free(second);
+    if (visualizer_area) gtk_widget_queue_draw(visualizer_area);
+    if (eq_graph_area) gtk_widget_queue_draw(eq_graph_area);
+    g_free(css);
+    g_free(base); g_free(panel); g_free(field); g_free(hover);
+    g_free(accent); g_free(selection);
 }
 
 static void apply_style(void)
@@ -4638,6 +4781,11 @@ static void apply_style(void)
         gdk_screen_get_default(), GTK_STYLE_PROVIDER(provider),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(provider);
+    custom_theme_provider = gtk_css_provider_new();
+    gtk_style_context_add_provider_for_screen(
+        gdk_screen_get_default(), GTK_STYLE_PROVIDER(custom_theme_provider),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+    update_custom_theme();
 }
 
 static gchar *preferences_path(void)
@@ -4664,6 +4812,15 @@ static void load_preferences(void)
         if (mode >= REPEAT_OFF && mode <= REPEAT_ONE)
             repeat_mode = (RepeatMode)mode;
     }
+    if (g_key_file_has_key(settings, "Appearance", "theme-hue", NULL))
+        theme_hue = CLAMP(g_key_file_get_integer(settings, "Appearance",
+                                               "theme-hue", NULL), 0, 360);
+    if (g_key_file_has_key(settings, "Appearance", "accent-hue", NULL))
+        accent_hue = CLAMP(g_key_file_get_integer(settings, "Appearance",
+                                                "accent-hue", NULL), 0, 360);
+    if (g_key_file_has_key(settings, "Appearance", "brightness", NULL))
+        theme_brightness = CLAMP(g_key_file_get_integer(settings, "Appearance",
+                                                      "brightness", NULL), 0, 100);
     g_key_file_free(settings);
     g_free(path);
 }
@@ -4676,6 +4833,9 @@ static void save_preferences(void)
     g_key_file_set_boolean(settings, "Window", "minimize-to-tray",
                            minimize_to_tray);
     g_key_file_set_integer(settings, "Playback", "repeat-mode", repeat_mode);
+    g_key_file_set_integer(settings, "Appearance", "theme-hue", theme_hue);
+    g_key_file_set_integer(settings, "Appearance", "accent-hue", accent_hue);
+    g_key_file_set_integer(settings, "Appearance", "brightness", theme_brightness);
 
     if (g_mkdir_with_parents(directory, 0700) == 0) {
         gsize length = 0;
@@ -4693,6 +4853,40 @@ static void save_preferences(void)
     g_key_file_free(settings);
     g_free(directory);
     g_free(path);
+}
+
+static GtkWidget *theme_hue_scale, *accent_hue_scale, *brightness_scale;
+
+static void on_theme_hue_changed(GtkRange *range, gpointer data)
+{
+    (void)data;
+    theme_hue = (gint)gtk_range_get_value(range);
+    update_custom_theme();
+    save_preferences();
+}
+
+static void on_accent_hue_changed(GtkRange *range, gpointer data)
+{
+    (void)data;
+    accent_hue = (gint)gtk_range_get_value(range);
+    update_custom_theme();
+    save_preferences();
+}
+
+static void on_brightness_changed(GtkRange *range, gpointer data)
+{
+    (void)data;
+    theme_brightness = (gint)gtk_range_get_value(range);
+    update_custom_theme();
+    save_preferences();
+}
+
+static void on_reset_charcoal(GtkButton *button, gpointer data)
+{
+    (void)button; (void)data;
+    gtk_range_set_value(GTK_RANGE(theme_hue_scale), 0);
+    gtk_range_set_value(GTK_RANGE(accent_hue_scale), 0);
+    gtk_range_set_value(GTK_RANGE(brightness_scale), 50);
 }
 
 static void on_playlist_repeat_mode(GtkCheckMenuItem *item, gpointer data)
@@ -4990,6 +5184,8 @@ static int create_player(void)
         "/org/helllabs/xmp/icons/xmp.png", 192, 192, TRUE, NULL);
 
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    g_signal_connect(window, "key-press-event",
+                     G_CALLBACK(on_visualizer_shortcut), NULL);
     gtk_window_set_title(GTK_WINDOW(window), "Modulez Player " MODULEZ_VERSION);
 
     /* Size the initial window to the monitor's usable area. GTK will not
@@ -5600,6 +5796,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     /* Classic IRC chat, using the same GTK notebook and dark theme. */
     xmp_irc_add_notebook_page(GTK_NOTEBOOK(notebook));
 
+    modulez_visualizer_set_track_navigation(playlist_skip_track);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
         modulez_visualizer_page_new(),
         compact_tab_label("Vis", "Wavescope visualization and projectM / MilkDrop"));
@@ -5637,6 +5834,59 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_widget_set_size_request(tray_hint, 300, -1);
     gtk_box_pack_start(GTK_BOX(preferences_page), tray_hint,
                        FALSE, FALSE, 0);
+
+    GtkWidget *appearance_heading = gtk_label_new("Colors & Appearance");
+    gtk_widget_set_halign(appearance_heading, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(appearance_heading),
+                                "module-title");
+    gtk_box_pack_start(GTK_BOX(preferences_page), appearance_heading,
+                       FALSE, FALSE, 8);
+
+    GtkWidget *theme_hue_label = gtk_label_new("Background Color");
+    gtk_label_set_xalign(GTK_LABEL(theme_hue_label), 0);
+    gtk_box_pack_start(GTK_BOX(preferences_page), theme_hue_label, FALSE, FALSE, 0);
+    theme_hue_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 360, 1);
+    gtk_scale_set_draw_value(GTK_SCALE(theme_hue_scale), FALSE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(theme_hue_scale),
+                                "rainbow-hue");
+    gtk_widget_set_size_request(theme_hue_scale, 320, -1);
+    gtk_range_set_value(GTK_RANGE(theme_hue_scale), theme_hue);
+    g_signal_connect(theme_hue_scale, "value-changed",
+                     G_CALLBACK(on_theme_hue_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(preferences_page), theme_hue_scale, FALSE, FALSE, 0);
+
+    GtkWidget *accent_hue_label = gtk_label_new("Highlight Color");
+    gtk_label_set_xalign(GTK_LABEL(accent_hue_label), 0);
+    gtk_box_pack_start(GTK_BOX(preferences_page), accent_hue_label, FALSE, FALSE, 0);
+    accent_hue_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 360, 1);
+    gtk_scale_set_draw_value(GTK_SCALE(accent_hue_scale), FALSE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(accent_hue_scale),
+                                "rainbow-hue");
+    gtk_widget_set_size_request(accent_hue_scale, 320, -1);
+    gtk_range_set_value(GTK_RANGE(accent_hue_scale), accent_hue);
+    g_signal_connect(accent_hue_scale, "value-changed",
+                     G_CALLBACK(on_accent_hue_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(preferences_page), accent_hue_scale, FALSE, FALSE, 0);
+
+    GtkWidget *brightness_label = gtk_label_new("Brightness");
+    gtk_label_set_xalign(GTK_LABEL(brightness_label), 0);
+    gtk_box_pack_start(GTK_BOX(preferences_page), brightness_label, FALSE, FALSE, 0);
+    brightness_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 100, 1);
+    gtk_scale_set_draw_value(GTK_SCALE(brightness_scale), FALSE);
+    gtk_widget_set_size_request(brightness_scale, 320, -1);
+    gtk_range_set_value(GTK_RANGE(brightness_scale), theme_brightness);
+    g_signal_connect(brightness_scale, "value-changed",
+                     G_CALLBACK(on_brightness_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(preferences_page), brightness_scale, FALSE, FALSE, 0);
+    GtkWidget *brightness_ends = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_box_pack_start(GTK_BOX(brightness_ends), gtk_label_new("Darker"), FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(brightness_ends), gtk_label_new("Brighter"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(preferences_page), brightness_ends, FALSE, FALSE, 0);
+
+    GtkWidget *reset_charcoal = gtk_button_new_with_label("Restore Original Colors");
+    g_signal_connect(reset_charcoal, "clicked", G_CALLBACK(on_reset_charcoal), NULL);
+    gtk_widget_set_halign(reset_charcoal, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(preferences_page), reset_charcoal, FALSE, FALSE, 0);
 
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), preferences_page,
                              compact_tab_label("Prefs", "General preferences"));
@@ -5685,6 +5935,9 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         "WAV export for all supported playback engines\n"
         "Wavescope: 34 visualization modes (Signal Ridge Labs, MIT)\n"
         "MilkDrop presets rendered by projectM (LGPL-2.1)\n"
+        "Fullscreen visualizers with playback and preset controls\n"
+        "Customizable charcoal theme with rainbow color sliders\n"
+        "Adjustable theme brightness and dual-color spectrum\n"
         "Vis tab with direct audio and saved preset importing\n"
         "Built-in IRC chat\n"
         "System tray playback controls\n"
@@ -5758,6 +6011,15 @@ static int on_launch(GApplication *app, GApplicationCommandLine *command, gpoint
     g_strfreev(argv);
     on_tray_show(NULL);
     return 0;
+}
+
+static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event,
+                                       gpointer data)
+{
+    (void)widget; (void)data;
+    if (event->keyval == GDK_KEY_F11)
+        return modulez_visualizer_toggle_fullscreen();
+    return FALSE;
 }
 
 int main(int argc, char **argv)
