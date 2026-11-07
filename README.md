@@ -1,6 +1,11 @@
 # Modulez Player
 
-**Formerly XMP Module Player.** Version **1.7.0** adds fullscreen visualizers and customizable charcoal themes. Version 1.6 introduced Wavescope/projectM, and version 1.5 introduced the new name and icon.
+**Formerly XMP Module Player.** Version **1.7.0** introduces fullscreen
+music visualizations, convenient playback controls, and a customizable
+interface with vibrant color and brightness adjustments.
+
+Version 1.6 introduced Wavescope and projectM / MilkDrop visualization.
+Version 1.5 introduced the Modulez Player name and icon.
 
 **In memory of modulez.org (2000-2013)**  
 [http://misc.yero.org/modulez/](http://misc.yero.org/modulez/)
@@ -20,7 +25,8 @@ Modulez Player brings classic tracker music and regular audio playback to the Li
 - **Song navigation from the visualizer** with Ctrl+Left/Right and context-menu commands
 - **Customizable charcoal theme** with rainbow Background/Highlight Color sliders and brightness
 - **Theme-aware dual-color spectrum** on the Player tab
-
+- **Theme-aware IRC interface** with colors that follow the selected player theme
+- **Theme-aware equalizer graph** with matching backgrounds, curves, and frequency bars
 - 🎵 **Tracker module playback** powered by libxmp
 - 🎵 **Additional Amiga music formats** powered by UADE, with libxmp retaining priority for formats supported by both engines
 - 🎧 **Regular audio playback** powered by FFmpeg: MP3, WAV, M4A/AAC, Ogg Vorbis, Opus, and FLAC
@@ -54,10 +60,12 @@ such as `/join`, `/part`, `/nick`, and `/me`. It does not connect until you
 click **Connect**. Network settings are saved to
 `~/.config/xmp-irc/settings.ini`; no IRC passwords are stored.
 
-The IRC widget uses Modulez Player's existing dark teal GTK palette, with green
-nicknames for a classic terminal look. The parser can be checked using
-`make check-irc`; that command also performs a syntax check of the GTK/GIO
-source files.
+The IRC interface follows the selected Modulez Player theme, including
+backgrounds, buttons, borders, and other controls. Nicknames and message
+types retain their distinct colors for readability.
+
+The parser can be checked using `make check-irc`; that command also performs
+a syntax check of the GTK/GIO source files.
 
 ## Version 1.7.0
 
