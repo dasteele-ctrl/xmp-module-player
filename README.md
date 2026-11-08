@@ -1,5 +1,19 @@
 # Modulez Player
 
+## Development Status
+
+**Modulez Player is feature-complete as of version 1.7.1.**
+
+No further feature development is planned.
+
+The source code and published releases will remain available
+for anyone who wishes to download, use, or study the project.
+
+Thank you to everyone who has shown interest in Modulez Player.
+
+---
+
+
 **Formerly XMP Module Player.** Version **1.7.1** includes fullscreen
 music visualizations, convenient playback controls, and a customizable
 interface with vibrant color and brightness adjustments.
