@@ -92,6 +92,7 @@ static GtkWidget *pattern_area;
 static GtkWidget *sample_list;
 static GtkWidget *sample_details_label;
 static GtkWidget *sample_waveform_area;
+static GtkWidget *hvsc_waveform_area;
 static GtkWidget *module_comments_view;
 
 static GtkWidget *visualizer_area;
@@ -4664,6 +4665,8 @@ static void update_custom_theme(void)
     if (eq_graph_area) gtk_widget_queue_draw(eq_graph_area);
     if (sample_waveform_area)
         gtk_widget_queue_draw(sample_waveform_area);
+    if (hvsc_waveform_area)
+        gtk_widget_queue_draw(hvsc_waveform_area);
     g_free(css);
     g_free(base); g_free(panel); g_free(field); g_free(hover);
     g_free(accent); g_free(selection);
@@ -5760,6 +5763,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     GtkWidget *hvsc_progress = gtk_progress_bar_new();
 
     GtkWidget *hvsc_waveform = gtk_drawing_area_new();
+    hvsc_waveform_area = hvsc_waveform;
     gtk_widget_set_size_request(hvsc_waveform, -1, 76);
 
     g_object_set_data(G_OBJECT(hvsc_waveform),
@@ -5767,9 +5771,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     g_signal_connect(hvsc_waveform, "draw",
                      G_CALLBACK(hvsc_waveform_draw), NULL);
-    g_signal_connect_swapped(custom_theme_provider, "changed",
-                             G_CALLBACK(gtk_widget_queue_draw),
-                             hvsc_waveform);
+
 
     gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_waveform,
                        FALSE, FALSE, 0);
