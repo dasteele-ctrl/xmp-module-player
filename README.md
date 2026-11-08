@@ -1,6 +1,6 @@
 # Modulez Player
 
-**Formerly XMP Module Player.** Version **1.7.0** introduces fullscreen
+**Formerly XMP Module Player.** Version **1.7.1** includes fullscreen
 music visualizations, convenient playback controls, and a customizable
 interface with vibrant color and brightness adjustments.
 
@@ -89,22 +89,22 @@ license notices and source references are included with the visualization assets
 
 ## Download
 
-**[Download Modulez Player v1.7.0 for Linux x86_64](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.7.0/Modulez-Player-v1.7.0-x86_64.AppImage)**
+**[Download Modulez Player v1.7.1 for Linux x86_64](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.7.1/Modulez-Player-v1.7.1-x86_64.AppImage)**
 
-[Release notes and downloads](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.7.0).
+[Release notes and downloads](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.7.1).
 
 The AppImage includes the application launcher icon.
 See [all releases](../../releases) for earlier versions.
 
 ### Running the AppImage
 
-1. Download the versioned `Modulez-Player-v1.7.0-x86_64.AppImage` file from Release v1.7.0.
+1. Download the versioned `Modulez-Player-v1.7.1-x86_64.AppImage` file from Release v1.7.1.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x Modulez-Player-v1.7.0-x86_64.AppImage
-   ./Modulez-Player-v1.7.0-x86_64.AppImage
+   chmod +x Modulez-Player-v1.7.1-x86_64.AppImage
+   ./Modulez-Player-v1.7.1-x86_64.AppImage
    ```
 
 ### Add the player to your application menu
@@ -272,7 +272,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.7.0**
+**Current source version: 1.7.1**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and
