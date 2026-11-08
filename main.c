@@ -101,6 +101,7 @@ static GdkRGBA mini_viz_background = {0.141, 0.141, 0.141, 1};
 static GdkRGBA mini_viz_accent = {0.08, 0.86, 1.0, 1};
 static GdkRGBA mini_viz_accent_second = {0.56, 0.34, 1.0, 1};
 static GdkRGBA eq_theme_accent = {0.467, 0.467, 0.467, 1};
+static GdkRGBA waveform_theme_background = {0.122, 0.122, 0.122, 1};
 static GtkWidget *eq_graph_area;
 static GtkWidget *eq_band_scales[XMP_EQ_BANDS];
 static GtkWidget *eq_preamp_scale;
@@ -600,12 +601,14 @@ static gboolean on_sample_waveform_draw(GtkWidget *widget,
     if (width <= 1 || height <= 1)
         return FALSE;
 
-    /* Dark background and center line. */
-    cairo_set_source_rgb(cr, 0.028, 0.060, 0.075);
+    /* Follow the active Modulez appearance settings. */
+    gdk_cairo_set_source_rgba(cr, &waveform_theme_background);
     cairo_paint(cr);
 
     double center = height / 2.0;
-    cairo_set_source_rgb(cr, 0.24, 0.27, 0.32);
+    cairo_set_source_rgba(cr,
+        eq_theme_accent.red, eq_theme_accent.green,
+        eq_theme_accent.blue, 0.35);
     cairo_set_line_width(cr, 1.0);
     cairo_move_to(cr, 0, center);
     cairo_line_to(cr, width, center);
@@ -636,12 +639,14 @@ static gboolean on_sample_waveform_draw(GtkWidget *widget,
         smp->lpe <= count) {
         double x1 = (double)smp->lps / count * width;
         double x2 = (double)smp->lpe / count * width;
-        cairo_set_source_rgba(cr, 0.20, 0.38, 0.30, 0.35);
+        cairo_set_source_rgba(cr,
+            eq_theme_accent.red, eq_theme_accent.green,
+            eq_theme_accent.blue, 0.18);
         cairo_rectangle(cr, x1, 0, x2 - x1, height);
         cairo_fill(cr);
     }
 
-    cairo_set_source_rgb(cr, 0.35, 0.92, 0.57);
+    gdk_cairo_set_source_rgba(cr, &eq_theme_accent);
     cairo_set_line_width(cr, 1.0);
 
     for (int x = 0; x < width; x++) {
@@ -1929,7 +1934,7 @@ static gboolean hvsc_waveform_draw(GtkWidget *widget,
 
     fraction = CLAMP(fraction, 0.0, 1.0);
 
-    cairo_set_source_rgb(cr, 0.035, 0.079, 0.095);
+    gdk_cairo_set_source_rgba(cr, &waveform_theme_background);
     cairo_rectangle(cr, 0, 0, width, height);
     cairo_fill(cr);
 
@@ -1947,23 +1952,29 @@ static gboolean hvsc_waveform_draw(GtkWidget *widget,
         amplitude = MIN(amplitude, height - 8.0);
 
         if (x < width * fraction)
-            cairo_set_source_rgb(cr, 0.212, 0.769, 0.847);
+            gdk_cairo_set_source_rgba(cr, &eq_theme_accent);
         else
-            cairo_set_source_rgb(cr, 0.278, 0.333, 0.412);
+            cairo_set_source_rgba(cr,
+                eq_theme_accent.red, eq_theme_accent.green,
+                eq_theme_accent.blue, 0.28);
 
         cairo_rectangle(cr, x, center - amplitude / 2.0,
                         2.6, amplitude);
         cairo_fill(cr);
     }
 
-    cairo_set_source_rgba(cr, 0.51, 0.57, 0.65, 0.45);
+    cairo_set_source_rgba(cr,
+        eq_theme_accent.red, eq_theme_accent.green,
+        eq_theme_accent.blue, 0.35);
     cairo_set_line_width(cr, 0.5);
     cairo_move_to(cr, 0, center);
     cairo_line_to(cr, width, center);
     cairo_stroke(cr);
 
     if (fraction > 0.0) {
-        cairo_set_source_rgb(cr, 0.90, 0.98, 1.0);
+        cairo_set_source_rgba(cr,
+            eq_theme_accent.red, eq_theme_accent.green,
+            eq_theme_accent.blue, 0.85);
         cairo_set_line_width(cr, 1.5);
         cairo_move_to(cr, width * fraction, 0);
         cairo_line_to(cr, width * fraction, height);
@@ -4638,6 +4649,7 @@ static void update_custom_theme(void)
     modulez_visualizer_set_toolbar_theme(panel, selection, accent);
     gdk_rgba_parse(&mini_viz_background, base);
     gdk_rgba_parse(&eq_theme_accent, accent);
+    gdk_rgba_parse(&waveform_theme_background, field);
     /* Neutral keeps the familiar cyan-violet spectrum. Custom hues move both
      * ends of the gradient together, maintaining roughly 75 degrees apart. */
     gint start_hue = accent_hue ? accent_hue : 181;
@@ -4650,6 +4662,8 @@ static void update_custom_theme(void)
     g_free(second);
     if (visualizer_area) gtk_widget_queue_draw(visualizer_area);
     if (eq_graph_area) gtk_widget_queue_draw(eq_graph_area);
+    if (sample_waveform_area)
+        gtk_widget_queue_draw(sample_waveform_area);
     g_free(css);
     g_free(base); g_free(panel); g_free(field); g_free(hover);
     g_free(accent); g_free(selection);
@@ -5753,6 +5767,9 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     g_signal_connect(hvsc_waveform, "draw",
                      G_CALLBACK(hvsc_waveform_draw), NULL);
+    g_signal_connect_swapped(custom_theme_provider, "changed",
+                             G_CALLBACK(gtk_widget_queue_draw),
+                             hvsc_waveform);
 
     gtk_box_pack_start(GTK_BOX(hvsc_page), hvsc_waveform,
                        FALSE, FALSE, 0);
