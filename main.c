@@ -1,3 +1,4 @@
+#include "player_config.h"
 #include <gtk/gtk.h>
 #include <gio/gio.h>
 #include <glib/gstdio.h>
@@ -26,7 +27,7 @@ static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event, gp
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.7.1"
+#define MODULEZ_VERSION "1.7.2"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
@@ -1378,9 +1379,7 @@ static int open_midi(const char *filename)
 
 static char *get_last_folder_file(void)
 {
-    return g_build_filename(g_get_user_config_dir(),
-                            "xmp-module-player",
-                            "last-folder", NULL);
+    return player_config_path("last-folder");
 }
 
 static void restore_last_folder(GtkWidget *dialog)
@@ -1419,14 +1418,12 @@ static void remember_last_folder(GtkWidget *dialog)
 
 static char *get_soundfont_settings_file(void)
 {
-    return g_build_filename(g_get_user_config_dir(),
-                            "xmp-module-player", "soundfont", NULL);
+    return player_config_path("soundfont");
 }
 
 static char *get_soundfont_library_file(void)
 {
-    return g_build_filename(g_get_user_config_dir(),
-                            "xmp-module-player", "soundfonts.ini", NULL);
+    return player_config_path("soundfonts.ini");
 }
 
 static gboolean soundfont_find(const char *path, GtkTreeIter *result)
@@ -1889,9 +1886,7 @@ static void on_system_soundfont(GtkButton *button, gpointer data)
 
 static char *get_hvsc_folder_file(void)
 {
-    return g_build_filename(g_get_user_config_dir(),
-                            "xmp-module-player",
-                            "hvsc-folder", NULL);
+    return player_config_path("hvsc-folder");
 }
 
 static void on_hvsc_folder_changed(GtkFileChooserButton *chooser,
@@ -4183,8 +4178,7 @@ static const EqPreset eq_presets[] = {
 
 static gchar *eq_settings_path(void)
 {
-    return g_build_filename(g_get_user_config_dir(), "xmp-module-player",
-                            "equalizer.ini", NULL);
+    return player_config_path("equalizer.ini");
 }
 
 static void eq_save_settings(void)
@@ -4807,8 +4801,7 @@ static void apply_style(void)
 
 static gchar *preferences_path(void)
 {
-    return g_build_filename(g_get_user_config_dir(), "xmp-module-player",
-                            "preferences.ini", NULL);
+    return player_config_path("preferences.ini");
 }
 
 static void load_preferences(void)
@@ -6011,6 +6004,9 @@ static int on_launch(GApplication *app, GApplicationCommandLine *command, gpoint
 {
     (void)data;
     if (!window) {
+        g_autoptr(GError) error = NULL;
+        if (!player_config_migrate(&error))
+            g_warning("Could not migrate Modulez Player settings: %s", error->message);
         if (create_player() != 0)
             return 1;
         g_application_hold(app);

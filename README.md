@@ -219,7 +219,7 @@ regular audio files without any additional audio library. The EQ uses smooth
 transitions when changing gains or toggling bypass.
 
 EQ settings are stored in
-`~/.config/xmp-module-player/equalizer.ini` (or the corresponding XDG
+`~/.config/modulez-player/equalizer.ini` (or the corresponding XDG
 configuration directory), so they persist between AppImage upgrades.
 
 The EQ is for **live playback**; exported WAV files remain unchanged. Use the
@@ -286,7 +286,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.7.1**
+**Current source version: 1.7.2**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and
@@ -297,10 +297,11 @@ Version 1.5 rebrands XMP Module Player as **Modulez Player**, with a new
 application icon, About title, tray/menu text, desktop entry, and AppImage
 filename. Playback features from 1.4.3 are retained.
 
-Existing settings remain in `~/.config/xmp-module-player` and
-`~/.config/xmp-irc`. The rebrand does not move or erase SoundFont selections,
-EQ presets, preferences, or stored paths. The repository address remains
-`dasteele-ctrl/xmp-module-player` so existing links continue to work.
+Version 1.7.2 stores player settings in `~/.config/modulez-player/` under the
+standard XDG configuration directory. On upgrade, the player copies missing
+settings and imported MilkDrop presets from `~/.config/xmp-module-player/`.
+Existing files in the new folder take precedence. The old folder remains
+available for earlier releases. IRC uses `~/.config/xmp-irc/`.
 
 The launcher icon is bundled inside the AppImage and is also available in
 the repository as [`icons/modulez-player.png`](icons/modulez-player.png).
@@ -340,7 +341,7 @@ shows the current track title in bold white text against a charcoal surface.
 The **Preferences** tab includes **Minimize to tray when closing Modulez Player**,
 enabled by default. When checked, closing the main window keeps the player
 running in the tray. Uncheck it to make the close button quit normally.
-This choice is saved in `~/.config/xmp-module-player/preferences.ini`.
+This choice is saved in `~/.config/modulez-player/preferences.ini`.
 If there is no usable tray, closing the window always exits normally.
 
 ## Author
