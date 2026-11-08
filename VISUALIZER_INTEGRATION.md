@@ -90,7 +90,7 @@ that can be replaced by a source rebuild. Its pinned git-blob hash is
 
 **Import Presets** opens a native multiple-file chooser for `.milk` files.
 Copies are saved under `$XDG_CONFIG_HOME/xmp-module-player/milk-presets`
-(normally `~/.config/xmp-module-player/milk-presets`), outside the executable or
+(normally `~/.config/modulez-player/milk-presets`), outside the executable or
 AppImage. Original files are never moved or changed. SHA-256 content IDs avoid
 importing the same preset twice. Valid UTF-8, nonempty preset text up to 1 MiB
 is accepted; the projectM compiler remains the final format check. A rejected

@@ -1,3 +1,4 @@
+#include "player_config.h"
 #include "visualizer.h"
 #include <webkit2/webkit2.h>
 #include <libsoup/soup.h>
@@ -118,7 +119,7 @@ static const char *resource_type(const char *name)
 #define MILK_MAX_BYTES (1024 * 1024)
 static gchar *preset_directory(void)
 {
-    return g_build_filename(g_get_user_config_dir(), "xmp-module-player", "milk-presets", NULL);
+    return player_config_path("milk-presets");
 }
 static gboolean preset_id_valid(const char *id)
 {
