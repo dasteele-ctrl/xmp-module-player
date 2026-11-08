@@ -81,6 +81,17 @@ types retain their distinct colors for readability.
 The parser can be checked using `make check-irc`; that command also performs
 a syntax check of the GTK/GIO source files.
 
+## Version 1.7.2
+
+Player settings now live in `~/.config/modulez-player/`. On upgrade, the player
+copies missing settings and imported MilkDrop presets from the old folder.
+[1.7.2 release notes](RELEASE_NOTES_1.7.2.md)
+
+## Version 1.7.1
+
+Fixed a GTK theme warning and updated the HVSC waveform when appearance
+settings change. [1.7.1 release notes](RELEASE_NOTES_1.7.1.md)
+
 ## Version 1.7.0
 
 Version 1.7.0 adds fullscreen Wavescope and MilkDrop, convenient song and preset navigation, and a charcoal default theme with customizable colors and brightness. The Player spectrum retains a colorful two-hue gradient that follows the selected accent.
