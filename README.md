@@ -14,7 +14,7 @@ Thank you to everyone who has shown interest in Modulez Player.
 ---
 
 
-**Formerly XMP Module Player.** Version **1.7.2** includes fullscreen
+**Formerly XMP Module Player.** Version **1.7.3** adds sample and pattern previews alongside fullscreen
 music visualizations, convenient playback controls, and a customizable
 interface with vibrant color and brightness adjustments.
 
@@ -80,6 +80,13 @@ types retain their distinct colors for readability.
 
 The parser can be checked using `make check-irc`; that command also performs
 a syntax check of the GTK/GIO source files.
+
+## Version 1.7.3
+
+Double-click a sample in the Samples tab to hear it, or open the Pattern tab to play
+and loop individual patterns in a larger grid.
+
+[1.7.3 release notes](RELEASE_NOTES_1.7.3.md)
 
 ## Version 1.7.2
 
@@ -297,7 +304,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.7.2**
+**Current source version: 1.7.3**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and
