@@ -5,6 +5,7 @@
 #include <SDL.h>
 #include <xmp.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
@@ -27,11 +28,12 @@ static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event, gp
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.7.2"
+#define MODULEZ_VERSION "1.7.3"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
 #define AUDIO_RATE 44100
+#define PATTERN_TAB_SCALE 2
 #define SCOPE_ROW_HEIGHT 76
 #define SCOPE_MARGIN 8
 
@@ -158,6 +160,36 @@ static double viz_levels[VIZ_BANDS];
 static double viz_peaks[VIZ_BANDS];
 static double viz_spectrum[VIZ_BANDS];
 static int selected_sample = 0;
+static GtkWidget *sample_preview_button;
+/* Accessed under the SDL device lock, or by the audio callback itself. */
+static struct xmp_sample *preview_sample;
+static uint64_t preview_phase;
+static int preview_index = -1;
+static gboolean preview_button_active;
+static GtkWidget *pattern_browser, *pattern_choice, *pattern_grid, *pattern_play;
+static GtkWidget *pattern_scroll_view, *pattern_prev, *pattern_next;
+static gboolean pattern_choices_dirty = TRUE;
+static int browser_pattern = -1, browser_order = -1;
+static xmp_context pattern_ctx;
+static gboolean pattern_active, pattern_loop;
+static int preview_order, preview_row, frame_remaining;
+static const Uint8 *frame_pcm;
+
+/* Call on the GTK thread. Detach the context before releasing its memory. */
+static void close_pattern_preview(void)
+{
+    SDL_LockAudioDevice(audio_device);
+    xmp_context old = pattern_ctx;
+    pattern_ctx = NULL;
+    pattern_active = FALSE;
+    frame_remaining = 0;
+    gboolean idle = !playing && !preview_sample;
+    SDL_UnlockAudioDevice(audio_device);
+    if (old) {
+        if (idle) SDL_PauseAudioDevice(audio_device, 1);
+        xmp_free_context(old);
+    }
+}
 #ifdef ENABLE_WAV_EXPORT
 typedef struct {
     ExportWavRequest request;
@@ -288,6 +320,8 @@ static int decoder_thread_fn(void *unused)
 
 static void stop_ffmpeg_decoder(void)
 {
+    if (audio_device) close_pattern_preview();
+    pattern_choices_dirty = TRUE;
     /* Stop shared PCM playback before joining and freeing any renderer. */
     if (audio_device) SDL_PauseAudioDevice(audio_device, 1);
     SDL_AtomicSet(&decoder_stop, 1);
@@ -315,6 +349,7 @@ static void stop_ffmpeg_decoder(void)
     if (audio_device) {
         SDL_PauseAudioDevice(audio_device, 1);
         SDL_LockAudioDevice(audio_device);
+        preview_sample = NULL;
         audio_ring_read_pos = 0;
         audio_ring_write_pos = 0;
         SDL_UnlockAudioDevice(audio_device);
@@ -426,15 +461,75 @@ static GtkWidget *playlist_view;
 static GtkTreeModelFilter *playlist_filter;
 static gchar *playlist_query;
 
+/* Audition the raw waveform once at tracker reference pitch. The normal
+ * playback context stays exactly where it was until the preview ends. */
+static void render_sample_preview(int16_t *out, int frames)
+{
+    const struct xmp_sample *sample = preview_sample;
+    int channels = (sample->flg & XMP_SAMPLE_STEREO) ? 2 : 1;
+    for (int frame = 0; frame < frames; ++frame) {
+        size_t source = (size_t)(preview_phase / AUDIO_RATE) * channels;
+        for (int ch = 0; ch < 2; ++ch) {
+            size_t index = source + (channels == 2 ? ch : 0);
+            out[frame * 2 + ch] = (sample->flg & XMP_SAMPLE_16BIT)
+                ? ((const int16_t *)sample->data)[index]
+                : ((const int8_t *)sample->data)[index] * 256;
+        }
+        preview_phase += 8363;
+        if (preview_phase / AUDIO_RATE >= (uint64_t)sample->len) {
+            preview_sample = NULL;
+            break;
+        }
+    }
+}
+
+/* Check every tracker tick before copying its PCM. A jump or pattern
+ * break can leave the chosen order in the middle of an SDL buffer. */
+static void render_pattern_preview(Uint8 *out, int bytes)
+{
+    gboolean retried = FALSE;
+    while (bytes > 0) {
+        if (!frame_remaining) {
+            struct xmp_frame_info frame;
+            int rc = xmp_play_frame(pattern_ctx);
+            xmp_get_frame_info(pattern_ctx, &frame);
+            if (rc < 0 || frame.pos != preview_order || frame.loop_count ||
+                !frame.buffer || frame.buffer_size <= 0) {
+                if (pattern_loop && !retried) {
+                    xmp_restart_module(pattern_ctx);
+                    xmp_set_position(pattern_ctx, preview_order);
+                    retried = TRUE;
+                    continue;
+                }
+                pattern_active = FALSE;
+                break;
+            }
+            frame_pcm = frame.buffer;
+            frame_remaining = frame.buffer_size;
+            preview_row = frame.row;
+            retried = FALSE;
+        }
+        int n = MIN(bytes, frame_remaining);
+        memcpy(out, frame_pcm, n);
+        frame_pcm += n;
+        frame_remaining -= n;
+        out += n;
+        bytes -= n;
+    }
+}
+
 static void audio_callback(void *userdata, Uint8 *stream, int len)
 {
     (void)userdata;
     memset(stream, 0, len);
 
-    if (!playing || audio_ended)
+    if (pattern_active) {
+        render_pattern_preview(stream, len);
+    } else if (preview_sample) {
+        render_sample_preview((int16_t *)stream, len / (2 * sizeof(int16_t)));
+    } else if (!playing || audio_ended) {
         return;
-
-    if (playback_mode == PLAYBACK_MODULE) {
+    } else if (playback_mode == PLAYBACK_MODULE) {
         if (!module_loaded || !player_started)
             return;
 
@@ -690,6 +785,70 @@ static gboolean on_sample_waveform_draw(GtkWidget *widget,
     return FALSE;
 }
 
+static struct xmp_sample *selected_pcm_sample(void)
+{
+    if (!module_loaded || playback_mode != PLAYBACK_MODULE)
+        return NULL;
+    struct xmp_module_info info;
+    xmp_get_module_info(ctx, &info);
+    if (!info.mod || !info.mod->xxs || selected_sample < 0 ||
+        selected_sample >= info.mod->smp)
+        return NULL;
+    struct xmp_sample *sample = &info.mod->xxs[selected_sample];
+    return sample->data && sample->len > 0 && !(sample->flg & XMP_SAMPLE_SYNTH)
+        ? sample : NULL;
+}
+
+static void refresh_sample_preview_button(void)
+{
+    SDL_LockAudioDevice(audio_device);
+    gboolean active = preview_sample != NULL;
+    gboolean stop = active && preview_index == selected_sample;
+    SDL_UnlockAudioDevice(audio_device);
+    gtk_button_set_label(GTK_BUTTON(sample_preview_button),
+                         stop ? "■ Stop Preview" : "▶ Play Sample");
+    gtk_widget_set_sensitive(sample_preview_button, selected_pcm_sample() != NULL);
+    if (preview_button_active && !active && !playing && !pattern_ctx)
+        SDL_PauseAudioDevice(audio_device, 1);
+    preview_button_active = active;
+}
+
+static void preview_selected_sample(gboolean toggle)
+{
+    struct xmp_sample *sample = selected_pcm_sample();
+    if (!sample)
+        return;
+    close_pattern_preview();
+    SDL_LockAudioDevice(audio_device);
+    if (toggle && preview_sample && preview_index == selected_sample) {
+        preview_sample = NULL;
+    } else {
+        preview_sample = sample;
+        preview_index = selected_sample;
+        preview_phase = 0;
+    }
+    if (preview_sample)
+        preview_button_active = TRUE;
+    gboolean audible = preview_sample || playing;
+    SDL_UnlockAudioDevice(audio_device);
+    SDL_PauseAudioDevice(audio_device, !audible);
+    refresh_sample_preview_button();
+}
+
+static void on_sample_preview(GtkButton *button, gpointer data)
+{
+    (void)button;
+    (void)data;
+    preview_selected_sample(TRUE);
+}
+
+static void on_sample_activated(GtkListBox *box, GtkListBoxRow *row, gpointer data)
+{
+    (void)data;
+    gtk_list_box_select_row(box, row);
+    preview_selected_sample(FALSE);
+}
+
 static void on_sample_selected(GtkListBox *box, GtkListBoxRow *row,
                                gpointer data)
 {
@@ -701,6 +860,7 @@ static void on_sample_selected(GtkListBox *box, GtkListBoxRow *row,
 
     selected_sample = gtk_list_box_row_get_index(row);
     update_sample_details(selected_sample);
+    refresh_sample_preview_button();
 
     if (sample_waveform_area)
         gtk_widget_queue_draw(sample_waveform_area);
@@ -723,6 +883,7 @@ static void populate_sample_browser(void)
         gtk_text_view_get_buffer(GTK_TEXT_VIEW(module_comments_view));
     gtk_text_buffer_set_text(buffer, "", -1);
 
+    refresh_sample_preview_button();
     if (!module_loaded)
         return;
 
@@ -2505,6 +2666,12 @@ static void on_play(GtkButton *button, gpointer data)
     (void)button;
     (void)data;
 
+    close_pattern_preview();
+    SDL_LockAudioDevice(audio_device);
+    preview_sample = NULL;
+    SDL_UnlockAudioDevice(audio_device);
+
+
     if (playback_mode == PLAYBACK_NONE && zx_pending) {
         zx_pending->autoplay = 1;
         set_status("Will play after ZX rendering finishes");
@@ -2618,6 +2785,12 @@ static void on_stop(GtkButton *button, gpointer data)
     (void)button;
     (void)data;
 
+    close_pattern_preview();
+    SDL_LockAudioDevice(audio_device);
+    preview_sample = NULL;
+    SDL_UnlockAudioDevice(audio_device);
+
+
     if (playback_mode == PLAYBACK_NONE && zx_pending) {
         zx_cancel_pending();
         gtk_label_set_text(GTK_LABEL(title_label), "No module loaded");
@@ -2682,6 +2855,7 @@ static void on_seek(GtkRange *range, gpointer data)
     if (updating_seek)
         return;
 
+    close_pattern_preview();
     int ms = (int)gtk_range_get_value(range);
 
     if (playback_mode == PLAYBACK_UADE) {
@@ -3803,8 +3977,10 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
 
     GtkAllocation allocation;
     gtk_widget_get_allocation(widget, &allocation);
-    int width = allocation.width;
-    int height = allocation.height;
+    gboolean browser = widget == pattern_grid;
+    int scale = browser ? PATTERN_TAB_SCALE : 1;
+    cairo_scale(cr, scale, scale);
+    int width = allocation.width / scale;
 
     cairo_set_source_rgb(cr, 0.028, 0.060, 0.075);
     cairo_paint(cr);
@@ -3823,59 +3999,33 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
         return FALSE;
     }
 
-    /* Snapshot visible events before drawing; never render under the audio lock. */
-    struct xmp_event events[13][XMP_MAX_CHANNELS] = {0};
-    SDL_LockAudioDevice(audio_device);
-
     struct xmp_module_info mi;
     struct xmp_frame_info fi;
+    SDL_LockAudioDevice(audio_device);
     xmp_get_module_info(ctx, &mi);
     xmp_get_frame_info(ctx, &fi);
+    int display_pattern = browser ? browser_pattern : fi.pattern;
+    int display_row = browser ? (pattern_active ? preview_row : 0) : fi.row;
+    SDL_UnlockAudioDevice(audio_device);
 
+    /* Pattern events are immutable during playback. Module replacement and
+     * GTK drawing both run on the main thread. */
     struct xmp_module *mod = mi.mod;
-    int display_pattern = fi.pattern;
-    int display_row = fi.row;
-
-    if (!mod || !mod->xxp || !mod->xxt ||
-        display_pattern < 0 || display_pattern >= mod->pat ||
-        !mod->xxp[display_pattern]) {
-        SDL_UnlockAudioDevice(audio_device);
+    if (!mod || !mod->xxp || !mod->xxt || display_pattern < 0 ||
+        display_pattern >= mod->pat || !mod->xxp[display_pattern])
         return FALSE;
-    }
-
     struct xmp_pattern *pat = mod->xxp[display_pattern];
     int channels = MIN(mod->chn, XMP_MAX_CHANNELS);
-    if (channels < 1) {
-        SDL_UnlockAudioDevice(audio_device);
-        return FALSE;
+    const int left = 42, top = 36, row_height = 18, channel_width = 110;
+    int total_rows = pat->rows;
+    int first_row = CLAMP(display_row - 6, 0, MAX(0, total_rows - 13));
+    int visible_rows = 13;
+    if (browser) {
+        double x1, y1, x2, y2;
+        cairo_clip_extents(cr, &x1, &y1, &x2, &y2);
+        first_row = MAX(0, (int)(y1 - top) / row_height - 1);
+        visible_rows = MAX(0, MIN(total_rows, (int)y2 / row_height + 2) - first_row);
     }
-
-    const int left = 42;
-    const int top = 36;
-    const int row_height = 18;
-    const int channel_width = 110;
-    const int visible_rows = 13;
-    const int total_rows = pat->rows;
-    int first_row = display_row - visible_rows / 2;
-
-    if (first_row < 0)
-        first_row = 0;
-    if (first_row > total_rows - visible_rows)
-        first_row = total_rows > visible_rows
-                  ? total_rows - visible_rows : 0;
-
-    for (int visible = 0; visible < visible_rows; ++visible) {
-        int row = first_row + visible;
-        if (row >= total_rows) break;
-        for (int ch = 0; ch < channels; ++ch) {
-            if (left + (ch + 1) * channel_width > width) break;
-            int index = pat->index[ch];
-            if (index >= 0 && index < mod->trk && mod->xxt[index] &&
-                row < mod->xxt[index]->rows)
-                events[visible][ch] = mod->xxt[index]->event[row];
-        }
-    }
-    SDL_UnlockAudioDevice(audio_device);
 
     char heading[96];
     snprintf(heading, sizeof(heading),
@@ -3916,7 +4066,7 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
         if (row >= total_rows)
             break;
 
-        int y = top + visible * row_height;
+        int y = top + (browser ? row + 1 : visible) * row_height;
 
         if (row == display_row) {
             cairo_set_source_rgb(cr, 0.13, 0.27, 0.36);
@@ -3930,9 +4080,9 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
 
         char row_label[16];
         snprintf(row_label, sizeof(row_label), "%02X", row);
-        cairo_set_source_rgb(cr, row == fi.row ? 1.0 : 0.60,
-                             row == fi.row ? 0.88 : 0.65,
-                             row == fi.row ? 0.48 : 0.72);
+        cairo_set_source_rgb(cr, row == display_row ? 1.0 : 0.60,
+                             row == display_row ? 0.88 : 0.65,
+                             row == display_row ? 0.48 : 0.72);
         cairo_move_to(cr, 8, y);
         cairo_show_text(cr, row_label);
 
@@ -3941,7 +4091,11 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
             if (x + channel_width > width)
                 break;
 
-            const struct xmp_event *ev = &events[visible][ch];
+            int track = pat->index[ch];
+            if (track < 0 || track >= mod->trk || !mod->xxt[track] ||
+                row >= mod->xxt[track]->rows)
+                continue;
+            const struct xmp_event *ev = &mod->xxt[track]->event[row];
 
             char note[8] = "...";
             if (ev->note == XMP_KEY_OFF)
@@ -3994,9 +4148,162 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
     return FALSE;
 }
 
+static void pattern_selection_changed(GtkComboBox *combo, gpointer data)
+{
+    (void)data;
+    close_pattern_preview();
+    browser_pattern = browser_order = -1;
+    const char *id = gtk_combo_box_get_active_id(combo);
+    if (id && module_loaded) {
+        struct xmp_module_info mi;
+        xmp_get_module_info(ctx, &mi);
+        browser_order = atoi(id);
+        browser_pattern = mi.mod->xxo[browser_order];
+        int rows = mi.mod->xxp[browser_pattern]->rows;
+        gtk_widget_set_size_request(pattern_grid, PATTERN_TAB_SCALE * (42 + 110 * mi.mod->chn),
+                                   PATTERN_TAB_SCALE * (54 + 18 * rows));
+    }
+    int index = gtk_combo_box_get_active(combo);
+    int count = gtk_tree_model_iter_n_children(gtk_combo_box_get_model(combo), NULL);
+    gtk_widget_set_sensitive(pattern_prev, index > 0);
+    gtk_widget_set_sensitive(pattern_next, index >= 0 && index + 1 < count);
+    gtk_widget_set_sensitive(pattern_play, browser_order >= 0);
+    gtk_button_set_label(GTK_BUTTON(pattern_play), "▶ Play Pattern");
+    GtkAdjustment *v = gtk_scrolled_window_get_vadjustment(
+        GTK_SCROLLED_WINDOW(pattern_scroll_view));
+    gtk_adjustment_set_value(v, 0);
+    gtk_widget_queue_draw(pattern_grid);
+}
+
+static void sync_pattern_choices(void)
+{
+    pattern_choices_dirty = FALSE;
+    gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(pattern_choice));
+    if (!module_loaded) {
+        gtk_widget_set_sensitive(pattern_play, FALSE);
+        gtk_widget_queue_draw(pattern_grid);
+        return;
+    }
+    struct xmp_module_info mi;
+    struct xmp_frame_info fi;
+    SDL_LockAudioDevice(audio_device);
+    xmp_get_module_info(ctx, &mi);
+    xmp_get_frame_info(ctx, &fi);
+    SDL_UnlockAudioDevice(audio_device);
+    gboolean listed[256] = {FALSE};
+    int selected = 0, count = 0;
+    for (int pos = 0; pos < mi.mod->len; ++pos) {
+        int pat = mi.mod->xxo[pos];
+        if (pat >= mi.mod->pat || !mi.mod->xxp[pat] || listed[pat])
+            continue;
+        char id[16], label[32];
+        listed[pat] = TRUE;
+        g_snprintf(id, sizeof(id), "%d", pos);
+        g_snprintf(label, sizeof(label), "Pattern %02d", pat);
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(pattern_choice), id, label);
+        if (pat == fi.pattern) selected = count;
+        ++count;
+    }
+    gtk_combo_box_set_active(GTK_COMBO_BOX(pattern_choice), count ? selected : -1);
+}
+
+static void step_browser_pattern(GtkButton *button, gpointer data)
+{
+    (void)data;
+    GtkComboBox *combo = GTK_COMBO_BOX(pattern_choice);
+    int step = GTK_WIDGET(button) == pattern_prev ? -1 : 1;
+    gtk_combo_box_set_active(combo, gtk_combo_box_get_active(combo) + step);
+}
+
+static void on_pattern_map(GtkWidget *widget, gpointer data)
+{
+    (void)widget;
+    (void)data;
+    if (!pattern_ctx) sync_pattern_choices();
+}
+
+static void play_browser_pattern(GtkButton *button, gpointer data)
+{
+    (void)data;
+    if (pattern_ctx) {
+        close_pattern_preview();
+        gtk_button_set_label(button, "▶ Play Pattern");
+        return;
+    }
+    if (!module_loaded || browser_order < 0 || pattern_choices_dirty)
+        return;
+    xmp_context next = xmp_create_context();
+    if (!next || xmp_load_module(next, current_file) < 0 ||
+        xmp_start_player(next, AUDIO_RATE, 0) < 0) {
+        if (next) xmp_free_context(next);
+        set_status("Could not open this module for pattern preview.");
+        return;
+    }
+    struct xmp_module_info mi;
+    xmp_get_module_info(next, &mi);
+    if (browser_order >= mi.mod->len || mi.mod->xxo[browser_order] != browser_pattern) {
+        xmp_free_context(next);
+        set_status("Module changed on disk. Reopen it to preview patterns.");
+        return;
+    }
+    xmp_set_position(next, browser_order);
+    SDL_LockAudioDevice(audio_device);
+    preview_sample = NULL;
+    pattern_ctx = next;
+    preview_order = browser_order;
+    preview_row = frame_remaining = 0;
+    pattern_active = TRUE;
+    SDL_UnlockAudioDevice(audio_device);
+    gtk_button_set_label(button, "■ Stop Preview");
+    SDL_PauseAudioDevice(audio_device, 0);
+}
+
+static void on_pattern_loop(GtkToggleButton *button, gpointer data)
+{
+    (void)data;
+    SDL_LockAudioDevice(audio_device);
+    pattern_loop = gtk_toggle_button_get_active(button);
+    SDL_UnlockAudioDevice(audio_device);
+}
+
+static void update_pattern_browser(void)
+{
+    if (pattern_ctx) {
+        SDL_LockAudioDevice(audio_device);
+        gboolean active = pattern_active;
+        int row = preview_row;
+        SDL_UnlockAudioDevice(audio_device);
+        if (!active) close_pattern_preview();
+        if (active && gtk_widget_get_mapped(pattern_grid)) {
+            GtkAdjustment *v = gtk_scrolled_window_get_vadjustment(
+                GTK_SCROLLED_WINDOW(pattern_scroll_view));
+            gtk_adjustment_clamp_page(v, PATTERN_TAB_SCALE * (36 + 18 * row),
+                                      PATTERN_TAB_SCALE * (56 + 18 * row));
+        }
+    }
+    if (!gtk_widget_get_mapped(pattern_browser)) return;
+    if (pattern_choices_dirty) sync_pattern_choices();
+    const char *label = pattern_ctx ? "■ Stop Preview" : "▶ Play Pattern";
+    if (g_strcmp0(gtk_button_get_label(GTK_BUTTON(pattern_play)), label)) {
+        gtk_button_set_label(GTK_BUTTON(pattern_play), label);
+        gtk_widget_queue_draw(pattern_grid);
+    } else if (pattern_ctx) {
+        gtk_widget_queue_draw(pattern_grid);
+    }
+}
+
 static gboolean update_display(gpointer data)
 {
     (void)data;
+
+    update_pattern_browser();
+    if (preview_button_active) {
+        SDL_LockAudioDevice(audio_device);
+        gboolean active = preview_sample != NULL;
+        SDL_UnlockAudioDevice(audio_device);
+        if (!active)
+            refresh_sample_preview_button();
+    }
 
     if (playback_mode == PLAYBACK_NONE)
         return G_SOURCE_CONTINUE;
@@ -5492,6 +5799,9 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_widget_set_name(sample_list, "sample-list");
     gtk_list_box_set_selection_mode(GTK_LIST_BOX(sample_list),
                                     GTK_SELECTION_SINGLE);
+    gtk_list_box_set_activate_on_single_click(GTK_LIST_BOX(sample_list), FALSE);
+    g_signal_connect(sample_list, "row-activated",
+        G_CALLBACK(on_sample_activated), NULL);
     g_signal_connect(sample_list, "row-selected",
         G_CALLBACK(on_sample_selected), NULL);
 
@@ -5521,6 +5831,13 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_box_pack_start(GTK_BOX(samples_page), sample_waveform_area,
                        FALSE, FALSE, 0);
 
+    sample_preview_button = gtk_button_new_with_label("▶ Play Sample");
+    gtk_widget_set_halign(sample_preview_button, GTK_ALIGN_START);
+    gtk_widget_set_sensitive(sample_preview_button, FALSE);
+    g_signal_connect(sample_preview_button, "clicked",
+                     G_CALLBACK(on_sample_preview), NULL);
+    gtk_box_pack_start(GTK_BOX(samples_page), sample_preview_button, FALSE, FALSE, 0);
+
     GtkWidget *comments_heading = gtk_label_new("Module Notes / Comments");
     gtk_widget_set_halign(comments_heading, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(samples_page), comments_heading,
@@ -5547,6 +5864,36 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         compact_tab_label("Samples", "Module samples and notes"));
 
     /* MIDI SoundFont library: persistent paths, startup default, live switching. */
+    pattern_browser = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(pattern_browser), 12);
+    GtkWidget *pattern_controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(pattern_browser), pattern_controls, FALSE, FALSE, 0);
+    pattern_prev = make_button("‹", G_CALLBACK(step_browser_pattern));
+    gtk_widget_set_tooltip_text(pattern_prev, "Previous pattern");
+    gtk_widget_set_sensitive(pattern_prev, FALSE);
+    gtk_box_pack_start(GTK_BOX(pattern_controls), pattern_prev, FALSE, FALSE, 0);
+    pattern_choice = gtk_combo_box_text_new();
+    gtk_box_pack_start(GTK_BOX(pattern_controls), pattern_choice, FALSE, FALSE, 0);
+    pattern_next = make_button("›", G_CALLBACK(step_browser_pattern));
+    gtk_widget_set_tooltip_text(pattern_next, "Next pattern");
+    gtk_widget_set_sensitive(pattern_next, FALSE);
+    gtk_box_pack_start(GTK_BOX(pattern_controls), pattern_next, FALSE, FALSE, 0);
+    pattern_play = make_button("▶ Play Pattern", G_CALLBACK(play_browser_pattern));
+    gtk_widget_set_sensitive(pattern_play, FALSE);
+    gtk_box_pack_start(GTK_BOX(pattern_controls), pattern_play, FALSE, FALSE, 0);
+    GtkWidget *pattern_loop_button = gtk_check_button_new_with_label("Loop");
+    g_signal_connect(pattern_loop_button, "toggled", G_CALLBACK(on_pattern_loop), NULL);
+    gtk_box_pack_start(GTK_BOX(pattern_controls), pattern_loop_button, FALSE, FALSE, 0);
+    pattern_scroll_view = gtk_scrolled_window_new(NULL, NULL);
+    pattern_grid = gtk_drawing_area_new();
+    gtk_container_add(GTK_CONTAINER(pattern_scroll_view), pattern_grid);
+    gtk_box_pack_start(GTK_BOX(pattern_browser), pattern_scroll_view, TRUE, TRUE, 0);
+    g_signal_connect(pattern_grid, "draw", G_CALLBACK(draw_pattern), NULL);
+    g_signal_connect(pattern_choice, "changed", G_CALLBACK(pattern_selection_changed), NULL);
+    g_signal_connect(pattern_browser, "map", G_CALLBACK(on_pattern_map), NULL);
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), pattern_browser,
+        compact_tab_label("Pattern", "Browse and preview module patterns"));
+
     GtkWidget *soundfont_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
     gtk_container_set_border_width(GTK_CONTAINER(soundfont_page),
                                    compact_ui ? 14 : 24);
