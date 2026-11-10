@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Modulez Player v1.7.3 AppImage: WebKit runtime, bundled visualizer assets, UADE and SoundFont.
+# Modulez Player v1.7.4 AppImage: WebKit runtime, bundled visualizer assets, UADE and SoundFont.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,8 +13,8 @@ if [[ ! -x "$project_dir/modulez-player" ]]; then
     echo "Missing modulez-player. Build the native player with: make -j4" >&2
     exit 1
 fi
-if ! grep -aFq 'Modulez Player 1.7.3' "$project_dir/modulez-player"; then
-    echo "The compiled player does not report version 1.7.3. Run make -j4 modulez-player first." >&2
+if ! grep -aFq 'Modulez Player 1.7.4' "$project_dir/modulez-player"; then
+    echo "The compiled player does not report version 1.7.4. Run make -j4 modulez-player first." >&2
     exit 1
 fi
 if [[ ! -x "$project_dir/xmp-zx-helper" ]]; then
@@ -29,7 +29,7 @@ if [[ ! -x "$linuxdeploy" || ! -x "$gtk_plugin" ]]; then
 fi
 
 # WebKit needs subprocesses and an injected bundle in addition to its .so.
-for command in pkg-config python3 patchelf gresource; do
+for command in pkg-config python3 patchelf gresource zsyncmake; do
     command -v "$command" >/dev/null || { echo "Missing build tool: $command" >&2; exit 1; }
 done
 pipewire_libdir="$(pkg-config --variable=libdir libpipewire-0.3)"
@@ -132,7 +132,7 @@ fi
 mkdir -p -- "$dist_dir"
 build_root="$(mktemp -d /tmp/xmp-appimage.XXXXXXXX)"
 appdir="$build_root/Modulez_Player.AppDir"
-output_name="Modulez-Player-v1.7.3-x86_64.AppImage"
+output_name="Modulez-Player-v1.7.4-x86_64.AppImage"
 
 cleanup() {
     if [[ -n "${build_root:-}" && -d "$build_root" &&
@@ -142,7 +142,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ -e "$dist_dir/$output_name" ]]; then
+if [[ -e "$dist_dir/$output_name" || -e "$dist_dir/$output_name.zsync" ]]; then
     echo "Output file already exists: $dist_dir/$output_name" >&2
     exit 1
 fi
@@ -244,6 +244,8 @@ verify_bundle() {
     python3 "$script_dir/relocate-webkit.py" "$bundle" --source-dir "$webkit_helper_dir" --verify
     grep -q 'MODULEZ_WEBKIT_RELOCATION_V1' "$bundle/AppRun"
     [[ -e "$bundle/AppRun.modulez" ]]
+    [[ -x "$bundle/usr/libexec/modulez/install-update" ]]
+    "$bundle/usr/libexec/modulez/zsync2.AppImage" --appimage-extract-and-run --version
     local resources
     resources="$(gresource list "$bundle/usr/bin/modulez-player")"
     for asset in index.html viewer.js wavescope.js presets.js projectm-adapter.js projectm/projectm.js projectm/projectm.wasm; do
@@ -253,6 +255,18 @@ verify_bundle() {
     cmp -- "$source_notice" \
         "$bundle/usr/share/doc/xmp-module-player/soundfonts/SOUNDFONT-LICENSE.txt"
 }
+# Ship the upstream HTTPS-capable client intact, isolated from player libraries.
+updater_name=zsync2-92-fc62ae7-x86_64.AppImage
+updater="$tool_dir/$updater_name"
+if [[ ! -f "$updater" ]]; then
+    updater="$build_root/$updater_name"
+    curl --fail --location --retry 2 --output "$updater" \
+        "https://github.com/AppImageCommunity/zsync2/releases/download/continuous/$updater_name"
+fi
+updater_digest=c1d448722ae3552ebc0c80d5ebd05272dd371f0218328bff6142ebc8f9d46381
+[[ "$(sha256sum < "$updater")" == "$updater_digest  -" ]] || { echo "Unexpected zsync2 checksum" >&2; exit 1; }
+install -Dm755 "$updater" "$appdir/usr/libexec/modulez/zsync2.AppImage"
+install -m755 "$script_dir/install-update.sh" "$appdir/usr/libexec/modulez/install-update"
 verify_bundle "$appdir"
 
 # Stage the notices after linuxdeploy has collected libraries, but before
@@ -265,15 +279,23 @@ mkdir -p -- "$build_root/packaging-tools"
 ( cd -- "$build_root/packaging-tools"; "$linuxdeploy" --appimage-extract > extraction.log 2>&1 )
 output_plugin="$(find "$build_root/packaging-tools/squashfs-root" -type f -name linuxdeploy-plugin-appimage -perm /111 -print -quit)"
 [[ -n "$output_plugin" ]] || { echo "Bundled AppImage output plugin not found." >&2; exit 1; }
+update_info='gh-releases-zsync|dasteele-ctrl|xmp-module-player|latest|Modulez-Player-v*-x86_64.AppImage.zsync'
 (
     cd -- "$dist_dir"
+    LDAI_UPDATE_INFORMATION="$update_info" \
     ARCH=x86_64 LDAI_OUTPUT="$output_name" "$output_plugin" --appdir "$appdir"
 )
 
-if [[ ! -f "$dist_dir/$output_name" ]]; then
-    echo "The packaging tool did not create the expected AppImage." >&2
-    exit 1
-fi
+# Use the classic writer, including the final partial block. Check its whole-file
+# digest against the exact release asset before either file is distributed.
+(
+    cd -- "$dist_dir"
+    [[ "$("./$output_name" --appimage-updateinformation)" == "$update_info" ]]
+    zsyncmake -u "$output_name" -o "$build_root/release.zsync" "$output_name"
+    digest=$(LC_ALL=C sed -n '/^$/q; s/^SHA-1: //p' "$build_root/release.zsync")
+    [[ "$digest" == "$(sha1sum "$output_name" | cut -d' ' -f1)" ]]
+    mv -- "$build_root/release.zsync" "$output_name.zsync"
+)
 
 # Inspect the compressed result, not just its staging directory. This does
 # not start the player or require FUSE. The exit trap removes extracted bytes.

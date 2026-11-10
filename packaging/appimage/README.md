@@ -11,11 +11,18 @@ local test, not a distribution-ready release.
 3. Download `linuxdeploy-plugin-gtk.sh` from
    <https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh>
    into that same folder. Make both tools executable.
-4. Run `bash packaging/appimage/build.sh` from the repository root.
+4. Install the control-file writer with `sudo apt install zsync` on Mint.
+5. Run `bash packaging/appimage/build.sh` from the repository root. The build
+   downloads the pinned zsync2 client and checks its SHA-256 before bundling it.
+   For offline builds, place `zsync2-92-fc62ae7-x86_64.AppImage` in the tools
+   directory first.
 
-The resulting version 1.5 AppImage is written under `dist/` with a timestamp in
-its filename (`Modulez-Player-v1.5-Linux-x86_64-*.AppImage`). This script does not
-overwrite an existing AppImage.
+Publish both versioned files from `dist/` on the same GitHub Release,
+for example `Modulez-Player-v1.7.4-x86_64.AppImage` and its matching
+`.AppImage.zsync`. Use a draft release until both assets are present.
+The filename must match the release tag. The About tab uses that tag for
+the entire update. Existing users download the first updater-enabled version
+manually. Later updates preserve the local filename and take effect at restart.
 
 GTK plugins and resources can be loaded dynamically, so `ldd` alone does
 not capture all runtime dependencies. Test the AppImage with ZX, tracker,
