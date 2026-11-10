@@ -67,6 +67,12 @@ types retain their distinct colors for readability.
 The parser can be checked using `make check-irc`; that command also performs
 a syntax check of the GTK/GIO source files.
 
+## Version 1.7.4
+
+The AppImage can install future releases from the About tab. Choose **Check for
+a new version**, then **Install update**. Keep listening or choose **Restart now**
+after the download finishes. Your existing launcher continues to use the same path.
+
 ## Version 1.7.3
 
 Double-click a sample in the Samples tab to hear it, or open the Pattern tab to play
@@ -290,7 +296,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.7.3**
+**Current source version: 1.7.4**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and

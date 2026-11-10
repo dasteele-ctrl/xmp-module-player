@@ -28,7 +28,7 @@ static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event, gp
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.7.3"
+#define MODULEZ_VERSION "1.7.4"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
@@ -5400,6 +5400,33 @@ static gboolean parse_release(const char *tag, guint64 parts[4])
     return valid;
 }
 
+/* AppRun handles this status only after the old single-instance process exits. */
+#define RESTART_AFTER_UPDATE 75
+static gboolean restart_after_update;
+
+static gchar *appimage_installer(void)
+{
+    const gchar *image = g_getenv("MODULEZ_APPIMAGE_PATH");
+    const gchar *appdir = g_getenv("APPDIR");
+    if (!image || !appdir || !g_file_test(image, G_FILE_TEST_IS_REGULAR))
+        return NULL;
+    gchar *helper = g_build_filename(appdir, "usr", "libexec", "modulez", "install-update", NULL);
+    if (!g_file_test(helper, G_FILE_TEST_IS_EXECUTABLE))
+        g_clear_pointer(&helper, g_free);
+    return helper;
+}
+
+static void update_install_finished(GObject *source, GAsyncResult *result, gpointer data)
+{
+    GtkLabel *label = GTK_LABEL(data);
+    if (g_subprocess_wait_check_finish(G_SUBPROCESS(source), result, NULL))
+        gtk_label_set_markup(label, "Update installed. <a href=\"restart\">Restart now</a> or keep listening.");
+    else
+        gtk_label_set_markup(label, "Update failed. Check the connection, free space and folder permissions. "
+                             CHECK_LINK " · <a href=\"" RELEASES_URL "/latest\">View release</a>");
+    g_object_unref(label);
+}
+
 static void update_check_finished(GObject *source, GAsyncResult *result, gpointer data)
 {
     GtkLabel *label = GTK_LABEL(data);
@@ -5414,10 +5441,15 @@ static void update_check_finished(GObject *source, GAsyncResult *result, gpointe
         parse_release(MODULEZ_VERSION "-r" MODULEZ_RELEASE_REVISION, current)) {
         int i = 0;
         while (i < 4 && latest[i] == current[i]) ++i;
-        if (i < 4 && latest[i] > current[i])
-            message = g_markup_printf_escaped("%s is available. <a href=\"%s\">View release</a>",
-                                              url + strlen(prefix), url);
-        else
+        if (i < 4 && latest[i] > current[i]) {
+            const gchar *tag = url + strlen(prefix);
+            gchar *helper = appimage_installer();
+            g_object_set_data_full(G_OBJECT(label), "release-tag", g_strdup(tag), g_free);
+            message = g_markup_printf_escaped(helper ? "%s is available. <a href=\"install\">Install update</a> · <a href=\"%s\">View release</a>"
+                                                     : "%s is available. <a href=\"%s\">View release</a>",
+                                              tag, url);
+            g_free(helper);
+        } else
             message = g_strdup("You’re up to date.");
     }
     gtk_label_set_markup(label, message ? message : "Couldn’t check for updates. " CHECK_LINK);
@@ -5429,6 +5461,27 @@ static void update_check_finished(GObject *source, GAsyncResult *result, gpointe
 static gboolean about_update_link(GtkLabel *label, const gchar *uri, gpointer data)
 {
     (void)data;
+    if (g_str_equal(uri, "restart")) {
+        restart_after_update = TRUE;
+        on_tray_quit(NULL);
+        return TRUE;
+    }
+    if (g_str_equal(uri, "install")) {
+        gchar *helper = appimage_installer();
+        const gchar *tag = g_object_get_data(G_OBJECT(label), "release-tag");
+        GSubprocess *install = helper && tag
+            ? g_subprocess_new(G_SUBPROCESS_FLAGS_STDOUT_SILENCE, NULL, helper, tag, NULL)
+            : NULL;
+        g_free(helper);
+        if (!install) {
+            gtk_label_set_markup(label, "Couldn’t start the AppImage updater. " CHECK_LINK);
+            return TRUE;
+        }
+        gtk_label_set_text(label, "Downloading and verifying the update…");
+        g_subprocess_wait_check_async(install, NULL, update_install_finished, g_object_ref(label));
+        g_object_unref(install);
+        return TRUE;
+    }
     if (!g_str_equal(uri, "check")) return FALSE;
     GSubprocess *process = g_subprocess_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE |
                                             G_SUBPROCESS_FLAGS_STDERR_SILENCE, NULL,
@@ -6397,5 +6450,5 @@ int main(int argc, char **argv)
     g_signal_connect(app, "command-line", G_CALLBACK(on_launch), NULL);
     int status = g_application_run(app, argc, argv);
     g_object_unref(app);
-    return status;
+    return restart_after_update ? RESTART_AFTER_UPDATE : status;
 }
