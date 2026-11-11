@@ -1,8 +1,9 @@
 # Modulez Player
 
-**Formerly XMP Module Player.** Modulez Player **1.7.4** adds AppImage updates
-from the About tab. You can keep listening while the new version downloads and
-restart when you’re ready.
+**Formerly XMP Module Player.** Modulez Player **1.7.5** introduces
+About-tab visual enhancements and interface refinements.
+The built-in AppImage updater, introduced in 1.7.4, lets you update
+without interrupting playback.
 
 Version 1.6 introduced Wavescope and projectM / MilkDrop visualization.
 Version 1.5 introduced the Modulez Player name and icon.
@@ -67,6 +68,12 @@ types retain their distinct colors for readability.
 The parser can be checked using `make check-irc`; that command also performs
 a syntax check of the GTK/GIO source files.
 
+## Version 1.7.5
+
+About-tab visual enhancements and minor interface refinements.
+
+[1.7.5 release notes](RELEASE_NOTES_1.7.5.md)
+
 ## Version 1.7.4
 
 The AppImage can install future releases from the About tab. Choose **Check for
@@ -113,11 +120,11 @@ license notices and source references are included with the visualization assets
 
 ## Download
 
-**[Download Modulez Player v1.7.4 for Linux x86_64](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.7.4/Modulez-Player-v1.7.4-x86_64.AppImage)**
+**[Download the latest Modulez Player for Linux x86_64](https://github.com/dasteele-ctrl/xmp-module-player/releases/latest)**
 
 [Latest release notes and downloads](https://github.com/dasteele-ctrl/xmp-module-player/releases/latest).
 
-For a first install or an upgrade from 1.7.3 or earlier, download the AppImage.
+For a first install or an upgrade from 1.7.4 or earlier, download the AppImage.
 The built-in updater uses the matching `.AppImage.zsync` file automatically for future updates.
 
 The AppImage includes the application launcher icon.
@@ -125,13 +132,13 @@ See [all releases](../../releases) for earlier versions.
 
 ### Running the AppImage
 
-1. Download the versioned `Modulez-Player-v1.7.4-x86_64.AppImage` file from Release v1.7.4.
+1. Download the versioned `Modulez-Player-v1.7.5-x86_64.AppImage` file from Release v1.7.5.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x Modulez-Player-v1.7.4-x86_64.AppImage
-   ./Modulez-Player-v1.7.4-x86_64.AppImage
+   chmod +x Modulez-Player-v1.7.5-x86_64.AppImage
+   ./Modulez-Player-v1.7.5-x86_64.AppImage
    ```
 
 ### Add the player to your application menu
@@ -299,7 +306,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.7.4**
+**Current source version: 1.7.5**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and

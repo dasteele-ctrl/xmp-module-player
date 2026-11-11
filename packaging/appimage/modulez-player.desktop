@@ -8,5 +8,5 @@ Terminal=false
 Categories=AudioVideo;Audio;Player;
 StartupNotify=true
 X-AppImage-Name=Modulez Player
-X-AppImage-Version=1.7.4
+X-AppImage-Version=1.7.5
 X-AppImage-Arch=x86_64
