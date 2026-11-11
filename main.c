@@ -4891,6 +4891,8 @@ static void update_custom_theme(void)
     gchar *accent = theme_color(accent_hue, 1.0, .94, "#777777");
     gchar *selection = theme_color(accent_hue, 1.0, .36, "#555555");
     gchar *css = g_strdup_printf(
+        "@define-color modulez_tribute_background %s;"
+        "@define-color modulez_tribute_accent %s;"
         "window, notebook, notebook stack, window.dialog, window.dialog.background,"
         "window.dialog box, window.dialog grid, window.dialog paned,"
         "window.dialog stack, window.xmp-dialog, .xmp-dialog-surface,"
@@ -4945,7 +4947,7 @@ static void update_custom_theme(void)
         "#xmp-irc-root notebook tab:checked {background-color:%s;"
         "color:#ffffff;border-bottom:2px solid %s;}"
         "#xmp-irc-root label {color:#e6e6e6;}"
-        ,base,panel,field,panel,hover,selection,accent,accent,
+        ,base,accent,base,panel,field,panel,hover,selection,accent,accent,
         accent,accent,field,accent,
         base,field,panel,hover,panel,panel,selection,accent);
     gtk_css_provider_load_from_data(custom_theme_provider, css, -1, NULL);
