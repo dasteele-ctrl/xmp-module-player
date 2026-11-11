@@ -66,7 +66,23 @@ static gboolean draw_tribute(GtkWidget *area, cairo_t *cr, gpointer data)
     Point front[POINT_COUNT], back[POINT_COUNT];
     Face faces[POINT_COUNT];
     unsigned count = 0;
-    cairo_set_source_rgb(cr, 16/255.0, 18/255.0, 21/255.0);
+    /* Read the current palette on every draw, including after a live theme change. */
+    GtkStyleContext *style = gtk_widget_get_style_context(area);
+    GdkRGBA background = {16/255.0, 18/255.0, 21/255.0, 1};
+    GdkRGBA accent = {.467, .467, .467, 1}, foreground;
+    gtk_style_context_lookup_color(style, "modulez_tribute_background", &background);
+    gtk_style_context_lookup_color(style, "modulez_tribute_accent", &accent);
+    gtk_style_context_get_color(style, GTK_STATE_FLAG_NORMAL, &foreground);
+    /* Use hue rather than accent brightness to keep the metal legible.
+     * A neutral accent retains the original silver finish. */
+    double peak = MAX(accent.red, MAX(accent.green, accent.blue));
+    double tint[3] = {1, 1, 1};
+    if (peak > 0) {
+        tint[0] = .65 + .35 * accent.red / peak;
+        tint[1] = .65 + .35 * accent.green / peak;
+        tint[2] = .65 + .35 * accent.blue / peak;
+    }
+    gdk_cairo_set_source_rgba(cr, &background);
     cairo_paint(cr);
     for (unsigned i = 0; i < POINT_COUNT; ++i) {
         front[i] = rotate(logo_points[i][0], logo_points[i][1], -12, t);
@@ -94,7 +110,7 @@ static gboolean draw_tribute(GtkWidget *area, cairo_t *cr, gpointer data)
         }
         cairo_close_path(cr);
         double s = faces[i].shade;
-        cairo_set_source_rgb(cr, (s-6)/255, s/255, (s+7)/255);
+        cairo_set_source_rgb(cr, (s-6)/255*tint[0], s/255*tint[1], (s+7)/255*tint[2]);
         cairo_fill(cr);
     }
     outline(cr, front, w, h);
@@ -103,12 +119,12 @@ static gboolean draw_tribute(GtkWidget *area, cairo_t *cr, gpointer data)
     const double stops[][4] = {{0,170,178,189},{.25,226,229,233},{.46,166,175,184},
         {.52,101,113,125},{.8,184,192,201},{1,224,227,232}};
     for (unsigned i = 0; i < G_N_ELEMENTS(stops); ++i)
-        cairo_pattern_add_color_stop_rgb(silver, stops[i][0], stops[i][1]/255,
-                                        stops[i][2]/255, stops[i][3]/255);
+        cairo_pattern_add_color_stop_rgb(silver, stops[i][0], stops[i][1]/255*tint[0],
+                                        stops[i][2]/255*tint[1], stops[i][3]/255*tint[2]);
     cairo_set_source(cr, silver);
     cairo_fill_preserve(cr);
     cairo_pattern_destroy(silver);
-    cairo_set_source_rgb(cr, 201/255.0, 207/255.0, 214/255.0);
+    cairo_set_source_rgb(cr, 201/255.0*tint[0], 207/255.0*tint[1], 214/255.0*tint[2]);
     cairo_set_line_width(cr, .7);
     cairo_stroke(cr);
     cairo_save(cr);
@@ -133,7 +149,7 @@ static gboolean draw_tribute(GtkWidget *area, cairo_t *cr, gpointer data)
     cairo_clip(cr);
     cairo_select_font_face(cr, "monospace", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 13);
-    cairo_set_source_rgb(cr, 170/255.0, 181/255.0, 189/255.0);
+    gdk_cairo_set_source_rgba(cr, &foreground);
     cairo_text_extents_t ext;
     cairo_text_extents(cr, "M", &ext);
     double advance = MAX(1, ext.x_advance), total = g_utf8_strlen(credits, -1)*advance;
@@ -151,6 +167,13 @@ static gboolean draw_tribute(GtkWidget *area, cairo_t *cr, gpointer data)
     }
     cairo_restore(cr);
     return FALSE;
+}
+
+static void style_updated(GtkWidget *widget, gpointer data)
+{
+    (void)data;
+    /* Animation may be paused or disabled when the palette changes. */
+    gtk_widget_queue_draw(widget);
 }
 
 static gboolean animate(gpointer data)
@@ -218,6 +241,11 @@ static void open_tribute(GtkWidget *target, Trigger *trigger)
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Modulez — In memory of modulez.org",
         GTK_IS_WINDOW(top) ? GTK_WINDOW(top) : NULL, GTK_DIALOG_DESTROY_WITH_PARENT,
         "Close", GTK_RESPONSE_CLOSE, NULL);
+    gtk_style_context_add_class(gtk_widget_get_style_context(dialog), "xmp-dialog");
+    gtk_style_context_add_class(gtk_widget_get_style_context(
+        gtk_dialog_get_content_area(GTK_DIALOG(dialog))), "xmp-dialog-surface");
+    gtk_style_context_add_class(gtk_widget_get_style_context(
+        gtk_dialog_get_action_area(GTK_DIALOG(dialog))), "xmp-dialog-surface");
     trigger->dialog = dialog;
     Tribute *demo = g_new0(Tribute, 1);
     g_object_set_data_full(G_OBJECT(dialog), "modulez-tribute", demo, g_free);
@@ -233,6 +261,7 @@ static void open_tribute(GtkWidget *target, Trigger *trigger)
     demo->pause = gtk_button_new_with_label(demo->paused ? "Play animation" : "Pause animation");
     gtk_widget_set_halign(demo->pause, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(content), demo->pause, FALSE, FALSE, 6);
+    g_signal_connect(demo->area, "style-updated", G_CALLBACK(style_updated), NULL);
     g_signal_connect(demo->area, "draw", G_CALLBACK(draw_tribute), demo);
     g_signal_connect(demo->area, "map", G_CALLBACK(on_map), demo);
     g_signal_connect(demo->area, "unmap", G_CALLBACK(on_unmap), demo);
