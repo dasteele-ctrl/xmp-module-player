@@ -7943,7 +7943,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         gtk_image_new_from_pixbuf(about_small_icon) : gtk_image_new();
     if (about_small_icon) g_object_unref(about_small_icon);
     gtk_widget_set_size_request(about_icon, 48, 48);
-    gtk_box_pack_start(GTK_BOX(about_page), modulez_about_tribute_wrap(about_icon),
+    gtk_box_pack_start(GTK_BOX(about_page), modulez_about_tribute_wrap_themed(about_icon, theme_dialog),
                        FALSE, FALSE, 0);
 
     GtkWidget *about_title = gtk_label_new("Modulez Player " MODULEZ_VERSION);
