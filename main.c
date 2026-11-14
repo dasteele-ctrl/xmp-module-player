@@ -138,7 +138,7 @@ static FfmpegAudio *ffmpeg_audio;
 /* Radio worker owns its FFmpeg context. Shared text is protected by a mutex. */
 static GMutex radio_mutex;
 static char radio_title[1024], radio_error[512];
-static SDL_atomic_t radio_ready;
+static SDL_atomic_t radio_ready, radio_retry_delay;
 static GtkWidget *radio_status_label, *radio_title_label;
 typedef struct {
     const char *name, *genre, *quality, *url, *website;
@@ -426,50 +426,71 @@ static int radio_interrupt(void *opaque)
 static int radio_worker(void *unused)
 {
     const RadioStation *station = unused;
-    char error[512] = "", title[1024] = "";
-    FfmpegAudio *audio = ffmpeg_audio_open_stream(station->url,
-        radio_interrupt, NULL, error, sizeof(error));
-    int16_t chunk[4096 * 2];
-    if (audio) {
-        while (!SDL_AtomicGet(&decoder_stop)) {
-            SDL_LockAudioDevice(audio_device);
-            unsigned used = (audio_ring_write_pos + AUDIO_BUFFER_FRAMES -
-                             audio_ring_read_pos) % AUDIO_BUFFER_FRAMES;
-            unsigned room = AUDIO_BUFFER_FRAMES - used - 1;
-            SDL_UnlockAudioDevice(audio_device);
-            if (!room) { SDL_Delay(5); continue; }
-            int got = ffmpeg_audio_read(audio, chunk, MIN(room, 4096u));
-            if (got <= 0) {
-                g_strlcpy(error, got < 0 ? "Radio connection lost" :
-                          "Radio stream ended", sizeof(error));
-                break;
+    unsigned retry = 0;
+    while (!SDL_AtomicGet(&decoder_stop)) {
+        char error[512] = "", title[1024] = "";
+        FfmpegAudio *audio = ffmpeg_audio_open_stream(station->url,
+            radio_interrupt, NULL, error, sizeof(error));
+        int16_t chunk[4096 * 2];
+        int stable_frames = 0;
+        if (audio) {
+            while (!SDL_AtomicGet(&decoder_stop)) {
+                SDL_LockAudioDevice(audio_device);
+                unsigned used = (audio_ring_write_pos + AUDIO_BUFFER_FRAMES -
+                                 audio_ring_read_pos) % AUDIO_BUFFER_FRAMES;
+                unsigned room = AUDIO_BUFFER_FRAMES - used - 1;
+                SDL_UnlockAudioDevice(audio_device);
+                if (!room) { SDL_Delay(5); continue; }
+                int got = ffmpeg_audio_read(audio, chunk, MIN(room, 4096u));
+                if (got <= 0) {
+                    g_strlcpy(error, got < 0 ? "Radio connection lost" :
+                              "Radio stream ended", sizeof(error));
+                    break;
+                }
+                if (SDL_AtomicGet(&decoder_stop)) break;
+                ffmpeg_audio_stream_title(audio, title, sizeof(title));
+                if (title[0]) {
+                    g_mutex_lock(&radio_mutex);
+                    g_strlcpy(radio_title, title, sizeof(radio_title));
+                    g_mutex_unlock(&radio_mutex);
+                }
+                SDL_LockAudioDevice(audio_device);
+                for (int i = 0; i < got; ++i) {
+                    unsigned slot = audio_ring_write_pos;
+                    audio_ring[slot * 2] = chunk[i * 2];
+                    audio_ring[slot * 2 + 1] = chunk[i * 2 + 1];
+                    audio_ring_write_pos = (slot + 1) % AUDIO_BUFFER_FRAMES;
+                }
+                SDL_UnlockAudioDevice(audio_device);
+                SDL_AtomicSet(&radio_retry_delay, 0);
+                SDL_AtomicSet(&radio_ready, 1);
+                stable_frames += got;
+                if (stable_frames >= AUDIO_RATE * 15) {
+                    retry = 0;
+                    stable_frames = AUDIO_RATE * 15;
+                }
             }
-            if (SDL_AtomicGet(&decoder_stop)) break;
-            ffmpeg_audio_stream_title(audio, title, sizeof(title));
-            if (title[0]) {
-                g_mutex_lock(&radio_mutex);
-                g_strlcpy(radio_title, title, sizeof(radio_title));
-                g_mutex_unlock(&radio_mutex);
-            }
-            SDL_LockAudioDevice(audio_device);
-            for (int i = 0; i < got; ++i) {
-                unsigned slot = audio_ring_write_pos;
-                audio_ring[slot * 2] = chunk[i * 2];
-                audio_ring[slot * 2 + 1] = chunk[i * 2 + 1];
-                audio_ring_write_pos = (slot + 1) % AUDIO_BUFFER_FRAMES;
-            }
-            SDL_UnlockAudioDevice(audio_device);
-            SDL_AtomicSet(&radio_ready, 1);
+            ffmpeg_audio_close(audio);
         }
-        ffmpeg_audio_close(audio);
-    }
-    if (!SDL_AtomicGet(&decoder_stop)) {
+        if (SDL_AtomicGet(&decoder_stop)) break;
+        /* Keep the SDL consumer alive during reconnects; it drains queued
+         * samples and then emits silence. Never signal terminal EOF here. */
+        SDL_AtomicSet(&radio_ready, 0);
+        unsigned delay = MIN(2u << MIN(retry, 4u), 30u);
+        if (retry < 4) ++retry;
         g_mutex_lock(&radio_mutex);
+        radio_title[0] = '\0';
         g_strlcpy(radio_error, error[0] ? error : "Radio disconnected",
                   sizeof(radio_error));
         g_mutex_unlock(&radio_mutex);
-        SDL_AtomicSet(&ffmpeg_decode_error, 1);
-        SDL_AtomicSet(&ffmpeg_decode_finished, 1);
+        SDL_AtomicSet(&radio_retry_delay, (int)delay);
+        for (unsigned elapsed = 0; elapsed < delay * 1000u; elapsed += 50u) {
+            if (SDL_AtomicGet(&decoder_stop)) break;
+            SDL_Delay(50);
+        }
+        if (SDL_AtomicGet(&decoder_stop)) break;
+        /* A negative value means the retry is connecting, not waiting. */
+        SDL_AtomicSet(&radio_retry_delay, -1);
     }
     return 0;
 }
@@ -517,6 +538,7 @@ static void stop_ffmpeg_decoder(void)
     ffmpeg_position_frames = 0;
     ffmpeg_duration_ms = 0;
     SDL_AtomicSet(&radio_ready, 0);
+    SDL_AtomicSet(&radio_retry_delay, 0);
     radio_mark_active("");
     if (radio_status_label) {
         gtk_label_set_text(GTK_LABEL(radio_status_label), "Stopped");
@@ -1451,7 +1473,8 @@ static void world_search_complete(GObject *source, GAsyncResult *result, gpointe
     gtk_widget_set_sensitive(world_next, count >= WORLD_LIMIT);
     gtk_widget_set_sensitive(world_prev, world_offset > 0);
     if (playback_mode == PLAYBACK_RADIO && !stopped)
-        radio_mark_active(SDL_AtomicGet(&radio_ready) ? "Playing" : "Connecting");
+        radio_mark_active(SDL_AtomicGet(&radio_retry_delay) ? "Reconnecting" :
+            SDL_AtomicGet(&radio_ready) ? "Playing" : "Connecting");
 done:
     if (bytes) g_bytes_unref(bytes);
     g_clear_error(&error);
@@ -5498,12 +5521,21 @@ static gboolean update_display(gpointer data)
             gtk_label_set_text(GTK_LABEL(title_label), valid);
             gtk_label_set_text(GTK_LABEL(radio_title_label), valid);
             g_free(valid);
+            int retry_delay = SDL_AtomicGet(&radio_retry_delay);
+            char retry_status[128];
+            if (retry_delay > 0)
+                g_snprintf(retry_status, sizeof(retry_status),
+                           "Connection lost — retrying after %d seconds", retry_delay);
+            else
+                g_strlcpy(retry_status, "Reconnecting…", sizeof(retry_status));
             const char *status = ended ? (error[0] ? error : "Disconnected") :
+                retry_delay ? retry_status :
                 SDL_AtomicGet(&radio_ready) ? "Live radio playing" : "Connecting…";
             gchar *station_status = g_strdup_printf("%s — %s", radio_name, status);
             gtk_label_set_text(GTK_LABEL(radio_status_label), station_status);
             g_free(station_status);
             radio_mark_active(ended ? "Disconnected" :
+                retry_delay ? "Reconnecting" :
                 SDL_AtomicGet(&radio_ready) ? "Playing" : "Connecting");
             set_status(status);
         }
