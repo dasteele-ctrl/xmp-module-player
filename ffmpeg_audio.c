@@ -10,6 +10,8 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
+#include <libavutil/dict.h>
+#include <libavutil/opt.h>
 #include <libavutil/mem.h>
 #include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
@@ -24,6 +26,7 @@ struct FfmpegAudio {
     AVPacket *packet;
     AVFrame *frame;
     int stream_index;
+    int live_stream;
     int flush_sent;
     int decoder_finished;
     int resampler_finished;
@@ -244,7 +247,8 @@ static int produce_pcm(FfmpegAudio *audio)
     }
 }
 
-FfmpegAudio *ffmpeg_audio_open(const char *filename,
+static FfmpegAudio *open_input(const char *filename, int live_stream,
+                               FfmpegAudioInterrupt interrupt, void *opaque,
                                char *error_text,
                                unsigned long error_text_size)
 {
@@ -254,7 +258,24 @@ FfmpegAudio *ffmpeg_audio_open(const char *filename,
         return NULL;
     }
 
-    int result = avformat_open_input(&audio->format, filename, NULL, NULL);
+    audio->live_stream = live_stream;
+    AVDictionary *options = NULL;
+    if (live_stream) {
+        audio->format = avformat_alloc_context();
+        if (!audio->format) {
+            set_error(error_text, error_text_size, "Cannot allocate stream context");
+            ffmpeg_audio_close(audio);
+            return NULL;
+        }
+        audio->format->interrupt_callback.callback = interrupt;
+        audio->format->interrupt_callback.opaque = opaque;
+        av_dict_set(&options, "rw_timeout", "5000000", 0);
+        av_dict_set(&options, "icy", "1", 0);
+        av_dict_set(&options, "protocol_whitelist", "http,https,tcp,tls", 0);
+        av_dict_set(&options, "format_whitelist", "mp3,aac,ogg,flac,matroska,webm", 0);
+    }
+    int result = avformat_open_input(&audio->format, filename, NULL, &options);
+    av_dict_free(&options);
     if (result < 0) {
         set_av_error(error_text, error_text_size,
                      "Cannot open media file", result);
@@ -324,7 +345,9 @@ FfmpegAudio *ffmpeg_audio_open(const char *filename,
         return NULL;
     }
 
-    if (stream->duration != AV_NOPTS_VALUE && stream->duration >= 0) {
+    if (live_stream) {
+        audio->duration_ms = 0;
+    } else if (stream->duration != AV_NOPTS_VALUE && stream->duration >= 0) {
         audio->duration_ms = av_rescale_q(
             stream->duration, stream->time_base, (AVRational){1, 1000});
     } else if (audio->format->duration != AV_NOPTS_VALUE &&
@@ -334,6 +357,56 @@ FfmpegAudio *ffmpeg_audio_open(const char *filename,
 
     set_error(error_text, error_text_size, "");
     return audio;
+}
+
+FfmpegAudio *ffmpeg_audio_open(const char *filename, char *error_text,
+                               unsigned long error_text_size)
+{
+    return open_input(filename, 0, NULL, NULL, error_text, error_text_size);
+}
+
+FfmpegAudio *ffmpeg_audio_open_stream(const char *url,
+                                     FfmpegAudioInterrupt interrupt,
+                                     void *opaque, char *error_text,
+                                     unsigned long error_text_size)
+{
+    if (!url || (strncmp(url, "https://", 8) && strncmp(url, "http://", 7))) {
+        set_error(error_text, error_text_size, "Expected an HTTP or HTTPS radio URL");
+        return NULL;
+    }
+    return open_input(url, 1, interrupt, opaque, error_text, error_text_size);
+}
+
+void ffmpeg_audio_stream_title(FfmpegAudio *audio, char *title,
+                               unsigned long title_size)
+{
+    if (!title || !title_size)
+        return;
+    title[0] = '\0';
+    if (!audio || !audio->live_stream || !audio->format)
+        return;
+    uint8_t *packet = NULL;
+    if (audio->format->pb &&
+        av_opt_get(audio->format->pb, "icy_metadata_packet", AV_OPT_SEARCH_CHILDREN,
+                   &packet) >= 0 && packet) {
+        const char *start = strstr((const char *)packet, "StreamTitle='");
+        if (start) {
+            start += strlen("StreamTitle='");
+            const char *end = strstr(start, "';");
+            if (end) {
+                size_t len = (size_t)(end - start);
+                if (len >= title_size) len = title_size - 1;
+                memcpy(title, start, len);
+                title[len] = '\0';
+                av_free(packet);
+                return;
+            }
+        }
+    }
+    av_free(packet);
+    AVDictionaryEntry *entry = av_dict_get(audio->format->metadata,
+                                          "StreamTitle", NULL, 0);
+    if (entry) snprintf(title, title_size, "%s", entry->value);
 }
 
 int ffmpeg_audio_read(FfmpegAudio *audio, int16_t *output, int max_frames)
@@ -370,7 +443,7 @@ int ffmpeg_audio_read(FfmpegAudio *audio, int16_t *output, int max_frames)
 }
 int ffmpeg_audio_seek(FfmpegAudio *audio, int64_t position_ms)
 {
-    if (!audio || !audio->format || !audio->codec ||
+    if (!audio || audio->live_stream || !audio->format || !audio->codec ||
         audio->stream_index < 0)
         return -1;
 
