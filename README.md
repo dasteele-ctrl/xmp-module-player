@@ -1,7 +1,6 @@
 # Modulez Player
 
-**Formerly XMP Module Player.** Modulez Player **1.7.5** introduces
-About-tab visual enhancements and interface refinements.
+**Formerly XMP Module Player.** Modulez Player **1.8.0 — The Streaming Update** introduces live internet radio, worldwide station discovery, persistent favorites and custom stations, automatic reconnection, and a modernized interface.
 The built-in AppImage updater, introduced in 1.7.4, lets you update
 without interrupting playback.
 
@@ -15,9 +14,13 @@ A native Linux music player built with **GTK3 and SDL2**, with playback powered 
 
 Modulez Player brings classic tracker music and regular audio playback to the Linux desktop, with a graphical interface, real-time audio visualization, and detailed module and sample information.
 
-![Modulez Player 1.7.7 showing the Player tab](modulez-player-1.7.7.png)
+![Modulez Player 1.8.0 playing Josss - Robotto on Nectarine in the Radio tab](modulez-player-1.8.0.png)
 
 ## Features
+
+- **Live internet radio** — ten curated retro/demoscene stations, worldwide Radio Browser search, favorites and custom streams
+- **Automatic radio reconnection** — increasing retry delays and automatic playback recovery
+- **Modern interface** — collapsible navigation sidebar, rounded windows and themed dialogs, and responsive visualizer controls
 
 - 🌐 **Open URL** — download and play audio and tracker files directly from HTTP/HTTPS URLs, including ModArchive and Modland
 - 🎵 **PSID and RSID support** — recognizes `.sid`, `.psid`, and `.rsid` filenames
@@ -53,6 +56,31 @@ Modulez Player brings classic tracker music and regular audio playback to the Li
 - 🔊 **Sample browser** with waveform visualization, sample details, loop information, and module comments
 - 🖥️ **Native GTK3 interface** with SDL2 audio output
 - 💬 **Built-in IRC chat** with EsperNet/#modulez preset, TLS, channel tabs, and private messages
+
+## Internet radio (new in 1.8.0)
+
+The **Radio** tab offers four categories: Demoscene / Retro, World Radio,
+Favorites and Custom Stations. Double-click a station to play it through
+FFmpeg. Live stream metadata, when supplied by the broadcaster, appears in
+the player. Radio uses the same volume, equalizer and visualization pipeline
+as local playback; live streams do not support seeking.
+
+The curated directory includes ERICADE, Nectarine, SceneSat, Kohina, CVGM,
+SLAY Radio, Rainwave Chiptunes, ModFM, NoLife Radio and SceneSat Compo Backgrounds.
+World Radio uses [Radio Browser](https://www.radio-browser.info/) to search by
+station name, country code and tag. Favorites and custom stations are saved in
+`~/.config/modulez-player/radio-stations.ini` (or the corresponding XDG directory).
+Custom stations accept HTTP/HTTPS stream URLs.
+
+When a stream fails, the player retries after 2, 4, 8, 16 and then 30 seconds.
+After 15 seconds of successfully decoded audio, the delay resets. Stop,
+station switching, local playback and quitting cancel retries. Recovery begins
+when the decoder detects a failure; a stalled network may take longer to detect.
+
+Source builds require libsoup 3 and JSON-GLib development headers in addition
+to the existing dependencies (Mint/Ubuntu: `sudo apt install libsoup-3.0-dev libjson-glib-dev`).
+
+See the [1.8.0 release notes](RELEASE_NOTES_1.8.0.md).
 
 ## IRC community chat
 
@@ -137,13 +165,13 @@ See [all releases](../../releases) for earlier versions.
 
 ### Running the AppImage
 
-1. Download the versioned `Modulez-Player-v1.7.7-x86_64.AppImage` file from Release v1.7.7.
+1. Download the versioned `Modulez-Player-v1.8.0-x86_64.AppImage` file from Release v1.8.0.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x Modulez-Player-v1.7.7-x86_64.AppImage
-   ./Modulez-Player-v1.7.7-x86_64.AppImage
+   chmod +x Modulez-Player-v1.8.0-x86_64.AppImage
+   ./Modulez-Player-v1.8.0-x86_64.AppImage
    ```
 
 ### Add the player to your application menu
@@ -240,7 +268,7 @@ The integrated **Equalizer** tab provides ten adjustable bands (31 Hz to
 spectrum, on/off bypass, and Flat, Rock, Pop, Classical, Jazz, Bass Boost and
 Vocal Clarity presets. Moving a slider creates a Custom preset. Changes are
 applied to the shared stereo output for tracker modules, UADE, SID, ZX, MIDI, and
-regular audio files without any additional audio library. The EQ uses smooth
+regular audio files and live radio without any additional audio library. The EQ uses smooth
 transitions when changing gains or toggling bypass.
 
 EQ settings are stored in
@@ -305,13 +333,14 @@ in the distributed AppImage.
 - [libxmp](https://github.com/libxmp/libxmp) — tracker module playback
 - [UADE](https://zakalwe.fi/uade/) — additional Amiga music formats
 - [libsidplayfp](https://github.com/libsidplayfp/libsidplayfp) — Commodore 64 SID playback
-- [FFmpeg](https://ffmpeg.org/) — decoding regular audio formats
+- [FFmpeg](https://ffmpeg.org/) — decoding regular audio formats and live radio
+- [libsoup](https://libsoup.gnome.org/) and [JSON-GLib](https://gnome.pages.gitlab.gnome.org/json-glib/) — worldwide radio discovery
 - [ZXTune](https://github.com/vitamin-caig/zxtune) — native ZX Spectrum and chiptune playback
 - [FluidSynth](https://www.fluidsynth.org/) — MIDI synthesis with SF2/SF3 SoundFonts
 
 ## Project Status
 
-**Current source version: 1.7.5**
+**Current source version: 1.8.0**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and
