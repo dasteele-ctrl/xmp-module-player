@@ -2,6 +2,7 @@
 #include "about_tribute.h"
 #include <gtk/gtk.h>
 #include <gio/gio.h>
+#include <libsoup/soup.h>
 #include <glib/gstdio.h>
 #include <SDL.h>
 #include <xmp.h>
@@ -29,7 +30,7 @@ static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event, gp
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.7.6"
+#define MODULEZ_VERSION "1.7.7"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
@@ -2326,6 +2327,297 @@ static void on_hvsc_open_folder(GtkButton *button, gpointer data)
 
 static void open_playlist_file(const char *filename);
 
+/* Download into a persistent per-file directory so saved M3U playlists
+ * continue to work after restarting the player. No shell commands are used. */
+#define URL_DOWNLOAD_LIMIT (64u * 1024u * 1024u)
+
+typedef struct {
+    gchar *url;
+    GtkWidget *dialog;
+    GCancellable *cancel;
+} UrlDownload;
+
+static gboolean playlist_is_audio_filename(const gchar *filename);
+
+static void url_download_free(gpointer data)
+{
+    UrlDownload *job = data;
+    g_free(job->url);
+    g_object_unref(job->cancel);
+    g_free(job);
+}
+
+static gchar *url_audio_name(const gchar *candidate)
+{
+    if (!candidate || !*candidate || !g_utf8_validate(candidate, -1, NULL))
+        return NULL;
+    gchar *name = g_path_get_basename(candidate);
+    if (strlen(name) > 240 || name[0] == '.' ||
+        strpbrk(name, "\\\r\n\t") || !playlist_is_audio_filename(name)) {
+        g_free(name);
+        return NULL;
+    }
+    for (const gchar *p = name; *p; ++p) {
+        if ((guchar)*p < 32 || *p == 127) {
+            g_free(name);
+            return NULL;
+        }
+    }
+    return name;
+}
+
+/* URI paths may be encoded by libsoup. Decode only the final segment,
+ * rejecting escaped path separators and embedded NULs. */
+static gchar *url_audio_uri_name(GUri *uri, gboolean fragment)
+{
+    const gchar *value = fragment ? g_uri_get_fragment(uri) : g_uri_get_path(uri);
+    if (!value || !*value) return NULL;
+    const gchar *base = strrchr(value, '/');
+    base = base ? base + 1 : value;
+    GUriFlags flags = g_uri_get_flags(uri);
+    gboolean encoded = (flags & G_URI_FLAGS_ENCODED) ||
+        (flags & (fragment ? G_URI_FLAGS_ENCODED_FRAGMENT : G_URI_FLAGS_ENCODED_PATH));
+    gchar *decoded = encoded ? g_uri_unescape_string(base, "/\\") : g_strdup(base);
+    gchar *name = decoded ? url_audio_name(decoded) : NULL;
+    g_free(decoded);
+    return name;
+}
+
+static void url_download_worker(GTask *task, gpointer source,
+                                gpointer task_data, GCancellable *cancel)
+{
+    (void)source;
+    UrlDownload *job = task_data;
+    GError *error = NULL;
+    SoupSession *session = soup_session_new_with_options("timeout", 30u, NULL);
+    SoupMessage *message = soup_message_new("GET", job->url);
+    GInputStream *input = NULL;
+    GFileOutputStream *output = NULL;
+    GFile *file = NULL;
+    gchar *name = NULL, *path = NULL, *directory = NULL, *root = NULL;
+    GUri *original = NULL;
+    GHashTable *params = NULL;
+    gboolean success = FALSE;
+    gsize total = 0;
+
+    if (!message) {
+        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                            "Invalid HTTP or HTTPS URL.");
+        goto done;
+    }
+    original = g_uri_parse(job->url, G_URI_FLAGS_ENCODED_PATH |
+                           G_URI_FLAGS_ENCODED_FRAGMENT, &error);
+    if (!original) goto done;
+    input = soup_session_send(session, message, cancel, &error);
+    if (!input) goto done;
+    guint status = soup_message_get_status(message);
+    if (status < 200 || status >= 300) {
+        g_set_error(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                    "Server returned HTTP %u.", status);
+        goto done;
+    }
+    SoupMessageHeaders *headers = soup_message_get_response_headers(message);
+    const gchar *type = soup_message_headers_get_content_type(headers, NULL);
+    if (type && (g_ascii_strcasecmp(type, "text/html") == 0 ||
+                 g_ascii_strcasecmp(type, "application/xhtml+xml") == 0)) {
+        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                            "This URL returned a web page. Copy the actual download link.");
+        goto done;
+    }
+    if (soup_message_headers_get_content_length(headers) > URL_DOWNLOAD_LIMIT) {
+        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                            "Download exceeds the 64 MiB limit.");
+        goto done;
+    }
+    /* Prefer the explicit URL filename when present; Content-Disposition
+     * remains a fallback for opaque download endpoints. */
+    name = url_audio_uri_name(original, TRUE);
+    if (!name) name = url_audio_uri_name(soup_message_get_uri(message), FALSE);
+    if (!name) name = url_audio_uri_name(original, FALSE);
+    if (!name && soup_message_headers_get_content_disposition(headers, NULL, &params) && params)
+        name = url_audio_name(g_hash_table_lookup(params, "filename"));
+    if (!name) {
+        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                            "No supported audio filename was found in the download link or response.");
+        goto done;
+    }
+    root = g_build_filename(g_get_user_data_dir(), "modulez-player", "downloads", NULL);
+    if (g_mkdir_with_parents(root, 0700) != 0) {
+        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                            "Could not create the download directory.");
+        goto done;
+    }
+    directory = g_build_filename(root, "url-XXXXXX", NULL);
+    if (!g_mkdtemp(directory)) {
+        g_clear_pointer(&directory, g_free);
+        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                            "Could not create a private download folder.");
+        goto done;
+    }
+    path = g_build_filename(directory, name, NULL);
+    file = g_file_new_for_path(path);
+    output = g_file_create(file, G_FILE_CREATE_PRIVATE, cancel, &error);
+    if (!output) goto done;
+    guint8 buffer[32768];
+    for (;;) {
+        gssize count = g_input_stream_read(input, buffer, sizeof buffer, cancel, &error);
+        if (count < 0) goto done;
+        if (count == 0) break;
+        if ((gsize)count > URL_DOWNLOAD_LIMIT - total) {
+            g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                                "Download exceeds the 64 MiB limit.");
+            goto done;
+        }
+        if (!g_output_stream_write_all(G_OUTPUT_STREAM(output), buffer,
+                                       (gsize)count, NULL, cancel, &error)) goto done;
+        total += (gsize)count;
+    }
+    if (!total) {
+        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                            "The downloaded file was empty.");
+        goto done;
+    }
+    if (!g_output_stream_close(G_OUTPUT_STREAM(output), cancel, &error)) goto done;
+    if (g_cancellable_set_error_if_cancelled(cancel, &error)) goto done;
+    success = TRUE;
+
+done:
+    if (output) {
+        g_output_stream_close(G_OUTPUT_STREAM(output), NULL, NULL);
+        g_object_unref(output);
+    }
+    if (input) {
+        g_input_stream_close(input, NULL, NULL);
+        g_object_unref(input);
+    }
+    g_clear_object(&file);
+    g_clear_pointer(&params, g_hash_table_unref);
+    g_clear_pointer(&original, g_uri_unref);
+    g_clear_object(&message);
+    g_object_unref(session);
+    if (!success) {
+        if (path) g_unlink(path);
+        if (directory) g_rmdir(directory);
+    }
+    g_free(directory);
+    g_free(root);
+    g_free(name);
+    if (success) g_task_return_pointer(task, path, g_free);
+    else {
+        g_free(path);
+        g_task_return_error(task, error);
+    }
+}
+
+static void url_download_dialog_destroy(GtkWidget *widget, gpointer data)
+{
+    (void)widget;
+    UrlDownload *job = data;
+    job->dialog = NULL;
+    g_cancellable_cancel(job->cancel);
+}
+
+static void url_download_response(GtkDialog *dialog, gint response, gpointer data)
+{
+    (void)response;
+    UrlDownload *job = data;
+    g_cancellable_cancel(job->cancel);
+    gtk_dialog_set_response_sensitive(dialog, GTK_RESPONSE_CANCEL, FALSE);
+}
+
+static void url_download_complete(GObject *source, GAsyncResult *result, gpointer data)
+{
+    (void)source;
+    (void)data;
+    GTask *task = G_TASK(result);
+    UrlDownload *job = g_task_get_task_data(task);
+    GError *error = NULL;
+    gchar *path = g_task_propagate_pointer(task, &error);
+    gboolean cancelled = g_cancellable_is_cancelled(job->cancel);
+    if (job->dialog) {
+        /* Disconnect destroy cancellation before normal completion. */
+        g_signal_handlers_disconnect_by_func(job->dialog, url_download_dialog_destroy, job);
+        gtk_widget_destroy(job->dialog);
+        job->dialog = NULL;
+        if (path && !cancelled) {
+            open_playlist_file(path);
+        } else if (!cancelled && error) {
+            GtkWidget *message = gtk_message_dialog_new(GTK_WINDOW(window),
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE, "%s", error->message);
+            theme_dialog(message);
+            gtk_dialog_run(GTK_DIALOG(message));
+            gtk_widget_destroy(message);
+        }
+    }
+    g_free(path);
+    g_clear_error(&error);
+}
+
+static void on_open_url(GtkButton *button, gpointer data)
+{
+    (void)button;
+    (void)data;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Open URL", GTK_WINDOW(window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Open", GTK_RESPONSE_ACCEPT, NULL);
+    theme_dialog(dialog);
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 12);
+    GtkWidget *label = gtk_label_new("Paste a direct HTTP or HTTPS audio download link:");
+    GtkWidget *entry = gtk_entry_new();
+    gtk_entry_set_width_chars(GTK_ENTRY(entry), 55);
+    gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT);
+    gtk_box_pack_start(GTK_BOX(content), label, FALSE, FALSE, 6);
+    gtk_box_pack_start(GTK_BOX(content), entry, FALSE, FALSE, 6);
+    gtk_widget_show_all(dialog);
+    gchar *url = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT)
+        url = g_strdup(gtk_entry_get_text(GTK_ENTRY(entry)));
+    gtk_widget_destroy(dialog);
+    if (!url) return;
+    g_strstrip(url);
+    GUri *uri = g_uri_parse(url, G_URI_FLAGS_NONE, NULL);
+    if (!uri || !g_uri_get_scheme(uri) || !g_uri_get_host(uri) || !*g_uri_get_host(uri) ||
+        g_uri_get_userinfo(uri) ||
+        (g_ascii_strcasecmp(g_uri_get_scheme(uri), "https") &&
+         g_ascii_strcasecmp(g_uri_get_scheme(uri), "http"))) {
+        if (uri) g_uri_unref(uri);
+        g_free(url);
+        GtkWidget *message = gtk_message_dialog_new(GTK_WINDOW(window),
+            GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+            "Enter a valid HTTP or HTTPS download URL without credentials.");
+        theme_dialog(message);
+        gtk_dialog_run(GTK_DIALOG(message));
+        gtk_widget_destroy(message);
+        return;
+    }
+    g_uri_unref(uri);
+    UrlDownload *job = g_new0(UrlDownload, 1);
+    job->url = url;
+    job->cancel = g_cancellable_new();
+    job->dialog = gtk_dialog_new_with_buttons("Downloading audio", GTK_WINDOW(window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_Cancel", GTK_RESPONSE_CANCEL, NULL);
+    theme_dialog(job->dialog);
+    content = gtk_dialog_get_content_area(GTK_DIALOG(job->dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 16);
+    GtkWidget *spinner = gtk_spinner_new();
+    gtk_spinner_start(GTK_SPINNER(spinner));
+    gtk_box_pack_start(GTK_BOX(content), spinner, FALSE, FALSE, 8);
+    gtk_box_pack_start(GTK_BOX(content), gtk_label_new("Downloading audio file…"), FALSE, FALSE, 8);
+    g_signal_connect(job->dialog, "response", G_CALLBACK(url_download_response), job);
+    g_signal_connect(job->dialog, "destroy", G_CALLBACK(url_download_dialog_destroy), job);
+    gtk_widget_show_all(job->dialog);
+    GTask *task = g_task_new(NULL, job->cancel, url_download_complete, NULL);
+    g_task_set_task_data(task, job, url_download_free);
+    /* Worker handles cancellation explicitly, including partial-file cleanup. */
+    g_task_set_check_cancellable(task, FALSE);
+    g_task_run_in_thread(task, url_download_worker);
+    g_object_unref(task);
+}
+
 static void on_open(GtkButton *button, gpointer data)
 {
     (void)button;
@@ -2347,6 +2639,7 @@ static void on_open(GtkButton *button, gpointer data)
         "*.mid", "*.MID", "*.midi", "*.MIDI", "*.kar", "*.KAR",
         "*.s3m", "*.S3M", "*.mptm", "*.MPTM", "*.mtm", "*.MTM",
         "*.669", "*.amf", "*.med", "*.okt", "*.ult", "*.sid", "*.SID",
+        "*.rsid", "*.RSID", "*.psid", "*.PSID",
         "*.mp3", "*.MP3", "*.wav", "*.WAV", "*.m4a", "*.M4A",
         "*.aac", "*.AAC", "*.ogg", "*.OGG", "*.oga", "*.OGA", "*.opus", "*.OPUS",
         "*.flac", "*.FLAC", "*.webm", "*.WEBM", "*.mka", "*.MKA",
@@ -3588,6 +3881,7 @@ static void on_playlist_add(GtkButton *button, gpointer data)
         "*.mid", "*.MID", "*.midi", "*.MIDI", "*.kar", "*.KAR",
         "*.s3m", "*.S3M", "*.mptm", "*.MPTM", "*.mtm", "*.MTM",
         "*.669", "*.amf", "*.med", "*.okt", "*.ult", "*.sid", "*.SID",
+        "*.rsid", "*.RSID", "*.psid", "*.PSID",
         "*.mp3", "*.MP3", "*.wav", "*.WAV", "*.m4a", "*.M4A",
         "*.aac", "*.AAC", "*.ogg", "*.OGG", "*.oga", "*.OGA", "*.opus", "*.OPUS",
         "*.flac", "*.FLAC", "*.webm", "*.WEBM", "*.mka", "*.MKA",
@@ -3636,7 +3930,7 @@ static gboolean playlist_is_audio_filename(const gchar *filename)
     static const gchar *extensions[] = {
         ".mod", ".xm", ".it", ".mid", ".midi", ".kar",
         ".s3m", ".mptm", ".mtm", ".669", ".amf", ".med",
-        ".okt", ".ult", ".sid", ".mp3", ".wav", ".m4a",
+        ".okt", ".ult", ".sid", ".rsid", ".psid", ".mp3", ".wav", ".m4a",
         ".aac", ".ogg", ".oga", ".opus", ".flac", ".webm",
         ".mka", ".aiff", ".aif", ".wma", ".mp4", ".pt3",
         ".pt2", ".ay", ".vtx", ".ym", ".stc", ".sqt",
@@ -5048,7 +5342,7 @@ static void apply_style(void)
         " background-color: #16515a; color: #ffffff; }"
         "notebook header { background: #08181d; border-color: #25545a; }"
         "notebook tab { background: #0d1e25; color: #b8d7d8;"
-        " border: 1px solid #28525a; padding: 8px 12px; }"
+        " border: 1px solid #28525a; border-radius: 12px; padding: 8px 12px; }"
         "notebook tab:checked { background: #14343b;"
         " border-bottom: 2px solid #45d9cb; }"
         "notebook tab:hover { background: #163039; }"
@@ -5073,8 +5367,8 @@ static void apply_style(void)
         "textview#module-comments, textview#module-comments text {"
         " background-color: #050d11; color: #dbeff0; }"
         "button, combobox button { background: #10262e; color: #dbeff0;"
-        " border: 1px solid #34616a; border-radius: 4px;"
-        " padding: 7px 12px; }"
+        " border: 1px solid #34616a; border-radius: 12px;"
+        " padding: 8px 14px; }"
         "button:hover { background: #193b44; }"
         "scale trough { background: #163139; min-height: 6px; }"
         "scale highlight { background: #39d4c5; }"
@@ -5657,37 +5951,48 @@ static int create_player(void)
                      G_CALLBACK(draw_visualizer), NULL);
     gtk_box_pack_start(GTK_BOX(top), visualizer_area, TRUE, TRUE, 0);
 
-    GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_pack_start(GTK_BOX(outer), controls, FALSE, FALSE, 0);
+    GtkWidget *file_controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(outer), file_controls, FALSE, FALSE, 0);
 
-    gtk_box_pack_start(GTK_BOX(controls),
-        make_button("Open File…", G_CALLBACK(on_open)), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(file_controls),
+        make_button("Open File", G_CALLBACK(on_open)), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(file_controls),
+        make_button("Open URL", G_CALLBACK(on_open_url)), FALSE, FALSE, 0);
 #ifdef ENABLE_WAV_EXPORT
-    gtk_box_pack_start(GTK_BOX(controls),
-        make_button("Export WAV…", G_CALLBACK(on_export_wav)), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(file_controls),
+        make_button("Export WAV", G_CALLBACK(on_export_wav)), FALSE, FALSE, 0);
 #endif
-    gtk_box_pack_start(GTK_BOX(controls),
-        make_button("|◀", G_CALLBACK(on_previous)), FALSE, FALSE, 0);
 
-    play_button = gtk_button_new_with_label("▶  Play");
-    g_signal_connect(play_button, "clicked", G_CALLBACK(on_play), NULL);
-    gtk_box_pack_start(GTK_BOX(controls), play_button, FALSE, FALSE, 0);
-
-    gtk_box_pack_start(GTK_BOX(controls),
-        make_button("■  Stop", G_CALLBACK(on_stop)), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(controls),
-        make_button("▶|", G_CALLBACK(on_next)), FALSE, FALSE, 0);
-
-
+    GtkWidget *file_spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_size_request(file_spacer, 12, -1);
+    gtk_box_pack_start(GTK_BOX(file_controls), file_spacer, FALSE, FALSE, 0);
     GtkWidget *volume_label = gtk_label_new("Volume");
-    gtk_box_pack_start(GTK_BOX(controls), volume_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(file_controls), volume_label, FALSE, FALSE, 0);
     volume_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 100, 1);
     gtk_scale_set_draw_value(GTK_SCALE(volume_scale), TRUE);
     gtk_scale_set_value_pos(GTK_SCALE(volume_scale), GTK_POS_RIGHT);
-    gtk_widget_set_size_request(volume_scale, 140, -1);
+    gtk_widget_set_size_request(volume_scale, compact_ui ? 100 : 140, -1);
     gtk_range_set_value(GTK_RANGE(volume_scale), master_volume);
     g_signal_connect(volume_scale, "value-changed", G_CALLBACK(on_volume_changed), NULL);
-    gtk_box_pack_start(GTK_BOX(controls), volume_scale, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(file_controls), volume_scale, TRUE, TRUE, 0);
+
+    GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_set_homogeneous(GTK_BOX(controls), TRUE);
+    gtk_box_pack_start(GTK_BOX(outer), controls, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(controls),
+        make_button("|◀", G_CALLBACK(on_previous)), TRUE, TRUE, 0);
+
+    play_button = gtk_button_new_with_label("▶  Play");
+    g_signal_connect(play_button, "clicked", G_CALLBACK(on_play), NULL);
+    gtk_box_pack_start(GTK_BOX(controls), play_button, TRUE, TRUE, 0);
+
+    gtk_box_pack_start(GTK_BOX(controls),
+        make_button("■  Stop", G_CALLBACK(on_stop)), TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(controls),
+        make_button("▶|", G_CALLBACK(on_next)), TRUE, TRUE, 0);
+
+    gtk_box_pack_start(GTK_BOX(outer),
+        gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
 
     /* Keep the search and toggle reachable when the track list is collapsed. */
     GtkWidget *playlist_controls =
@@ -5698,7 +6003,7 @@ static int create_player(void)
     GtkWidget *playlist_heading = gtk_label_new("Playlist");
     gtk_widget_set_halign(playlist_heading, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(playlist_controls), playlist_heading,
-                       TRUE, TRUE, 0);
+                       FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(playlist_controls),
         make_button("Add Files", G_CALLBACK(on_playlist_add)),
@@ -5820,23 +6125,25 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     g_object_bind_property(show_patterns, "active", lower_box, "visible", G_BINDING_SYNC_CREATE);
     gtk_paned_set_position(GTK_PANED(content_pane), compact_ui ? 150 : 230);
 
-    gtk_box_pack_start(GTK_BOX(outer), seek_scale, FALSE, FALSE, 0);
+    GtkWidget *player_footer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_box_pack_start(GTK_BOX(outer), player_footer, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(player_footer), seek_scale, FALSE, FALSE, 0);
 
     time_label = gtk_label_new("00:00 / 00:00");
     gtk_label_set_xalign(GTK_LABEL(time_label), 1);
-    gtk_box_pack_start(GTK_BOX(outer), time_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(player_footer), time_label, FALSE, FALSE, 0);
 
     GtkWidget *separator = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
-    gtk_box_pack_start(GTK_BOX(outer), separator, FALSE, FALSE, 4);
+    gtk_box_pack_start(GTK_BOX(player_footer), separator, FALSE, FALSE, 0);
 
     details_label = gtk_label_new(NULL);
     gtk_label_set_xalign(GTK_LABEL(details_label), 0);
     gtk_label_set_ellipsize(GTK_LABEL(details_label), PANGO_ELLIPSIZE_MIDDLE);
-    gtk_box_pack_start(GTK_BOX(outer), details_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(player_footer), details_label, FALSE, FALSE, 0);
 
     status_label = gtk_label_new("Ready");
     gtk_label_set_xalign(GTK_LABEL(status_label), 0);
-    gtk_box_pack_start(GTK_BOX(outer), status_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(player_footer), status_label, FALSE, FALSE, 0);
 
     gtk_notebook_append_page(
         GTK_NOTEBOOK(notebook), player_page, gtk_label_new("Player"));
