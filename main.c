@@ -3,6 +3,7 @@
 #include <gtk/gtk.h>
 #include <gio/gio.h>
 #include <libsoup/soup.h>
+#include <json-glib/json-glib.h>
 #include <glib/gstdio.h>
 #include <SDL.h>
 #include <xmp.h>
@@ -30,7 +31,7 @@ static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event, gp
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.7.7"
+#define MODULEZ_VERSION "1.8.0"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
@@ -46,7 +47,8 @@ typedef enum {
     PLAYBACK_SID,
     PLAYBACK_MIDI,
     PLAYBACK_ZX,
-    PLAYBACK_UADE
+    PLAYBACK_UADE,
+    PLAYBACK_RADIO
 } PlaybackMode;
 
 static PlaybackMode playback_mode = PLAYBACK_NONE;
@@ -90,6 +92,8 @@ static GtkWidget *volume_scale;
 static GtkWidget *play_button;
 static XmpTrayIcon *tray_icon;
 static gboolean minimize_to_tray = TRUE;
+static gboolean sidebar_collapsed = FALSE;
+static gboolean modern_window = TRUE;
 static GtkWidget *channels_label;
 static GtkWidget *details_label;
 static GtkWidget *scope_area;
@@ -131,6 +135,99 @@ static unsigned int audio_ring_write_pos;
 static SDL_Thread *decoder_thread;
 static SDL_atomic_t decoder_stop;
 static FfmpegAudio *ffmpeg_audio;
+/* Radio worker owns its FFmpeg context. Shared text is protected by a mutex. */
+static GMutex radio_mutex;
+static char radio_title[1024], radio_error[512];
+static SDL_atomic_t radio_ready, radio_retry_delay;
+static GtkWidget *radio_status_label, *radio_title_label;
+typedef struct {
+    const char *name, *genre, *quality, *url, *website;
+} RadioStation;
+static const RadioStation radio_stations[] = {
+    {"ERICADE Radio", "Tracker / demoscene", "MP3 192 kbps", "https://radio.ericade.net/sc/stream/1/", "https://ericade.radio/"},
+    {"Nectarine", "Demoscene", "MP3 192 kbps", "https://nectarine.inversi0n.org/necta192.mp3", "https://scenestream.net/"},
+    {"SceneSat", "Demoscene / electronic", "MP3 HQ", "https://streams.scenesat.com/main/hq.mp3", "https://scenesat.com/"},
+    {"Kohina", "Classic chiptunes", "Ogg Vorbis", "http://kohina.duckdns.org:8000/stream.ogg", "https://www.kohina.com/"},
+    {"CVGM", "Game music / demoscene", "MP3 192 kbps", "https://slacker.cvgm.net/cvgm192", "https://radio.cvgm.net/"},
+    {"SLAY Radio", "Commodore 64 remixes", "MP3", "http://relay4.slayradio.org:8000/", "https://www.slayradio.org/"},
+    {"Rainwave Chiptunes", "Video game chiptunes", "MP3", "https://relay.rainwave.cc/chiptune.mp3", "https://rainwave.cc/chiptune/"},
+    {"ModFM", "Tracker music", "Auto", "http://radio.modules.pl:8500/;stream/1", "https://modules.pl/"},
+    {"NoLife Radio", "Video game music", "Auto", "https://listen.nolife-radio.com/stream", "https://nolife-radio.com/"},
+    {"SceneSat Compo Backgrounds", "Demoscene", "MP3 HQ", "https://streams.scenesat.com/compobg/hq.mp3", "https://scenesat.com/"},
+};
+/* Only the GTK thread changes this index, after joining the old worker. */
+static guint radio_active = 0;
+/* Owned by the GTK thread; replaced only after joining the decoder. */
+static gchar *radio_dynamic_name, *radio_dynamic_url, *radio_dynamic_uuid;
+static RadioStation radio_dynamic_station;
+#define radio_name (radio_dynamic_name ? radio_dynamic_name : radio_stations[radio_active].name)
+#define radio_url (radio_dynamic_url ? radio_dynamic_url : radio_stations[radio_active].url)
+enum { WORLD_NAME, WORLD_COUNTRY, WORLD_TAGS, WORLD_QUALITY, WORLD_STATE,
+       WORLD_URL, WORLD_WEBSITE, WORLD_UUID, WORLD_COLS };
+static GtkListStore *world_store;
+static GtkListStore *saved_stores[2];
+static GtkWidget *saved_views[2];
+static GtkWidget *world_view, *world_name, *world_country, *world_tag;
+static GtkWidget *world_status, *world_play, *world_website, *world_next, *world_prev;
+static GCancellable *world_cancel;
+static gboolean world_closing;
+static guint world_offset;
+static gchar *world_params;
+#define WORLD_LIMIT 100
+enum { RADIO_ID, RADIO_NAME, RADIO_GENRE, RADIO_QUALITY, RADIO_STATE, RADIO_COLS };
+static GtkListStore *radio_store;
+static GtkWidget *radio_view, *radio_website, *radio_play_button;
+static GtkTreeModelFilter *radio_filter;
+static gchar *radio_query;
+
+static void radio_mark_active(const char *state)
+{
+    if (!radio_store) return;
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(radio_store), &iter);
+    while (valid) {
+        guint id;
+        gtk_tree_model_get(GTK_TREE_MODEL(radio_store), &iter, RADIO_ID, &id, -1);
+        const char *next = !radio_dynamic_name && id == radio_active ? state : "";
+        gchar *previous = NULL;
+        gtk_tree_model_get(GTK_TREE_MODEL(radio_store), &iter, RADIO_STATE, &previous, -1);
+        if (g_strcmp0(previous, next) != 0)
+            gtk_list_store_set(radio_store, &iter, RADIO_STATE, next, -1);
+        g_free(previous);
+        valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(radio_store), &iter);
+    }
+    if (!world_store) return;
+    valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(world_store), &iter);
+    while (valid) {
+        gchar *uuid = NULL, *previous = NULL;
+        gtk_tree_model_get(GTK_TREE_MODEL(world_store), &iter,
+                           WORLD_UUID, &uuid, WORLD_STATE, &previous, -1);
+        const char *next = radio_dynamic_uuid &&
+            g_strcmp0(uuid, radio_dynamic_uuid) == 0 ? state : "";
+        if (g_strcmp0(previous, next) != 0)
+            gtk_list_store_set(world_store, &iter, WORLD_STATE, next, -1);
+        g_free(uuid);
+        g_free(previous);
+        valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(world_store), &iter);
+    }
+    for (guint k = 0; k < 2; k++) {
+        if (!saved_stores[k]) continue;
+        GtkTreeModel *m = GTK_TREE_MODEL(saved_stores[k]);
+        valid = gtk_tree_model_get_iter_first(m, &iter);
+        while (valid) {
+            gchar *uuid = NULL, *previous = NULL;
+            gtk_tree_model_get(m, &iter, WORLD_UUID, &uuid, WORLD_STATE, &previous, -1);
+            gchar *retro = g_strdup_printf("retro:%u", radio_active);
+            const char *active = radio_dynamic_uuid ? radio_dynamic_uuid : retro;
+            const char *next = g_strcmp0(uuid, active) == 0 ? state : "";
+            if (g_strcmp0(previous, next) != 0)
+                gtk_list_store_set(saved_stores[k], &iter, WORLD_STATE, next, -1);
+            g_free(retro); g_free(uuid); g_free(previous);
+            valid = gtk_tree_model_iter_next(m, &iter);
+        }
+    }
+
+}
 static SidAudio *sid_audio;
 static UadeAudio *uade_audio;
 static MidiAudio *midi_audio;
@@ -320,6 +417,84 @@ static int decoder_thread_fn(void *unused)
     return 0;
 }
 
+static int radio_interrupt(void *opaque)
+{
+    (void)opaque;
+    return SDL_AtomicGet(&decoder_stop);
+}
+
+static int radio_worker(void *unused)
+{
+    const RadioStation *station = unused;
+    unsigned retry = 0;
+    while (!SDL_AtomicGet(&decoder_stop)) {
+        char error[512] = "", title[1024] = "";
+        FfmpegAudio *audio = ffmpeg_audio_open_stream(station->url,
+            radio_interrupt, NULL, error, sizeof(error));
+        int16_t chunk[4096 * 2];
+        int stable_frames = 0;
+        if (audio) {
+            while (!SDL_AtomicGet(&decoder_stop)) {
+                SDL_LockAudioDevice(audio_device);
+                unsigned used = (audio_ring_write_pos + AUDIO_BUFFER_FRAMES -
+                                 audio_ring_read_pos) % AUDIO_BUFFER_FRAMES;
+                unsigned room = AUDIO_BUFFER_FRAMES - used - 1;
+                SDL_UnlockAudioDevice(audio_device);
+                if (!room) { SDL_Delay(5); continue; }
+                int got = ffmpeg_audio_read(audio, chunk, MIN(room, 4096u));
+                if (got <= 0) {
+                    g_strlcpy(error, got < 0 ? "Radio connection lost" :
+                              "Radio stream ended", sizeof(error));
+                    break;
+                }
+                if (SDL_AtomicGet(&decoder_stop)) break;
+                ffmpeg_audio_stream_title(audio, title, sizeof(title));
+                if (title[0]) {
+                    g_mutex_lock(&radio_mutex);
+                    g_strlcpy(radio_title, title, sizeof(radio_title));
+                    g_mutex_unlock(&radio_mutex);
+                }
+                SDL_LockAudioDevice(audio_device);
+                for (int i = 0; i < got; ++i) {
+                    unsigned slot = audio_ring_write_pos;
+                    audio_ring[slot * 2] = chunk[i * 2];
+                    audio_ring[slot * 2 + 1] = chunk[i * 2 + 1];
+                    audio_ring_write_pos = (slot + 1) % AUDIO_BUFFER_FRAMES;
+                }
+                SDL_UnlockAudioDevice(audio_device);
+                SDL_AtomicSet(&radio_retry_delay, 0);
+                SDL_AtomicSet(&radio_ready, 1);
+                stable_frames += got;
+                if (stable_frames >= AUDIO_RATE * 15) {
+                    retry = 0;
+                    stable_frames = AUDIO_RATE * 15;
+                }
+            }
+            ffmpeg_audio_close(audio);
+        }
+        if (SDL_AtomicGet(&decoder_stop)) break;
+        /* Keep the SDL consumer alive during reconnects; it drains queued
+         * samples and then emits silence. Never signal terminal EOF here. */
+        SDL_AtomicSet(&radio_ready, 0);
+        unsigned delay = MIN(2u << MIN(retry, 4u), 30u);
+        if (retry < 4) ++retry;
+        g_mutex_lock(&radio_mutex);
+        radio_title[0] = '\0';
+        g_strlcpy(radio_error, error[0] ? error : "Radio disconnected",
+                  sizeof(radio_error));
+        g_mutex_unlock(&radio_mutex);
+        SDL_AtomicSet(&radio_retry_delay, (int)delay);
+        for (unsigned elapsed = 0; elapsed < delay * 1000u; elapsed += 50u) {
+            if (SDL_AtomicGet(&decoder_stop)) break;
+            SDL_Delay(50);
+        }
+        if (SDL_AtomicGet(&decoder_stop)) break;
+        /* A negative value means the retry is connecting, not waiting. */
+        SDL_AtomicSet(&radio_retry_delay, -1);
+    }
+    return 0;
+}
+
 static void stop_ffmpeg_decoder(void)
 {
     if (audio_device) close_pattern_preview();
@@ -362,6 +537,13 @@ static void stop_ffmpeg_decoder(void)
     SDL_AtomicSet(&ffmpeg_seek_requested, 0);
     ffmpeg_position_frames = 0;
     ffmpeg_duration_ms = 0;
+    SDL_AtomicSet(&radio_ready, 0);
+    SDL_AtomicSet(&radio_retry_delay, 0);
+    radio_mark_active("");
+    if (radio_status_label) {
+        gtk_label_set_text(GTK_LABEL(radio_status_label), "Stopped");
+        gtk_label_set_text(GTK_LABEL(radio_title_label), "—");
+    }
 }
 
 static void zx_free_conversion(ZxConversion *job)
@@ -541,7 +723,8 @@ static void audio_callback(void *userdata, Uint8 *stream, int len)
             audio_ended = 1;
             playing = 0;
         }
-    } else if (playback_mode == PLAYBACK_FFMPEG ||
+    } else if (playback_mode == PLAYBACK_RADIO ||
+               playback_mode == PLAYBACK_FFMPEG ||
                playback_mode == PLAYBACK_ZX ||
                playback_mode == PLAYBACK_UADE) {
         int16_t *out = (int16_t *)stream;
@@ -626,7 +809,7 @@ static void on_volume_changed(GtkRange *range, gpointer user_data)
 static void update_play_button(void)
 {
     gtk_button_set_label(GTK_BUTTON(play_button),
-                         playing ? "❚❚  Pause" : "▶  Play");
+                         playing ? (playback_mode == PLAYBACK_RADIO ? "■  Stop" : "❚❚  Pause") : "▶  Play");
     if (title_label)
         xmp_tray_icon_update(tray_icon, playing,
                              gtk_label_get_text(GTK_LABEL(title_label)));
@@ -1028,6 +1211,671 @@ static int open_ffmpeg_audio(const char *filename)
 }
 
 static void on_play(GtkButton *button, gpointer data);
+static void on_stop(GtkButton *button, gpointer data);
+
+static void start_radio_source(guint id, const char *name, const char *url,
+                               const char *uuid)
+{
+    if (!audio_device || !ctx || (!name && id >= G_N_ELEMENTS(radio_stations))) return;
+    /* Duplicate before stopping: restart may pass the current owned strings. */
+    gchar *new_name = g_strdup(name), *new_url = g_strdup(url), *new_uuid = g_strdup(uuid);
+    stop_ffmpeg_decoder();
+    g_free(radio_dynamic_name);
+    g_free(radio_dynamic_url);
+    g_free(radio_dynamic_uuid);
+    radio_dynamic_name = new_name;
+    radio_dynamic_url = new_url;
+    radio_dynamic_uuid = new_uuid;
+    radio_active = id;
+    radio_dynamic_station.name = new_name;
+    radio_dynamic_station.url = new_url;
+    zx_cancel_pending();
+    zx_remove_active();
+    SDL_LockAudioDevice(audio_device);
+    playing = stopped = audio_ended = 0;
+    playback_mode = PLAYBACK_RADIO;
+    if (player_started) { xmp_end_player(ctx); player_started = 0; }
+    if (module_loaded) { xmp_release_module(ctx); module_loaded = 0; }
+    if (sid_audio) { sid_audio_close(sid_audio); sid_audio = NULL; }
+    if (midi_audio) { midi_audio_close(midi_audio); midi_audio = NULL; }
+    xmp_eq_reset_history(&equalizer);
+    SDL_UnlockAudioDevice(audio_device);
+    current_file[0] = '\0';
+    populate_sample_browser();
+    if (scope_area) gtk_widget_set_size_request(scope_area, 620, SCOPE_ROW_HEIGHT);
+    gtk_label_set_text(GTK_LABEL(title_label), radio_name);
+    gtk_label_set_text(GTK_LABEL(format_label), "Live radio (FFmpeg)");
+    gtk_label_set_text(GTK_LABEL(channels_label), "Stereo    44100 Hz");
+    gtk_label_set_text(GTK_LABEL(details_label), radio_url);
+    gtk_label_set_text(GTK_LABEL(time_label), "LIVE");
+    gtk_widget_set_sensitive(seek_scale, FALSE);
+    updating_seek = 1;
+    gtk_range_set_range(GTK_RANGE(seek_scale), 0, 1);
+    gtk_range_set_value(GTK_RANGE(seek_scale), 0);
+    updating_seek = 0;
+    g_mutex_lock(&radio_mutex);
+    radio_title[0] = radio_error[0] = '\0';
+    g_mutex_unlock(&radio_mutex);
+    SDL_AtomicSet(&decoder_stop, 0);
+    decoder_thread = SDL_CreateThread(radio_worker, "radio-decoder", (void *)(radio_dynamic_name ? &radio_dynamic_station : &radio_stations[id]));
+    if (!decoder_thread) {
+        stopped = 1;
+        set_status("Could not start radio decoder");
+        gtk_label_set_text(GTK_LABEL(radio_status_label), "Could not start decoder");
+        update_play_button();
+        return;
+    }
+    SDL_LockAudioDevice(audio_device);
+    playing = 1;
+    SDL_UnlockAudioDevice(audio_device);
+    SDL_PauseAudioDevice(audio_device, 0);
+    gtk_label_set_text(GTK_LABEL(radio_status_label), "Connecting…");
+    gchar *message = g_strdup_printf("Connecting to %s…", radio_name);
+    set_status(message);
+    g_free(message);
+    radio_mark_active("Connecting");
+    update_play_button();
+}
+
+static void start_radio_station(guint id)
+{
+    start_radio_source(id, NULL, NULL, NULL);
+}
+
+static void start_radio(void)
+{
+    start_radio_source(radio_active, radio_dynamic_name, radio_dynamic_url, radio_dynamic_uuid);
+}
+
+static gboolean radio_selected(guint *id)
+{
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+    if (!radio_view || !gtk_tree_selection_get_selected(
+            gtk_tree_view_get_selection(GTK_TREE_VIEW(radio_view)), &model, &iter))
+        return FALSE;
+    gtk_tree_model_get(model, &iter, RADIO_ID, id, -1);
+    return *id < G_N_ELEMENTS(radio_stations);
+}
+
+static void on_radio_selection(GtkTreeSelection *selection, gpointer data)
+{
+    (void)selection; (void)data;
+    guint id;
+    gboolean selected = radio_selected(&id);
+    gtk_widget_set_sensitive(radio_play_button, selected);
+    gtk_widget_set_sensitive(radio_website, selected);
+    if (selected)
+        gtk_link_button_set_uri(GTK_LINK_BUTTON(radio_website), radio_stations[id].website);
+}
+
+static void on_radio_play(GtkButton *button, gpointer data)
+{
+    (void)button; (void)data;
+    guint id;
+    if (radio_selected(&id)) start_radio_station(id);
+}
+
+static void on_radio_activated(GtkTreeView *view, GtkTreePath *path,
+                               GtkTreeViewColumn *column, gpointer data)
+{
+    (void)column; (void)data;
+    GtkTreeModel *model = gtk_tree_view_get_model(view);
+    GtkTreeIter iter;
+    guint id;
+    if (gtk_tree_model_get_iter(model, &iter, path)) {
+        gtk_tree_model_get(model, &iter, RADIO_ID, &id, -1);
+        start_radio_station(id);
+    }
+}
+
+static gboolean radio_visible(GtkTreeModel *model, GtkTreeIter *iter, gpointer data)
+{
+    (void)data;
+    if (!radio_query || !*radio_query) return TRUE;
+    guint id;
+    gtk_tree_model_get(model, iter, RADIO_ID, &id, -1);
+    const RadioStation *station = &radio_stations[id];
+    gchar *text = g_strdup_printf("%s %s %s", station->name, station->genre, station->quality);
+    gchar *folded = g_utf8_casefold(text, -1);
+    gboolean match = strstr(folded, radio_query) != NULL;
+    g_free(folded);
+    g_free(text);
+    return match;
+}
+
+static void on_radio_search(GtkEditable *entry, gpointer data)
+{
+    (void)data;
+    g_free(radio_query);
+    radio_query = g_utf8_casefold(gtk_entry_get_text(GTK_ENTRY(entry)), -1);
+    gtk_tree_model_filter_refilter(radio_filter);
+}
+
+
+/* Radio Browser search runs off the GTK thread, including DNS and HTTP. */
+static const char *world_json_string(JsonObject *obj, const char *key)
+{
+    JsonNode *node = json_object_get_member(obj, key);
+    return node && JSON_NODE_HOLDS_VALUE(node) &&
+        json_node_get_value_type(node) == G_TYPE_STRING ? json_node_get_string(node) : "";
+}
+
+static gboolean world_http_url(const char *url)
+{
+    return url && (g_str_has_prefix(url, "https://") || g_str_has_prefix(url, "http://"));
+}
+
+static void world_search_worker(GTask *task, gpointer source, gpointer data,
+                                GCancellable *cancel)
+{
+    (void)source;
+    const gchar *query = data;
+    GResolver *resolver = g_resolver_get_default();
+    GList *targets = g_resolver_lookup_service(resolver, "api", "tcp",
+                                               "radio-browser.info", cancel, NULL);
+    g_object_unref(resolver);
+    GPtrArray *hosts = g_ptr_array_new_with_free_func(g_free);
+    for (GList *l = targets; l; l = l->next) {
+        const gchar *host = g_srv_target_get_hostname(l->data);
+        if (host && *host) g_ptr_array_add(hosts, g_strdup(host));
+    }
+    g_resolver_free_targets(targets);
+    if (!hosts->len) g_ptr_array_add(hosts, g_strdup("de1.api.radio-browser.info"));
+    SoupSession *session = soup_session_new_with_options("timeout", 12u,
+        "user-agent", "ModulezPlayer/1.8.0", NULL);
+    guint first = g_random_int_range(0, hosts->len);
+    for (guint i = 0; i < hosts->len && !g_cancellable_is_cancelled(cancel); ++i) {
+        const gchar *host = g_ptr_array_index(hosts, (first + i) % hosts->len);
+        gchar *url = g_strdup_printf("https://%s/json/stations/search?%s", host, query);
+        SoupMessage *msg = soup_message_new("GET", url);
+        g_free(url);
+        if (!msg) continue;
+        GBytes *bytes = soup_session_send_and_read(session, msg, cancel, NULL);
+        if (bytes && SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(msg))) {
+            gsize len;
+            const gchar *body = g_bytes_get_data(bytes, &len);
+            JsonParser *parser = json_parser_new();
+            if (json_parser_load_from_data(parser, body, len, NULL) &&
+                JSON_NODE_HOLDS_ARRAY(json_parser_get_root(parser))) {
+                g_object_unref(parser);
+                g_object_unref(msg);
+                g_object_unref(session);
+                g_ptr_array_unref(hosts);
+                g_task_return_pointer(task, bytes, (GDestroyNotify)g_bytes_unref);
+                return;
+            }
+            g_object_unref(parser);
+        }
+        if (bytes) g_bytes_unref(bytes);
+        g_object_unref(msg);
+    }
+    g_object_unref(session);
+    g_ptr_array_unref(hosts);
+    if (!g_task_return_error_if_cancelled(task))
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
+                                "Radio Browser unavailable. Try searching again.");
+}
+
+static void world_search_complete(GObject *source, GAsyncResult *result, gpointer data)
+{
+    (void)source; (void)data;
+    GTask *task = G_TASK(result);
+    GError *error = NULL;
+    GBytes *bytes = g_task_propagate_pointer(task, &error);
+    if (world_closing || g_task_get_cancellable(task) != world_cancel) goto done;
+    g_clear_object(&world_cancel);
+    if (!bytes) {
+        gtk_label_set_text(GTK_LABEL(world_status), error ? error->message : "Search failed");
+        gtk_widget_set_sensitive(world_prev, world_offset > 0);
+        gtk_widget_set_sensitive(world_next, FALSE);
+        goto done;
+    }
+    gsize len;
+    const gchar *body = g_bytes_get_data(bytes, &len);
+    JsonParser *parser = json_parser_new();
+    if (!json_parser_load_from_data(parser, body, len, NULL)) {
+        gtk_label_set_text(GTK_LABEL(world_status), "Invalid directory response");
+        g_object_unref(parser);
+        goto done;
+    }
+    JsonArray *array = json_node_get_array(json_parser_get_root(parser));
+    guint count = json_array_get_length(array), shown = 0;
+    gtk_list_store_clear(world_store);
+    for (guint i = 0; i < count; ++i) {
+        JsonNode *node = json_array_get_element(array, i);
+        if (!JSON_NODE_HOLDS_OBJECT(node)) continue;
+        JsonObject *obj = json_node_get_object(node);
+        const char *name = world_json_string(obj, "name");
+        const char *uuid = world_json_string(obj, "stationuuid");
+        const char *url = world_json_string(obj, "url_resolved");
+        if (!world_http_url(url)) url = world_json_string(obj, "url");
+        if (!*name || !*uuid || !world_http_url(url)) continue;
+        const char *codec = world_json_string(obj, "codec");
+        JsonNode *bit = json_object_get_member(obj, "bitrate");
+        gint64 bitrate = bit && JSON_NODE_HOLDS_VALUE(bit) &&
+            json_node_get_value_type(bit) == G_TYPE_INT64 ? json_node_get_int(bit) : 0;
+        gchar *quality = bitrate > 0 ? g_strdup_printf("%s %" G_GINT64_FORMAT " kbps", codec, bitrate) : g_strdup(codec);
+        GtkTreeIter iter;
+        gtk_list_store_append(world_store, &iter);
+        gtk_list_store_set(world_store, &iter, WORLD_NAME, name,
+            WORLD_COUNTRY, world_json_string(obj, "countrycode"),
+            WORLD_TAGS, world_json_string(obj, "tags"), WORLD_QUALITY, quality,
+            WORLD_URL, url, WORLD_WEBSITE, world_json_string(obj, "homepage"),
+            WORLD_UUID, uuid, WORLD_STATE, "", -1);
+        g_free(quality);
+        ++shown;
+    }
+    g_object_unref(parser);
+    gchar *message = g_strdup_printf("%u stations • Page %u", shown, world_offset / WORLD_LIMIT + 1);
+    gtk_label_set_text(GTK_LABEL(world_status), message);
+    g_free(message);
+    gtk_widget_set_sensitive(world_next, count >= WORLD_LIMIT);
+    gtk_widget_set_sensitive(world_prev, world_offset > 0);
+    if (playback_mode == PLAYBACK_RADIO && !stopped)
+        radio_mark_active(SDL_AtomicGet(&radio_retry_delay) ? "Reconnecting" :
+            SDL_AtomicGet(&radio_ready) ? "Playing" : "Connecting");
+done:
+    if (bytes) g_bytes_unref(bytes);
+    g_clear_error(&error);
+}
+
+static void world_request(void)
+{
+    if (world_cancel) g_cancellable_cancel(world_cancel);
+    g_clear_object(&world_cancel);
+    world_cancel = g_cancellable_new();
+    gchar *query = g_strdup_printf("hidebroken=true&order=votes&reverse=true%s&offset=%u&limit=%u",
+                                   world_params, world_offset, WORLD_LIMIT);
+    gtk_list_store_clear(world_store);
+    gtk_label_set_text(GTK_LABEL(world_status), "Searching Radio Browser…");
+    gtk_widget_set_sensitive(world_next, FALSE);
+    gtk_widget_set_sensitive(world_prev, FALSE);
+    GTask *task = g_task_new(NULL, world_cancel, world_search_complete, NULL);
+    g_task_set_task_data(task, query, g_free);
+    g_task_run_in_thread(task, world_search_worker);
+    g_object_unref(task);
+}
+
+static void on_world_search(GtkWidget *widget, gpointer data)
+{
+    (void)widget; (void)data;
+    gchar *name = g_uri_escape_string(gtk_entry_get_text(GTK_ENTRY(world_name)), NULL, FALSE);
+    gchar *country = g_ascii_strup(gtk_entry_get_text(GTK_ENTRY(world_country)), -1);
+    g_strstrip(country);
+    gchar *cc = g_uri_escape_string(country, NULL, FALSE);
+    gchar *tag = g_uri_escape_string(gtk_entry_get_text(GTK_ENTRY(world_tag)), NULL, FALSE);
+    g_free(world_params);
+    world_params = g_strdup_printf("%s%s%s%s%s%s",
+        *name ? "&name=" : "", name, *cc ? "&countrycode=" : "", cc,
+        *tag ? "&tag=" : "", tag);
+    g_free(name); g_free(country); g_free(cc); g_free(tag);
+    world_offset = 0;
+    world_request();
+}
+
+static void on_world_page(GtkButton *button, gpointer data)
+{
+    (void)button;
+    if (!world_params) return;
+    if (GPOINTER_TO_INT(data) > 0) world_offset += WORLD_LIMIT;
+    else world_offset = world_offset >= WORLD_LIMIT ? world_offset - WORLD_LIMIT : 0;
+    world_request();
+}
+
+static void on_world_selection(GtkTreeSelection *selection, gpointer data)
+{
+    (void)data;
+    GtkTreeModel *model; GtkTreeIter iter;
+    gboolean selected = gtk_tree_selection_get_selected(selection, &model, &iter);
+    gchar *website = NULL;
+    if (selected) gtk_tree_model_get(model, &iter, WORLD_WEBSITE, &website, -1);
+    gtk_widget_set_sensitive(world_play, selected);
+    gtk_widget_set_sensitive(world_website, world_http_url(website));
+    if (world_http_url(website)) gtk_link_button_set_uri(GTK_LINK_BUTTON(world_website), website);
+    g_free(website);
+}
+
+static void world_play_iter(GtkTreeModel *model, GtkTreeIter *iter)
+{
+    gchar *name = NULL, *url = NULL, *uuid = NULL;
+    gtk_tree_model_get(model, iter, WORLD_NAME, &name, WORLD_URL, &url, WORLD_UUID, &uuid, -1);
+    if (name && world_http_url(url)) start_radio_source(0, name, url, uuid);
+    g_free(name); g_free(url); g_free(uuid);
+}
+
+static void on_world_play(GtkButton *button, gpointer data)
+{
+    (void)button; (void)data;
+    GtkTreeModel *model; GtkTreeIter iter;
+    if (gtk_tree_selection_get_selected(gtk_tree_view_get_selection(GTK_TREE_VIEW(world_view)), &model, &iter))
+        world_play_iter(model, &iter);
+}
+
+static void on_world_activated(GtkTreeView *view, GtkTreePath *path,
+                               GtkTreeViewColumn *column, gpointer data)
+{
+    (void)column; (void)data;
+    GtkTreeModel *model = gtk_tree_view_get_model(view);
+    GtkTreeIter iter;
+    if (gtk_tree_model_get_iter(model, &iter, path)) world_play_iter(model, &iter);
+}
+
+static void on_save_favorite(GtkButton *button, gpointer data);
+
+static GtkWidget *world_radio_page(void)
+{
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    world_name = gtk_search_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(world_name), "Station name (optional)");
+    gtk_box_pack_start(GTK_BOX(page), world_name, FALSE, FALSE, 0);
+    GtkWidget *filters = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    world_country = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(world_country), "Country code (US, GB, DE…)");
+    gtk_entry_set_width_chars(GTK_ENTRY(world_country), 16);
+    gtk_entry_set_max_length(GTK_ENTRY(world_country), 2);
+    world_tag = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(world_tag), "Genre (rock, jazz…)");
+    GtkWidget *search = gtk_button_new_with_label("Search");
+    gtk_box_pack_start(GTK_BOX(filters), world_country, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(filters), world_tag, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(filters), search, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(page), filters, FALSE, FALSE, 0);
+    world_store = gtk_list_store_new(WORLD_COLS, G_TYPE_STRING, G_TYPE_STRING,
+        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    world_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(world_store));
+    gtk_widget_set_name(world_view, "radio-view");
+    const char *columns[] = {"Station", "Country", "Genre", "Quality", "Status"};
+    for (guint i = 0; i < G_N_ELEMENTS(columns); ++i) {
+        GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+        g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+        GtkTreeViewColumn *column = gtk_tree_view_column_new_with_attributes(columns[i], renderer, "text", i, NULL);
+        gtk_tree_view_column_set_resizable(column, TRUE);
+        gtk_tree_view_column_set_min_width(column, 60);
+        gtk_tree_view_column_set_expand(column, i == 0 || i == 2);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(world_view), column);
+    }
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_size_request(scroll, -1, 120);
+    gtk_container_add(GTK_CONTAINER(scroll), world_view);
+    gtk_box_pack_start(GTK_BOX(page), scroll, TRUE, TRUE, 0);
+    GtkWidget *buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    world_play = gtk_button_new_with_label("▶ Play Station");
+    world_website = gtk_link_button_new_with_label("https://www.radio-browser.info/", "Station website");
+    world_prev = gtk_button_new_with_label("Previous");
+    world_next = gtk_button_new_with_label("Next");
+    gtk_box_pack_start(GTK_BOX(buttons), world_play, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(buttons), world_website, FALSE, FALSE, 0);
+    GtkWidget *favorite = gtk_button_new_with_label("★ Favorite");
+    gtk_box_pack_start(GTK_BOX(buttons), favorite, FALSE, FALSE, 0);
+    g_signal_connect(favorite, "clicked", G_CALLBACK(on_save_favorite), GINT_TO_POINTER(1));
+    gtk_box_pack_end(GTK_BOX(buttons), world_next, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(buttons), world_prev, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(page), buttons, FALSE, FALSE, 0);
+    world_status = gtk_label_new("Search or leave filters blank to browse popular stations.");
+    gtk_label_set_line_wrap(GTK_LABEL(world_status), TRUE);
+    gtk_box_pack_start(GTK_BOX(page), world_status, FALSE, FALSE, 0);
+    GtkWidget *link = gtk_link_button_new_with_label("https://www.radio-browser.info/", "Powered by Radio Browser");
+    gtk_box_pack_start(GTK_BOX(page), link, FALSE, FALSE, 0);
+    gtk_widget_set_sensitive(world_play, FALSE);
+    gtk_widget_set_sensitive(world_website, FALSE);
+    gtk_widget_set_sensitive(world_prev, FALSE);
+    gtk_widget_set_sensitive(world_next, FALSE);
+    g_signal_connect(search, "clicked", G_CALLBACK(on_world_search), NULL);
+    g_signal_connect(world_name, "activate", G_CALLBACK(on_world_search), NULL);
+    g_signal_connect(world_country, "activate", G_CALLBACK(on_world_search), NULL);
+    g_signal_connect(world_tag, "activate", G_CALLBACK(on_world_search), NULL);
+    g_signal_connect(world_prev, "clicked", G_CALLBACK(on_world_page), GINT_TO_POINTER(-1));
+    g_signal_connect(world_next, "clicked", G_CALLBACK(on_world_page), GINT_TO_POINTER(1));
+    g_signal_connect(world_play, "clicked", G_CALLBACK(on_world_play), NULL);
+    g_signal_connect(world_view, "row-activated", G_CALLBACK(on_world_activated), NULL);
+    g_signal_connect(gtk_tree_view_get_selection(GTK_TREE_VIEW(world_view)), "changed", G_CALLBACK(on_world_selection), NULL);
+    return page;
+}
+
+/* Saved stations use stable IDs and copies of the stream URL, never result indices. */
+static const gint saved_fields[] = {WORLD_NAME, WORLD_COUNTRY, WORLD_TAGS,
+    WORLD_QUALITY, WORLD_URL, WORLD_WEBSITE, WORLD_UUID};
+static const char *saved_keys[] = {"name", "country", "genre", "quality", "url", "website", "uuid"};
+
+static void theme_dialog(GtkWidget *dialog);
+
+static void saved_message(const char *text)
+{
+    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(window), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", text);
+    theme_dialog(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+static gboolean saved_write(void)
+{
+    GKeyFile *key = g_key_file_new();
+    for (guint k = 0; k < 2; ++k) {
+        GtkTreeModel *model = GTK_TREE_MODEL(saved_stores[k]);
+        GtkTreeIter iter;
+        guint n = 0;
+        for (gboolean valid = gtk_tree_model_get_iter_first(model, &iter); valid;
+             valid = gtk_tree_model_iter_next(model, &iter)) {
+            gchar *group = g_strdup_printf("%s-%u", k ? "custom" : "favorite", n++);
+            for (guint j = 0; j < G_N_ELEMENTS(saved_fields); ++j) {
+                gchar *value = NULL;
+                gtk_tree_model_get(model, &iter, saved_fields[j], &value, -1);
+                g_key_file_set_string(key, group, saved_keys[j], value ? value : "");
+                g_free(value);
+            }
+            g_free(group);
+        }
+    }
+    gchar *path = player_config_path("radio-stations.ini");
+    gchar *dir = g_path_get_dirname(path);
+    g_mkdir_with_parents(dir, 0700);
+    GError *error = NULL;
+    gboolean ok = g_key_file_save_to_file(key, path, &error);
+    if (!ok) saved_message(error ? error->message : "Could not save radio stations.");
+    g_clear_error(&error); g_free(dir); g_free(path); g_key_file_unref(key);
+    return ok;
+}
+
+static void saved_load(void)
+{
+    GKeyFile *key = g_key_file_new();
+    gchar *path = player_config_path("radio-stations.ini");
+    GError *error = NULL;
+    if (g_key_file_load_from_file(key, path, G_KEY_FILE_NONE, &error)) {
+        gsize count = 0;
+        gchar **groups = g_key_file_get_groups(key, &count);
+        for (gsize i = 0; i < count; ++i) {
+            guint k;
+            if (g_str_has_prefix(groups[i], "favorite-")) k = 0;
+            else if (g_str_has_prefix(groups[i], "custom-")) k = 1;
+            else continue;
+            gchar *values[G_N_ELEMENTS(saved_fields)];
+            for (guint j = 0; j < G_N_ELEMENTS(saved_fields); ++j)
+                values[j] = g_key_file_get_string(key, groups[i], saved_keys[j], NULL);
+            if (values[0] && *values[0] && world_http_url(values[4]) && values[6] && *values[6]) {
+                GtkTreeIter iter;
+                gtk_list_store_append(saved_stores[k], &iter);
+                for (guint j = 0; j < G_N_ELEMENTS(saved_fields); ++j)
+                    gtk_list_store_set(saved_stores[k], &iter, saved_fields[j], values[j], -1);
+                gtk_list_store_set(saved_stores[k], &iter, WORLD_STATE, "", -1);
+            }
+            for (guint j = 0; j < G_N_ELEMENTS(saved_fields); ++j) g_free(values[j]);
+        }
+        g_strfreev(groups);
+    } else if (!g_error_matches(error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
+        g_warning("Saved radio stations: %s", error ? error->message : "Cannot read file");
+    }
+    g_clear_error(&error); g_free(path); g_key_file_unref(key);
+}
+
+static gboolean saved_selected(GtkWidget *view, GtkTreeModel **model, GtkTreeIter *iter)
+{
+    return gtk_tree_selection_get_selected(gtk_tree_view_get_selection(GTK_TREE_VIEW(view)), model, iter);
+}
+
+static void on_save_favorite(GtkButton *button, gpointer data)
+{
+    (void)button;
+    gchar *v[G_N_ELEMENTS(saved_fields)] = {NULL};
+    if (GPOINTER_TO_INT(data) == 0) {
+        guint id;
+        if (!radio_selected(&id)) return;
+        const RadioStation *r = &radio_stations[id];
+        v[0] = g_strdup(r->name); v[2] = g_strdup(r->genre); v[3] = g_strdup(r->quality);
+        v[4] = g_strdup(r->url); v[5] = g_strdup(r->website); v[6] = g_strdup_printf("retro:%u", id);
+    } else {
+        GtkTreeModel *model; GtkTreeIter iter;
+        GtkWidget *view = GPOINTER_TO_INT(data) == 1 ? world_view : saved_views[1];
+        if (!saved_selected(view, &model, &iter)) return;
+        for (guint j = 0; j < G_N_ELEMENTS(saved_fields); ++j)
+            gtk_tree_model_get(model, &iter, saved_fields[j], &v[j], -1);
+    }
+    GtkTreeModel *model = GTK_TREE_MODEL(saved_stores[0]); GtkTreeIter iter;
+    gboolean duplicate = FALSE;
+    for (gboolean valid = gtk_tree_model_get_iter_first(model, &iter); valid;
+         valid = gtk_tree_model_iter_next(model, &iter)) {
+        gchar *uuid = NULL;
+        gtk_tree_model_get(model, &iter, WORLD_UUID, &uuid, -1);
+        duplicate = g_strcmp0(uuid, v[6]) == 0;
+        g_free(uuid); if (duplicate) break;
+    }
+    if (duplicate) saved_message("Station is already in Favorites.");
+    else if (v[6] && world_http_url(v[4])) {
+        gtk_list_store_append(saved_stores[0], &iter);
+        for (guint j = 0; j < G_N_ELEMENTS(saved_fields); ++j)
+            gtk_list_store_set(saved_stores[0], &iter, saved_fields[j], v[j], -1);
+        gtk_list_store_set(saved_stores[0], &iter, WORLD_STATE, "", -1);
+        if (saved_write()) saved_message("Station added to Favorites.");
+    }
+    for (guint j = 0; j < G_N_ELEMENTS(saved_fields); ++j) g_free(v[j]);
+}
+
+static void saved_play_iter(GtkTreeModel *model, GtkTreeIter *iter)
+{
+    gchar *uuid = NULL;
+    gtk_tree_model_get(model, iter, WORLD_UUID, &uuid, -1);
+    if (uuid && g_str_has_prefix(uuid, "retro:")) {
+        guint64 id = g_ascii_strtoull(uuid + 6, NULL, 10);
+        if (id < G_N_ELEMENTS(radio_stations)) start_radio_station((guint)id);
+    } else world_play_iter(model, iter);
+    g_free(uuid);
+}
+static void on_saved_play(GtkButton *button, gpointer data)
+{
+    (void)button; GtkTreeModel *model; GtkTreeIter iter;
+    if (saved_selected(saved_views[GPOINTER_TO_INT(data)], &model, &iter)) saved_play_iter(model, &iter);
+}
+static void on_saved_activated(GtkTreeView *view, GtkTreePath *path, GtkTreeViewColumn *column, gpointer data)
+{
+    (void)column; (void)data; GtkTreeIter iter;
+    GtkTreeModel *model = gtk_tree_view_get_model(view);
+    if (gtk_tree_model_get_iter(model, &iter, path)) saved_play_iter(model, &iter);
+}
+static void on_saved_remove(GtkButton *button, gpointer data)
+{
+    (void)button; guint k = GPOINTER_TO_INT(data); GtkTreeModel *model; GtkTreeIter iter;
+    if (!saved_selected(saved_views[k], &model, &iter)) return;
+    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(window), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_QUESTION, GTK_BUTTONS_YES_NO, "Remove the selected saved station?");
+    theme_dialog(dialog);
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog)); gtk_widget_destroy(dialog);
+    if (response == GTK_RESPONSE_YES) { gtk_list_store_remove(saved_stores[k], &iter); saved_write(); }
+}
+
+static void on_custom_edit(GtkButton *button, gpointer data)
+{
+    (void)button; gboolean edit = GPOINTER_TO_INT(data); GtkTreeModel *model; GtkTreeIter iter;
+    if (edit && !saved_selected(saved_views[1], &model, &iter)) return;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(edit ? "Edit station" : "Add station", GTK_WINDOW(window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, "Cancel", GTK_RESPONSE_CANCEL, "Save", GTK_RESPONSE_OK, NULL);
+    theme_dialog(dialog);
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *grid = gtk_grid_new(); gtk_grid_set_row_spacing(GTK_GRID(grid), 8); gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+    gtk_container_set_border_width(GTK_CONTAINER(grid), 12);
+    gtk_container_add(GTK_CONTAINER(content), grid);
+    const char *labels[] = {"Name", "Stream URL", "Genre", "Website"};
+    gint fields[] = {WORLD_NAME, WORLD_URL, WORLD_TAGS, WORLD_WEBSITE};
+    GtkWidget *entries[4];
+    for (guint i = 0; i < 4; ++i) {
+        GtkWidget *label = gtk_label_new(labels[i]); gtk_widget_set_halign(label, GTK_ALIGN_START);
+        entries[i] = gtk_entry_new(); gtk_entry_set_width_chars(GTK_ENTRY(entries[i]), 38);
+        gtk_grid_attach(GTK_GRID(grid), label, 0, i, 1, 1); gtk_grid_attach(GTK_GRID(grid), entries[i], 1, i, 1, 1);
+        if (edit) { gchar *value = NULL; gtk_tree_model_get(model, &iter, fields[i], &value, -1);
+            gtk_entry_set_text(GTK_ENTRY(entries[i]), value ? value : ""); g_free(value); }
+    }
+    gtk_widget_show_all(content);
+    while (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        const char *name = gtk_entry_get_text(GTK_ENTRY(entries[0]));
+        const char *url = gtk_entry_get_text(GTK_ENTRY(entries[1]));
+        const char *website = gtk_entry_get_text(GTK_ENTRY(entries[3]));
+        if (!*name || !world_http_url(url) || (*website && !world_http_url(website))) {
+            saved_message("Enter a name and an HTTP or HTTPS stream URL. Website is optional."); continue;
+        }
+        if (!edit) {
+            gchar *id = g_uuid_string_random(); gchar *uuid = g_strconcat("custom:", id, NULL);
+            gtk_list_store_append(saved_stores[1], &iter);
+            gtk_list_store_set(saved_stores[1], &iter, WORLD_UUID, uuid, WORLD_COUNTRY, "", WORLD_QUALITY, "Auto", WORLD_STATE, "", -1);
+            g_free(uuid); g_free(id);
+        }
+        for (guint i = 0; i < 4; ++i)
+            gtk_list_store_set(saved_stores[1], &iter, fields[i], gtk_entry_get_text(GTK_ENTRY(entries[i])), -1);
+        saved_write(); break;
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static GtkWidget *saved_radio_page(guint k)
+{
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    saved_stores[k] = gtk_list_store_new(WORLD_COLS, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
+        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    GtkWidget *view = saved_views[k] = gtk_tree_view_new_with_model(GTK_TREE_MODEL(saved_stores[k]));
+    gtk_widget_set_name(view, "radio-view");
+    const char *labels[] = {"Station", "Genre", "Quality", "Status"};
+    gint fields[] = {WORLD_NAME, WORLD_TAGS, WORLD_QUALITY, WORLD_STATE};
+    for (guint i = 0; i < 4; ++i) {
+        GtkCellRenderer *renderer = gtk_cell_renderer_text_new(); g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+        GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes(labels[i], renderer, "text", fields[i], NULL);
+        gtk_tree_view_column_set_resizable(col, TRUE); gtk_tree_view_column_set_min_width(col, 60);
+        gtk_tree_view_column_set_expand(col, i < 2); gtk_tree_view_append_column(GTK_TREE_VIEW(view), col);
+    }
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL); gtk_widget_set_size_request(scroll, -1, 120);
+    gtk_container_add(GTK_CONTAINER(scroll), view); gtk_box_pack_start(GTK_BOX(page), scroll, TRUE, TRUE, 0);
+    GtkWidget *buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *play = gtk_button_new_with_label("▶ Play Station"), *remove = gtk_button_new_with_label("Remove");
+    gtk_box_pack_start(GTK_BOX(buttons), play, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(buttons), remove, FALSE, FALSE, 0);
+    g_signal_connect(play, "clicked", G_CALLBACK(on_saved_play), GINT_TO_POINTER(k));
+    g_signal_connect(remove, "clicked", G_CALLBACK(on_saved_remove), GINT_TO_POINTER(k));
+    g_signal_connect(view, "row-activated", G_CALLBACK(on_saved_activated), NULL);
+    if (k) {
+        GtkWidget *add = gtk_button_new_with_label("Add"), *edit = gtk_button_new_with_label("Edit"), *favorite = gtk_button_new_with_label("★ Favorite");
+        gtk_box_pack_start(GTK_BOX(buttons), add, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(buttons), edit, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(buttons), favorite, FALSE, FALSE, 0);
+        g_signal_connect(add, "clicked", G_CALLBACK(on_custom_edit), GINT_TO_POINTER(0));
+        g_signal_connect(edit, "clicked", G_CALLBACK(on_custom_edit), GINT_TO_POINTER(1));
+        g_signal_connect(favorite, "clicked", G_CALLBACK(on_save_favorite), GINT_TO_POINTER(2));
+    }
+    gtk_box_pack_start(GTK_BOX(page), buttons, FALSE, FALSE, 0);
+    return page;
+}
+
+/* Category navigation is independent of the active decoder. */
+static void on_radio_category_changed(GtkComboBox *combo, gpointer data)
+{
+    GtkStack *stack = GTK_STACK(data);
+    gtk_stack_set_visible_child_name(stack,
+        (const char *[]) {"retro", "world", "favorites", "custom"}[
+            CLAMP(gtk_combo_box_get_active(combo), 0, 3)]);
+}
+
+static void on_radio_stop(GtkButton *button, gpointer data)
+{
+    (void)button; (void)data;
+    if (playback_mode == PLAYBACK_RADIO) on_stop(NULL, NULL);
+}
+
 
 static void zx_apply_labels(void)
 {
@@ -1819,6 +2667,31 @@ static void theme_dialog(GtkWidget *dialog)
 {
     gtk_style_context_add_class(gtk_widget_get_style_context(dialog),
                                 "xmp-dialog");
+
+    /* Keep GTK responsible for titlebar gestures and delete-event handling.
+     * Match the main window's native fallback on non-composited desktops. */
+    GdkScreen *screen = gtk_widget_get_screen(dialog);
+    if (modern_window && screen && gdk_screen_is_composited(screen) &&
+        gdk_screen_get_rgba_visual(screen) && !gtk_widget_get_realized(dialog)) {
+        GtkWidget *bar = gtk_window_get_titlebar(GTK_WINDOW(dialog));
+        if (!bar) {
+            const gchar *title = gtk_window_get_title(GTK_WINDOW(dialog));
+            bar = gtk_header_bar_new();
+            gtk_header_bar_set_title(GTK_HEADER_BAR(bar),
+                title && *title ? title : "Modulez Player");
+            gtk_header_bar_set_has_subtitle(GTK_HEADER_BAR(bar), FALSE);
+            gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(bar), TRUE);
+            gtk_header_bar_set_decoration_layout(GTK_HEADER_BAR(bar), ":close");
+            gtk_window_set_titlebar(GTK_WINDOW(dialog), bar);
+            gtk_widget_show(bar);
+        }
+        gtk_style_context_add_class(gtk_widget_get_style_context(dialog),
+                                    "modulez-modern-dialog");
+        gtk_style_context_add_class(gtk_widget_get_style_context(bar),
+                                    "modulez-dialog-titlebar");
+        gtk_widget_set_name(bar, "modulez-dialog-titlebar");
+        gtk_widget_set_name(dialog, "modulez-dialog-window");
+    }
 
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     GtkWidget *actions = gtk_dialog_get_action_area(GTK_DIALOG(dialog));
@@ -2779,6 +3652,10 @@ static void on_export_wav(GtkButton *button, gpointer data)
         set_status("A WAV export is already running");
         return;
     }
+    if (playback_mode == PLAYBACK_RADIO) {
+        set_status("WAV export is not available for live radio");
+        return;
+    }
     if (playback_mode == PLAYBACK_NONE || !current_file[0]) {
         set_status("Open a music file before exporting it");
         return;
@@ -2960,6 +3837,11 @@ static void on_play(GtkButton *button, gpointer data)
     (void)button;
     (void)data;
 
+    if (playback_mode == PLAYBACK_RADIO) {
+        if (playing) on_stop(NULL, NULL);
+        else start_radio();
+        return;
+    }
     close_pattern_preview();
     SDL_LockAudioDevice(audio_device);
     preview_sample = NULL;
@@ -3100,7 +3982,8 @@ static void on_stop(GtkButton *button, gpointer data)
         SDL_LockAudioDevice(audio_device);
         xmp_stop_module(ctx);
         SDL_UnlockAudioDevice(audio_device);
-    } else if (playback_mode == PLAYBACK_FFMPEG ||
+    } else if (playback_mode == PLAYBACK_RADIO ||
+               playback_mode == PLAYBACK_FFMPEG ||
                playback_mode == PLAYBACK_ZX ||
                playback_mode == PLAYBACK_UADE) {
         stop_ffmpeg_decoder();
@@ -3146,7 +4029,7 @@ static void on_seek(GtkRange *range, gpointer data)
 {
     (void)data;
 
-    if (updating_seek)
+    if (updating_seek || playback_mode == PLAYBACK_RADIO)
         return;
 
     close_pattern_preview();
@@ -3222,8 +4105,18 @@ static gboolean draw_visualizer(GtkWidget *widget, cairo_t *cr,
     GtkAllocation a;
     gtk_widget_get_allocation(widget, &a);
     double w = a.width, h = a.height;
+    if (w < 2 || h < 2) return FALSE;
     double baseline = h - 8.0;
-    double max_height = h - 22.0;
+    double max_height = MAX(1.0, h - 16.0);
+    double radius = MIN(10.0, MIN(w, h) / 2.0);
+    cairo_save(cr);
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, w-radius, radius, radius, -G_PI/2, 0);
+    cairo_arc(cr, w-radius, h-radius, radius, 0, G_PI/2);
+    cairo_arc(cr, radius, h-radius, radius, G_PI/2, G_PI);
+    cairo_arc(cr, radius, radius, radius, G_PI, 3*G_PI/2);
+    cairo_close_path(cr);
+    cairo_clip(cr);
 
     cairo_set_source_rgb(cr, mini_viz_background.red,
                          mini_viz_background.green, mini_viz_background.blue);
@@ -3296,6 +4189,7 @@ static gboolean draw_visualizer(GtkWidget *widget, cairo_t *cr,
     cairo_move_to(cr, 8, baseline);
     cairo_line_to(cr, w - 8, baseline);
     cairo_stroke(cr);
+    cairo_restore(cr);
 
     return FALSE;
 }
@@ -3306,6 +4200,7 @@ static void update_visualizer_spectrum(void)
     if ((playback_mode != PLAYBACK_ZX &&
          playback_mode != PLAYBACK_MODULE &&
          playback_mode != PLAYBACK_FFMPEG &&
+         playback_mode != PLAYBACK_RADIO &&
          playback_mode != PLAYBACK_MIDI &&
          playback_mode != PLAYBACK_SID &&
          playback_mode != PLAYBACK_UADE) ||
@@ -3415,7 +4310,8 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
     cairo_set_source_rgb(cr, 0.028, 0.060, 0.075);
     cairo_paint(cr);
 
-    if (((zx_active_wav && playback_mode == PLAYBACK_FFMPEG) ||
+    if ((playback_mode == PLAYBACK_RADIO ||
+         (zx_active_wav && playback_mode == PLAYBACK_FFMPEG) ||
          playback_mode == PLAYBACK_ZX || playback_mode == PLAYBACK_MIDI ||
          playback_mode == PLAYBACK_UADE) &&
         width >= 80 && height >= 20) {
@@ -3435,6 +4331,8 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
                               ? "MIDI - mixed audio waveform"
                               : playback_mode == PLAYBACK_UADE
                               ? "Amiga (UADE) - mixed audio waveform"
+                              : playback_mode == PLAYBACK_RADIO
+                              ? "Radio - mixed audio waveform"
                               : "ZX Spectrum - mixed audio waveform");
         cairo_set_source_rgb(cr, 0.35, 0.90, 0.65);
         cairo_set_line_width(cr, 1.0);
@@ -4608,7 +5506,41 @@ static gboolean update_display(gpointer data)
     int current;
     int total;
 
-    if (playback_mode == PLAYBACK_FFMPEG ||
+    if (playback_mode == PLAYBACK_RADIO) {
+        SDL_LockAudioDevice(audio_device);
+        ended = audio_ended;
+        is_playing = playing;
+        SDL_UnlockAudioDevice(audio_device);
+        char title[1024], error[512];
+        g_mutex_lock(&radio_mutex);
+        g_strlcpy(title, radio_title, sizeof(title));
+        g_strlcpy(error, radio_error, sizeof(error));
+        g_mutex_unlock(&radio_mutex);
+        if (!stopped) {
+            gchar *valid = g_utf8_make_valid(title[0] ? title : radio_name, -1);
+            gtk_label_set_text(GTK_LABEL(title_label), valid);
+            gtk_label_set_text(GTK_LABEL(radio_title_label), valid);
+            g_free(valid);
+            int retry_delay = SDL_AtomicGet(&radio_retry_delay);
+            char retry_status[128];
+            if (retry_delay > 0)
+                g_snprintf(retry_status, sizeof(retry_status),
+                           "Connection lost — retrying after %d seconds", retry_delay);
+            else
+                g_strlcpy(retry_status, "Reconnecting…", sizeof(retry_status));
+            const char *status = ended ? (error[0] ? error : "Disconnected") :
+                retry_delay ? retry_status :
+                SDL_AtomicGet(&radio_ready) ? "Live radio playing" : "Connecting…";
+            gchar *station_status = g_strdup_printf("%s — %s", radio_name, status);
+            gtk_label_set_text(GTK_LABEL(radio_status_label), station_status);
+            g_free(station_status);
+            radio_mark_active(ended ? "Disconnected" :
+                retry_delay ? "Reconnecting" :
+                SDL_AtomicGet(&radio_ready) ? "Playing" : "Connecting");
+            set_status(status);
+        }
+        update_play_button();
+    } else if (playback_mode == PLAYBACK_FFMPEG ||
         playback_mode == PLAYBACK_ZX ||
         playback_mode == PLAYBACK_UADE) {
         SDL_LockAudioDevice(audio_device);
@@ -4732,7 +5664,7 @@ static gboolean update_display(gpointer data)
             set_status("Playback finished");
     }
 
-    if (ended && !playlist_advance())
+    if (ended && playback_mode != PLAYBACK_RADIO && !playlist_advance())
         update_play_button();
 
     if ((visualizer_area && gtk_widget_get_mapped(visualizer_area)) ||
@@ -5187,6 +6119,7 @@ static void update_custom_theme(void)
     gchar *css = g_strdup_printf(
         "@define-color modulez_tribute_background %s;"
         "@define-color modulez_tribute_accent %s;"
+        "@define-color modulez_shell_panel %s;"
         "window, notebook, notebook stack, window.dialog, window.dialog.background,"
         "window.dialog box, window.dialog grid, window.dialog paned,"
         "window.dialog stack, window.xmp-dialog, .xmp-dialog-surface,"
@@ -5198,7 +6131,7 @@ static void update_custom_theme(void)
         "filechooser placessidebar, filechooser placessidebar row,"
         "label#sample-details, label#about-description {background-color:%s;color:#e6e6e6;}"
         "entry, spinbutton, spinbutton entry, filechooser entry,"
-        "treeview#playlist-view, treeview#soundfont-view,"
+        "treeview#playlist-view, treeview#soundfont-view, treeview#radio-view,"
         "list#sample-list, list#sample-list row,"
         "textview#module-comments, textview#module-comments text,"
         "filechooser scrolledwindow, filechooser viewport, filechooser .view,"
@@ -5206,12 +6139,89 @@ static void update_custom_theme(void)
         "button, combobox button, spinbutton button, notebook tab {"
         "background-color:%s;color:#e6e6e6;border-color:#555555;}"
         "button:hover, notebook tab:hover, menuitem:hover,"
+        "treeview#radio-view:hover:not(:selected),"
         "filechooser placessidebar row:hover {background-color:%s;}"
         "notebook tab:checked, treeview#playlist-view:selected,"
-        "treeview#soundfont-view:selected, list#sample-list row:selected,"
+        "treeview#soundfont-view:selected, treeview#radio-view:selected, list#sample-list row:selected,"
         "filechooser treeview:selected, filechooser iconview:selected,"
         "menuitem:selected, menuitem:hover {background-color:%s;color:#ffffff;}"
         "notebook tab:checked {border-bottom:2px solid %s;}"
+        /* Dialog frames use the same palette as the main window. */
+        "#modulez-dialog-window, #modulez-dialog-window:backdrop {"
+        "background-color:@modulez_tribute_background;background-image:none;"
+        "border:0;box-shadow:none;border-radius:16px;}"
+        "#modulez-dialog-window.csd {"
+        "background-color:@modulez_tribute_background;background-image:none;"
+        "border-radius:16px;}"
+        "#modulez-dialog-window.csd decoration {"
+        "background:transparent;border:0;"
+        "border-radius:16px;box-shadow:0 6px 18px 2px rgba(0,0,0,0.55);}" 
+        /* Remove desktop-theme gradients from dialog surfaces, including
+         * GtkMessageDialog's internal message area and titlebar boxes. */
+        "window.xmp-dialog, window.xmp-dialog.background,"
+        "window.xmp-dialog .xmp-dialog-surface, window.xmp-dialog .dialog-vbox,"
+        "window.xmp-dialog .dialog-action-box, window.xmp-dialog box,"
+        "window.xmp-dialog grid, window.xmp-dialog .message-area {"
+        "background-color:@modulez_tribute_background;background-image:none;box-shadow:none;}"
+        "#modulez-dialog-titlebar,"
+        "#modulez-dialog-titlebar:backdrop {"
+        "background-color:@modulez_shell_panel;background-image:none;"
+        "border:0;box-shadow:none;color:#e6e6e6;}"
+        "#modulez-dialog-titlebar box {"
+        "background:transparent;box-shadow:none;}"
+        "#modulez-dialog-titlebar {"
+        "background-color:@modulez_shell_panel;background-image:none;"
+        "border-radius:16px 16px 0 0;border:0;box-shadow:none;"
+        "min-height:28px;padding:3px 8px;color:#e6e6e6;}"
+        "#modulez-dialog-titlebar button.titlebutton {"
+        "background-color:@modulez_tribute_background;background-image:none;"
+        "border-radius:999px;border:0;box-shadow:none;padding:3px;"
+        "min-width:22px;min-height:22px;color:#e6e6e6;}"
+        "#modulez-dialog-titlebar button.titlebutton:hover {"
+        "background-color:alpha(@modulez_tribute_accent,0.30);}"
+        "#modulez-dialog-titlebar button.titlebutton.close:hover {"
+        "background-color:#a33e49;}"
+        "window.modulez-modern-dialog.maximized, window.modulez-modern-dialog.tiled,"
+        "window.modulez-modern-dialog.maximized decoration, window.modulez-modern-dialog.tiled decoration,"
+        "window.modulez-modern-dialog.maximized .modulez-dialog-titlebar,"
+        "window.modulez-modern-dialog.tiled .modulez-dialog-titlebar {border-radius:0;box-shadow:none;}"
+        /* GTK still owns the main frame extents, resize handles and titlebar gestures. */
+        "window#modulez-main-window.csd {"
+        "background-color:@modulez_tribute_background;background-image:none;"
+        "border-radius:32px;}"
+        "window#modulez-main-window.csd decoration {"
+        "border-radius:32px;box-shadow:0 6px 18px 2px rgba(0,0,0,0.55); }"
+        "#modulez-window-titlebar {"
+        "background-color:@modulez_tribute_background;background-image:none;"
+        "border-radius:32px 32px 0 0;border:0;box-shadow:none;"
+        "min-height:28px;padding:3px 8px;color:#e6e6e6;}"
+        "#modulez-window-titlebar button.titlebutton {"
+        "background-color:@modulez_shell_panel;background-image:none;"
+        "border-radius:999px;border:0;box-shadow:none;padding:3px;"
+        "min-width:22px;min-height:22px;color:#e6e6e6;}"
+        "#modulez-window-titlebar button.titlebutton:hover {"
+        "background-color:alpha(@modulez_tribute_accent,0.30);}"
+        "#modulez-window-titlebar button.titlebutton.close:hover {"
+        "background-color:#a33e49;}"
+        "window#modulez-main-window.maximized, window#modulez-main-window.fullscreen,"
+        "window#modulez-main-window.tiled,"
+        "window#modulez-main-window.maximized decoration,"
+        "window#modulez-main-window.fullscreen decoration,"
+        "window#modulez-main-window.tiled decoration,"
+        "window#modulez-main-window.maximized #modulez-window-titlebar,"
+        "window#modulez-main-window.fullscreen #modulez-window-titlebar,"
+        "window#modulez-main-window.tiled #modulez-window-titlebar {"
+        "border-radius:0;box-shadow:none;}"
+        "#modulez-header, #modulez-sidebar-panel, #modulez-footer {"
+        "background-color:@modulez_shell_panel;background-image:none;border-radius:12px;}"
+        "#modulez-sidebar-scroll, #modulez-sidebar-scroll viewport, #modulez-sidebar {"
+        "background:transparent;color:#e6e6e6;}"
+        "#modulez-sidebar row {background:transparent;border-radius:8px;margin:1px 3px;}"
+        "#modulez-sidebar row:selected, #modulez-sidebar row:selected:hover {background-color:alpha(@modulez_tribute_accent,0.30);}"
+        "#modulez-sidebar row:selected image, #modulez-sidebar row:selected label {color:@modulez_tribute_accent;}"
+        "#modulez-sidebar row:hover {background-color:alpha(@modulez_tribute_accent,0.15);}"
+        "#modulez-sidebar .dim-label {color:#b0b0b0;font-size:0.85em;}"
+        "#modulez-header button, #modulez-sidebar-panel button {padding:4px 10px;border-radius:10px;}"
         "scale highlight, progressbar progress, switch:checked {background-color:%s;}"
         "scale slider, #eq-sliders scale slider, switch slider {"
         "background-color:%s;border-color:%s;}"
@@ -5241,7 +6251,7 @@ static void update_custom_theme(void)
         "#xmp-irc-root notebook tab:checked {background-color:%s;"
         "color:#ffffff;border-bottom:2px solid %s;}"
         "#xmp-irc-root label {color:#e6e6e6;}"
-        ,base,accent,base,panel,field,panel,hover,selection,accent,accent,
+        ,base,accent,panel,base,panel,field,panel,hover,selection,accent,accent,
         accent,accent,field,accent,
         base,field,panel,hover,panel,panel,selection,accent);
     gtk_css_provider_load_from_data(custom_theme_provider, css, -1, NULL);
@@ -5352,6 +6362,9 @@ static void apply_style(void)
         "treeview#soundfont-view { background-color: #050d11; color: #dbeff0; }"
         "treeview#soundfont-view:selected { background-color: #16515a; color: #ffffff; }"
         "treeview#soundfont-view row:hover { background-color: #10242d; }"
+        "treeview#radio-view { background-color: #050d11; color: #dbeff0; }"
+        "treeview#radio-view:selected { background-color: #16515a; color: #ffffff; }"
+        "treeview#radio-view:hover:not(:selected) { background-color: #10242d; }"
         "box#samples-page { background-color: #071218; }"
         "scrolledwindow#sample-scroll, scrolledwindow#sample-scroll viewport {"
         " background-color: #050d11; background-image: none; }"
@@ -5435,6 +6448,14 @@ static void load_preferences(void)
     if (g_key_file_has_key(settings, "Appearance", "brightness", NULL))
         theme_brightness = CLAMP(g_key_file_get_integer(settings, "Appearance",
                                                       "brightness", NULL), 0, 100);
+    if (g_key_file_has_key(settings, "Window", "sidebar-collapsed", NULL))
+        sidebar_collapsed = g_key_file_get_boolean(settings, "Window", "sidebar-collapsed", NULL);
+    if (g_key_file_has_key(settings, "Window", "modern-window", NULL)) {
+        GError *error = NULL;
+        gboolean value = g_key_file_get_boolean(settings, "Window", "modern-window", &error);
+        if (!error) modern_window = value;
+        g_clear_error(&error);
+    }
     g_key_file_free(settings);
     g_free(path);
 }
@@ -5446,6 +6467,8 @@ static void save_preferences(void)
     GKeyFile *settings = g_key_file_new();
     g_key_file_set_boolean(settings, "Window", "minimize-to-tray",
                            minimize_to_tray);
+    g_key_file_set_boolean(settings, "Window", "sidebar-collapsed", sidebar_collapsed);
+    g_key_file_set_boolean(settings, "Window", "modern-window", modern_window);
     g_key_file_set_integer(settings, "Playback", "repeat-mode", repeat_mode);
     g_key_file_set_integer(settings, "Appearance", "theme-hue", theme_hue);
     g_key_file_set_integer(settings, "Appearance", "accent-hue", accent_hue);
@@ -5618,6 +6641,10 @@ static void on_destroy(GtkWidget *widget, gpointer data)
 {
     (void)widget;
     (void)data;
+    world_closing = TRUE;
+    if (world_cancel) g_cancellable_cancel(world_cancel);
+    g_clear_object(&world_cancel);
+    g_clear_pointer(&world_params, g_free);
 
     xmp_tray_icon_free(tray_icon);
     tray_icon = NULL;
@@ -5796,6 +6823,172 @@ static gboolean about_update_link(GtkLabel *label, const gchar *uri, gpointer da
     return TRUE;
 }
 
+/* Keep the existing notebook pages and use a separate navigation list. */
+typedef struct {
+    GtkNotebook *notebook;
+    GtkListBox *list;
+    GtkWidget *toggle;
+    GtkWidget *labels[20];
+    guint label_count;
+    gboolean syncing;
+} ModulezSidebar;
+
+static void sidebar_apply(ModulezSidebar *nav)
+{
+    for (guint i = 0; i < nav->label_count; ++i)
+        gtk_widget_set_visible(nav->labels[i], !sidebar_collapsed);
+    gtk_button_set_image(GTK_BUTTON(nav->toggle), gtk_image_new_from_icon_name(
+        sidebar_collapsed ? "go-next-symbolic" : "go-previous-symbolic",
+        GTK_ICON_SIZE_BUTTON));
+    gtk_widget_set_tooltip_text(nav->toggle,
+        sidebar_collapsed ? "Expand navigation" : "Collapse navigation");
+}
+
+static void sidebar_toggle(GtkButton *button, gpointer data)
+{
+    (void)button;
+    ModulezSidebar *nav = data;
+    sidebar_collapsed = !sidebar_collapsed;
+    sidebar_apply(nav);
+    save_preferences();
+}
+
+static void sidebar_selected(GtkListBox *list, GtkListBoxRow *row, gpointer data)
+{
+    (void)list;
+    ModulezSidebar *nav = data;
+    if (!row || nav->syncing) return;
+    int page = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "page-index")) - 1;
+    if (page >= 0) gtk_notebook_set_current_page(nav->notebook, page);
+}
+
+/* The live canvas must use the viewport, not the notebook's tallest page. */
+static void visualizer_page_switch(GtkNotebook *notebook, GtkWidget *page,
+                                  guint index, gpointer data)
+{
+    (void)notebook; (void)index;
+    GtkStack *stack = GTK_STACK(data);
+    GtkWidget *placeholder = g_object_get_data(G_OBJECT(stack), "vis-placeholder");
+    gtk_stack_set_visible_child_name(stack, page == placeholder ? "visualizer" : "pages");
+}
+
+static void sidebar_page_changed(GtkNotebook *notebook, GtkWidget *page,
+                                 guint index, gpointer data)
+{
+    (void)notebook; (void)page;
+    ModulezSidebar *nav = data;
+    GList *rows = gtk_container_get_children(GTK_CONTAINER(nav->list));
+    nav->syncing = TRUE;
+    for (GList *it = rows; it; it = it->next) {
+        if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(it->data), "page-index")) == (int)index + 1) {
+            gtk_list_box_select_row(nav->list, GTK_LIST_BOX_ROW(it->data));
+            break;
+        }
+    }
+    nav->syncing = FALSE;
+    g_list_free(rows);
+}
+
+static ModulezSidebar *sidebar_create(GtkWidget *container, GtkNotebook *notebook)
+{
+    static const struct { const char *label, *icon; int page; } entries[] = {
+        {"PLAYER", NULL, -1},
+        {"Player", "audio-x-generic-symbolic", 0},
+        {"Samples", "media-record-symbolic", 1},
+        {"Patterns", "view-grid-symbolic", 2},
+        {"DISCOVER", NULL, -1},
+        {"Radio", "network-wireless-symbolic", 6},
+        {"HVSC", "folder-music-symbolic", 5},
+        {"IRC", "mail-message-new-symbolic", 7},
+        {"TOOLS", NULL, -1},
+        {"SoundFonts", "audio-x-generic-symbolic", 3},
+        {"Equalizer", "preferences-system-symbolic", 4},
+        {"Visualizer", "video-display-symbolic", 8},
+        {"SYSTEM", NULL, -1},
+        {"Preferences", "emblem-system-symbolic", 9},
+        {"About", "help-about-symbolic", 10}
+    };
+    ModulezSidebar *nav = g_new0(ModulezSidebar, 1);
+    nav->notebook = notebook;
+    GtkWidget *panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_name(panel, "modulez-sidebar-panel");
+    gtk_container_set_border_width(GTK_CONTAINER(panel), 4);
+    gtk_box_pack_start(GTK_BOX(container), panel, FALSE, FALSE, 0);
+    g_object_set_data_full(G_OBJECT(panel), "modulez-navigation", nav, g_free);
+    nav->toggle = gtk_button_new();
+    gtk_box_pack_start(GTK_BOX(panel), nav->toggle, FALSE, FALSE, 0);
+    g_signal_connect(nav->toggle, "clicked", G_CALLBACK(sidebar_toggle), nav);
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_name(scroll, "modulez-sidebar-scroll");
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(scroll), FALSE);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroll), 0);
+    gtk_box_pack_start(GTK_BOX(panel), scroll, TRUE, TRUE, 0);
+    nav->list = GTK_LIST_BOX(gtk_list_box_new());
+    gtk_widget_set_name(GTK_WIDGET(nav->list), "modulez-sidebar");
+    gtk_list_box_set_selection_mode(nav->list, GTK_SELECTION_SINGLE);
+    gtk_container_add(GTK_CONTAINER(scroll), GTK_WIDGET(nav->list));
+    for (guint i = 0; i < G_N_ELEMENTS(entries); ++i) {
+        GtkWidget *row = gtk_list_box_row_new();
+        GtkWidget *line = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        gtk_container_set_border_width(GTK_CONTAINER(line), 4);
+        gtk_container_add(GTK_CONTAINER(row), line);
+        GtkWidget *label = gtk_label_new(entries[i].label);
+        gtk_label_set_xalign(GTK_LABEL(label), 0);
+        if (entries[i].page < 0) {
+            gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(row), FALSE);
+            gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
+            gtk_style_context_add_class(gtk_widget_get_style_context(label), "dim-label");
+            /* Hide the entire section heading when collapsed. */
+            nav->labels[nav->label_count++] = row;
+            gtk_widget_set_no_show_all(row, TRUE);
+        } else {
+            GtkWidget *image = gtk_image_new_from_icon_name(entries[i].icon, GTK_ICON_SIZE_MENU);
+            gtk_box_pack_start(GTK_BOX(line), image, FALSE, FALSE, 0);
+            g_object_set_data(G_OBJECT(row), "page-index", GINT_TO_POINTER(entries[i].page + 1));
+            gtk_widget_set_tooltip_text(row, entries[i].label);
+            nav->labels[nav->label_count++] = label;
+            gtk_widget_set_no_show_all(label, TRUE);
+        }
+        gtk_box_pack_start(GTK_BOX(line), label, FALSE, FALSE, 0);
+        gtk_container_add(GTK_CONTAINER(nav->list), row);
+        gtk_widget_show_all(line);
+        gtk_widget_show(label);
+    }
+    g_signal_connect(nav->list, "row-selected", G_CALLBACK(sidebar_selected), nav);
+    g_signal_connect(notebook, "switch-page", G_CALLBACK(sidebar_page_changed), nav);
+    return nav;
+}
+
+/* Install the titlebar before the toplevel is realized. Do not implement
+ * custom dragging/resizing: GtkHeaderBar and GtkWindow already handle both. */
+static void install_window_decorations(void)
+{
+    GdkScreen *screen = gtk_widget_get_screen(window);
+    /* Non-composited X11 cannot display transparent rounded corners reliably.
+     * Keep a native window frame in that case, without changing the saved choice. */
+    if (!modern_window || !screen || !gdk_screen_is_composited(screen) ||
+        !gdk_screen_get_rgba_visual(screen))
+        return;
+
+    GtkWidget *bar = gtk_header_bar_new();
+    gtk_widget_set_name(window, "modulez-main-window");
+    gtk_widget_set_name(bar, "modulez-window-titlebar");
+    gtk_header_bar_set_title(GTK_HEADER_BAR(bar), "Modulez Player " MODULEZ_VERSION);
+    gtk_header_bar_set_has_subtitle(GTK_HEADER_BAR(bar), FALSE);
+    gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(bar), TRUE);
+    gtk_header_bar_set_decoration_layout(GTK_HEADER_BAR(bar), ":minimize,maximize,close");
+    gtk_window_set_titlebar(GTK_WINDOW(window), bar);
+}
+
+static void on_modern_window_changed(GtkToggleButton *button, gpointer data)
+{
+    (void)data;
+    modern_window = gtk_toggle_button_get_active(button);
+    save_preferences();
+    set_status("Window style saved. Quit and reopen Modulez Player to apply.");
+}
+
 static int create_player(void)
 {
     /* Request a dark GTK fallback for controls the application does not
@@ -5854,12 +7047,13 @@ static int create_player(void)
     g_signal_connect(window, "key-press-event",
                      G_CALLBACK(on_visualizer_shortcut), NULL);
     gtk_window_set_title(GTK_WINDOW(window), "Modulez Player " MODULEZ_VERSION);
+    install_window_decorations();
 
     /* Size the initial window to the monitor's usable area. GTK will not
      * honor a smaller default size if notebook pages request more space, so
      * the tall pages also use shorter minimum widgets on compact displays. */
     gint initial_width = 900;
-    gint initial_height = 850;
+    gint initial_height = 720;
     gboolean compact_ui = FALSE;
     GdkDisplay *display = gdk_display_get_default();
     GdkMonitor *monitor = display ? gdk_display_get_primary_monitor(display) : NULL;
@@ -5900,35 +7094,48 @@ static int create_player(void)
 
     GtkWidget *notebook = gtk_notebook_new();
     gtk_notebook_set_scrollable(GTK_NOTEBOOK(notebook), TRUE);
-    gtk_container_add(GTK_CONTAINER(window), notebook);
+    gtk_notebook_set_show_tabs(GTK_NOTEBOOK(notebook), FALSE);
+    gtk_notebook_set_show_border(GTK_NOTEBOOK(notebook), FALSE);
+    GtkWidget *shell = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(shell), compact_ui ? 8 : 12);
+    gtk_container_add(GTK_CONTAINER(window), shell);
+    GtkWidget *header = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_name(header, "modulez-header");
+    gtk_container_set_border_width(GTK_CONTAINER(header), 6);
+    gtk_box_pack_start(GTK_BOX(shell), header, FALSE, FALSE, 0);
+    GtkWidget *body = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(shell), body, TRUE, TRUE, 0);
 
     GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, compact_ui ? 8 : 12);
-    gtk_container_set_border_width(GTK_CONTAINER(outer), compact_ui ? 12 : 20);
+    gtk_container_set_border_width(GTK_CONTAINER(outer), compact_ui ? 4 : 8);
 
     GtkWidget *player_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, compact_ui ? 8 : 12);
     gtk_container_set_border_width(GTK_CONTAINER(player_page), compact_ui ? 4 : 8);
     gtk_box_pack_start(GTK_BOX(player_page), outer, TRUE, TRUE, 0);
 
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-    gtk_box_pack_start(GTK_BOX(outer), top, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(header), top, FALSE, FALSE, 0);
 
-    GdkPixbuf *small_cover = (app_icon && compact_ui)
-        ? gdk_pixbuf_scale_simple(app_icon, 80, 80, GDK_INTERP_BILINEAR)
+    GdkPixbuf *small_cover = app_icon
+        ? gdk_pixbuf_scale_simple(app_icon, compact_ui ? 48 : 60,
+                                  compact_ui ? 48 : 60, GDK_INTERP_BILINEAR)
         : NULL;
     GtkWidget *cover = app_icon
         ? gtk_image_new_from_pixbuf(small_cover ? small_cover : app_icon)
         : gtk_image_new();
     if (small_cover)
         g_object_unref(small_cover);
-    gtk_widget_set_size_request(cover, compact_ui ? 80 : 100,
-                               compact_ui ? 80 : 100);
+    gtk_widget_set_size_request(cover, compact_ui ? 48 : 60,
+                               compact_ui ? 48 : 60);
     gtk_box_pack_start(GTK_BOX(top), cover, FALSE, FALSE, 0);
 
-    GtkWidget *info = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *info = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     gtk_box_pack_start(GTK_BOX(top), info, TRUE, TRUE, 0);
 
     title_label = gtk_label_new("No module loaded");
     gtk_label_set_xalign(GTK_LABEL(title_label), 0);
+    gtk_label_set_ellipsize(GTK_LABEL(title_label), PANGO_ELLIPSIZE_END);
+    gtk_label_set_max_width_chars(GTK_LABEL(title_label), 32);
     gtk_widget_set_name(title_label, "module-title");
     gtk_style_context_add_class(gtk_widget_get_style_context(title_label),
                                 "module-title");
@@ -5936,23 +7143,24 @@ static int create_player(void)
 
     format_label = gtk_label_new("Open a music file to begin");
     gtk_label_set_xalign(GTK_LABEL(format_label), 0);
+    gtk_label_set_ellipsize(GTK_LABEL(format_label), PANGO_ELLIPSIZE_END);
     gtk_box_pack_start(GTK_BOX(info), format_label, FALSE, FALSE, 0);
 
     channels_label = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(channels_label), 0);
+    gtk_label_set_ellipsize(GTK_LABEL(channels_label), PANGO_ELLIPSIZE_END);
     gtk_box_pack_start(GTK_BOX(info), channels_label, FALSE, FALSE, 0);
 
-    /* Mirrored FFT spectrum in the open space at the top right. */
+    /* Full-width spectrum below the compact now-playing row. */
     visualizer_area = gtk_drawing_area_new();
-    gtk_widget_set_size_request(visualizer_area, compact_ui ? 280 : 320,
-                               compact_ui ? 80 : 100);
+    gtk_widget_set_size_request(visualizer_area, -1, compact_ui ? 52 : 64);
     gtk_widget_set_hexpand(visualizer_area, TRUE);
     g_signal_connect(visualizer_area, "draw",
                      G_CALLBACK(draw_visualizer), NULL);
-    gtk_box_pack_start(GTK_BOX(top), visualizer_area, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(header), visualizer_area, FALSE, TRUE, 0);
 
     GtkWidget *file_controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_pack_start(GTK_BOX(outer), file_controls, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(header), file_controls, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(file_controls),
         make_button("Open File", G_CALLBACK(on_open)), FALSE, FALSE, 0);
@@ -5978,7 +7186,7 @@ static int create_player(void)
 
     GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_set_homogeneous(GTK_BOX(controls), TRUE);
-    gtk_box_pack_start(GTK_BOX(outer), controls, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(header), controls, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(controls),
         make_button("|◀", G_CALLBACK(on_previous)), TRUE, TRUE, 0);
 
@@ -5991,7 +7199,7 @@ static int create_player(void)
     gtk_box_pack_start(GTK_BOX(controls),
         make_button("▶|", G_CALLBACK(on_next)), TRUE, TRUE, 0);
 
-    gtk_box_pack_start(GTK_BOX(outer),
+    gtk_box_pack_start(GTK_BOX(header),
         gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
 
     /* Keep the search and toggle reachable when the track list is collapsed. */
@@ -6024,10 +7232,12 @@ static int create_player(void)
     gtk_box_pack_start(GTK_BOX(playlist_controls),
         make_button("Save M3U", G_CALLBACK(on_playlist_save_m3u)),
         FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(playlist_controls),
+    GtkWidget *playlist_actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_box_pack_start(GTK_BOX(outer), playlist_actions, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(playlist_actions),
         make_button("Remove", G_CALLBACK(on_playlist_remove)),
         FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(playlist_controls),
+    gtk_box_pack_start(GTK_BOX(playlist_actions),
         make_button("Clear", G_CALLBACK(on_playlist_clear)),
         FALSE, FALSE, 0);
 
@@ -6041,7 +7251,7 @@ static int create_player(void)
     g_object_unref(playlist_filter); /* The view now owns the model. */
 
     GtkWidget *search_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_box_pack_start(GTK_BOX(outer), search_row, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(playlist_actions), search_row, TRUE, TRUE, 0);
     GtkWidget *search_entry = gtk_search_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry), "Search playlist…");
     gtk_box_pack_start(GTK_BOX(search_row), search_entry, TRUE, TRUE, 0);
@@ -6125,8 +7335,10 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     g_object_bind_property(show_patterns, "active", lower_box, "visible", G_BINDING_SYNC_CREATE);
     gtk_paned_set_position(GTK_PANED(content_pane), compact_ui ? 150 : 230);
 
-    GtkWidget *player_footer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    gtk_box_pack_start(GTK_BOX(outer), player_footer, FALSE, FALSE, 0);
+    GtkWidget *player_footer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_name(player_footer, "modulez-footer");
+    gtk_container_set_border_width(GTK_CONTAINER(player_footer), 4);
+    gtk_box_pack_start(GTK_BOX(shell), player_footer, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(player_footer), seek_scale, FALSE, FALSE, 0);
 
     time_label = gtk_label_new("00:00 / 00:00");
@@ -6143,6 +7355,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     status_label = gtk_label_new("Ready");
     gtk_label_set_xalign(GTK_LABEL(status_label), 0);
+    gtk_label_set_ellipsize(GTK_LABEL(status_label), PANGO_ELLIPSIZE_END);
     gtk_box_pack_start(GTK_BOX(player_footer), status_label, FALSE, FALSE, 0);
 
     gtk_notebook_append_page(
@@ -6515,12 +7728,101 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         GTK_NOTEBOOK(notebook), hvsc_page,
         gtk_label_new("HVSC"));
 
+    /* Searchable station directory; use the existing themed GTK widgets. */
+    GtkWidget *radio_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(radio_page), 12);
+    GtkWidget *radio_heading = gtk_label_new("Internet Radio");
+    gtk_style_context_add_class(gtk_widget_get_style_context(radio_heading), "module-title");
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_heading, FALSE, FALSE, 0);
+    GtkWidget *radio_category = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_category), "Demoscene / Retro");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_category), "World Radio");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_category), "Favorites");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_category), "Custom Stations");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(radio_category), 0);
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_category, FALSE, FALSE, 0);
+    GtkWidget *radio_categories = gtk_stack_new();
+    gtk_stack_set_homogeneous(GTK_STACK(radio_categories), FALSE);
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_categories, TRUE, TRUE, 0);
+    GtkWidget *radio_retro = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_stack_add_named(GTK_STACK(radio_categories), radio_retro, "retro");
+    GtkWidget *radio_world = world_radio_page();
+    gtk_stack_add_named(GTK_STACK(radio_categories), radio_world, "world");
+    gtk_stack_add_named(GTK_STACK(radio_categories), saved_radio_page(0), "favorites");
+    gtk_stack_add_named(GTK_STACK(radio_categories), saved_radio_page(1), "custom");
+    saved_load();
+    gtk_stack_set_visible_child_name(GTK_STACK(radio_categories), "retro");
+    g_signal_connect(radio_category, "changed", G_CALLBACK(on_radio_category_changed), radio_categories);
+    GtkWidget *radio_search = gtk_search_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(radio_search), "Search stations, genres or formats…");
+    gtk_box_pack_start(GTK_BOX(radio_retro), radio_search, FALSE, FALSE, 0);
+    radio_store = gtk_list_store_new(RADIO_COLS, G_TYPE_UINT, G_TYPE_STRING,
+        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    for (guint i = 0; i < G_N_ELEMENTS(radio_stations); ++i) {
+        GtkTreeIter iter;
+        gtk_list_store_append(radio_store, &iter);
+        gtk_list_store_set(radio_store, &iter, RADIO_ID, i,
+            RADIO_NAME, radio_stations[i].name, RADIO_GENRE, radio_stations[i].genre,
+            RADIO_QUALITY, radio_stations[i].quality, RADIO_STATE, "", -1);
+    }
+    radio_filter = GTK_TREE_MODEL_FILTER(gtk_tree_model_filter_new(GTK_TREE_MODEL(radio_store), NULL));
+    gtk_tree_model_filter_set_visible_func(radio_filter, radio_visible, NULL, NULL);
+    radio_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(radio_filter));
+    gtk_widget_set_name(radio_view, "radio-view");
+    const char *radio_columns[] = {"Station", "Genre", "Quality", "Status"};
+    for (guint i = 0; i < G_N_ELEMENTS(radio_columns); ++i) {
+        GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+        g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+        GtkTreeViewColumn *column = gtk_tree_view_column_new_with_attributes(
+            radio_columns[i], renderer, "text", RADIO_NAME + i, NULL);
+        gtk_tree_view_column_set_resizable(column, TRUE);
+        gtk_tree_view_column_set_min_width(column, 65);
+        gtk_tree_view_column_set_expand(column, i < 2);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(radio_view), column);
+    }
+    GtkWidget *radio_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(radio_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(radio_scroll, -1, 120);
+    gtk_container_add(GTK_CONTAINER(radio_scroll), radio_view);
+    gtk_box_pack_start(GTK_BOX(radio_retro), radio_scroll, TRUE, TRUE, 0);
+    GtkWidget *radio_buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    radio_play_button = make_button("▶ Play Station", G_CALLBACK(on_radio_play));
+    gtk_box_pack_start(GTK_BOX(radio_buttons), radio_play_button, FALSE, FALSE, 0);
+    radio_website = gtk_link_button_new_with_label(radio_stations[0].website, "Station website");
+    gtk_box_pack_start(GTK_BOX(radio_buttons), radio_website, FALSE, FALSE, 0);
+    GtkWidget *retro_favorite = gtk_button_new_with_label("★ Favorite");
+    gtk_box_pack_start(GTK_BOX(radio_buttons), retro_favorite, FALSE, FALSE, 0);
+    g_signal_connect(retro_favorite, "clicked", G_CALLBACK(on_save_favorite), GINT_TO_POINTER(0));
+    gtk_box_pack_start(GTK_BOX(radio_retro), radio_buttons, FALSE, FALSE, 0);
+    GtkWidget *radio_stop_button = make_button("■ Stop Radio", G_CALLBACK(on_radio_stop));
+    gtk_widget_set_halign(radio_stop_button, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_stop_button, FALSE, FALSE, 0);
+    radio_status_label = gtk_label_new("Stopped");
+    radio_title_label = gtk_label_new("—");
+    gtk_label_set_ellipsize(GTK_LABEL(radio_status_label), PANGO_ELLIPSIZE_END);
+    gtk_label_set_ellipsize(GTK_LABEL(radio_title_label), PANGO_ELLIPSIZE_END);
+    gtk_label_set_selectable(GTK_LABEL(radio_title_label), TRUE);
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_status_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_title_label, FALSE, FALSE, 0);
+    GtkTreeSelection *radio_selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(radio_view));
+    g_signal_connect(radio_selection, "changed", G_CALLBACK(on_radio_selection), NULL);
+    g_signal_connect(radio_view, "row-activated", G_CALLBACK(on_radio_activated), NULL);
+    g_signal_connect(radio_search, "changed", G_CALLBACK(on_radio_search), NULL);
+    GtkTreePath *first_station = gtk_tree_path_new_first();
+    gtk_tree_selection_select_path(radio_selection, first_station);
+    gtk_tree_path_free(first_station);
+    on_radio_selection(radio_selection, NULL);
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), radio_page,
+        compact_tab_label("Radio", "Live retro and worldwide radio streaming"));
+
     /* Classic IRC chat, using the same GTK notebook and dark theme. */
     xmp_irc_add_notebook_page(GTK_NOTEBOOK(notebook));
 
     modulez_visualizer_set_track_navigation(playlist_skip_track);
+    GtkWidget *vis_page = modulez_visualizer_page_new();
+    GtkWidget *vis_placeholder = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
-        modulez_visualizer_page_new(),
+        vis_placeholder,
         compact_tab_label("Vis", "Wavescope visualization and projectM / MilkDrop"));
 
     /* General preferences. A missing preferences file defaults to hiding
@@ -6556,6 +7858,20 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_widget_set_size_request(tray_hint, 300, -1);
     gtk_box_pack_start(GTK_BOX(preferences_page), tray_hint,
                        FALSE, FALSE, 0);
+
+    GtkWidget *modern_check = gtk_check_button_new_with_label(
+        "Use modern rounded window (requires restart)");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(modern_check), modern_window);
+    g_signal_connect(modern_check, "toggled",
+                     G_CALLBACK(on_modern_window_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(preferences_page), modern_check, FALSE, FALSE, 0);
+    GtkWidget *modern_hint = gtk_label_new(
+        "Uncheck for the native desktop frame. Quit from the tray if necessary, "
+        "then reopen the player. The native frame is also used when desktop "
+        "compositing is unavailable.");
+    gtk_label_set_line_wrap(GTK_LABEL(modern_hint), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(modern_hint), 0);
+    gtk_box_pack_start(GTK_BOX(preferences_page), modern_hint, FALSE, FALSE, 0);
 
     GtkWidget *appearance_heading = gtk_label_new("Colors & Appearance");
     gtk_widget_set_halign(appearance_heading, GTK_ALIGN_START);
@@ -6627,7 +7943,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         gtk_image_new_from_pixbuf(about_small_icon) : gtk_image_new();
     if (about_small_icon) g_object_unref(about_small_icon);
     gtk_widget_set_size_request(about_icon, 48, 48);
-    gtk_box_pack_start(GTK_BOX(about_page), modulez_about_tribute_wrap(about_icon),
+    gtk_box_pack_start(GTK_BOX(about_page), modulez_about_tribute_wrap_themed(about_icon, theme_dialog),
                        FALSE, FALSE, 0);
 
     GtkWidget *about_title = gtk_label_new("Modulez Player " MODULEZ_VERSION);
@@ -6705,8 +8021,28 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     g_timeout_add(33, update_display, NULL);
 
+    ModulezSidebar *nav = sidebar_create(body, GTK_NOTEBOOK(notebook));
+    /* Contain the largest notebook page's size request within the body.
+     * Header and footer stay outside this scrollable area. */
+    GtkWidget *page_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(page_scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(page_scroll), FALSE);
+    gtk_scrolled_window_set_propagate_natural_width(GTK_SCROLLED_WINDOW(page_scroll), FALSE);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(page_scroll), 0);
+    gtk_scrolled_window_set_min_content_width(GTK_SCROLLED_WINDOW(page_scroll), 0);
+    gtk_container_add(GTK_CONTAINER(page_scroll), notebook);
+    GtkWidget *page_stack = gtk_stack_new();
+    gtk_stack_set_homogeneous(GTK_STACK(page_stack), FALSE);
+    gtk_stack_add_named(GTK_STACK(page_stack), page_scroll, "pages");
+    gtk_stack_add_named(GTK_STACK(page_stack), vis_page, "visualizer");
+    g_object_set_data(G_OBJECT(page_stack), "vis-placeholder", vis_placeholder);
+    g_signal_connect(notebook, "switch-page", G_CALLBACK(visualizer_page_switch), page_stack);
+    gtk_box_pack_start(GTK_BOX(body), page_stack, TRUE, TRUE, 0);
     gtk_widget_show_all(window);
+    sidebar_apply(nav);
     gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), 0);
+    sidebar_page_changed(GTK_NOTEBOOK(notebook), player_page, 0, nav);
     return 0;
 }
 

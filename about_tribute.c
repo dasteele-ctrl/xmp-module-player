@@ -20,6 +20,7 @@ typedef struct {
     unsigned clicks;
     gint64 first_click;
     GtkWidget *dialog;
+    void (*theme)(GtkWidget *dialog);
 } Trigger;
 
 static Point rotate(double x, double y, double z, double t)
@@ -241,11 +242,15 @@ static void open_tribute(GtkWidget *target, Trigger *trigger)
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Modulez — In memory of modulez.org",
         GTK_IS_WINDOW(top) ? GTK_WINDOW(top) : NULL, GTK_DIALOG_DESTROY_WITH_PARENT,
         "Close", GTK_RESPONSE_CLOSE, NULL);
-    gtk_style_context_add_class(gtk_widget_get_style_context(dialog), "xmp-dialog");
-    gtk_style_context_add_class(gtk_widget_get_style_context(
-        gtk_dialog_get_content_area(GTK_DIALOG(dialog))), "xmp-dialog-surface");
-    gtk_style_context_add_class(gtk_widget_get_style_context(
-        gtk_dialog_get_action_area(GTK_DIALOG(dialog))), "xmp-dialog-surface");
+    if (trigger->theme) {
+        trigger->theme(dialog);
+    } else {
+        gtk_style_context_add_class(gtk_widget_get_style_context(dialog), "xmp-dialog");
+        gtk_style_context_add_class(gtk_widget_get_style_context(
+            gtk_dialog_get_content_area(GTK_DIALOG(dialog))), "xmp-dialog-surface");
+        gtk_style_context_add_class(gtk_widget_get_style_context(
+            gtk_dialog_get_action_area(GTK_DIALOG(dialog))), "xmp-dialog-surface");
+    }
     trigger->dialog = dialog;
     Tribute *demo = g_new0(Tribute, 1);
     g_object_set_data_full(G_OBJECT(dialog), "modulez-tribute", demo, g_free);
@@ -299,7 +304,8 @@ static void trigger_destroyed(GtkWidget *widget, gpointer data)
     if (trigger->dialog) gtk_widget_destroy(trigger->dialog);
     g_free(trigger);
 }
-GtkWidget *modulez_about_tribute_wrap(GtkWidget *image)
+GtkWidget *modulez_about_tribute_wrap_themed(GtkWidget *image,
+                                             void (*theme)(GtkWidget *dialog))
 {
     GtkWidget *target = gtk_event_box_new();
     gtk_event_box_set_visible_window(GTK_EVENT_BOX(target), FALSE);
@@ -307,8 +313,14 @@ GtkWidget *modulez_about_tribute_wrap(GtkWidget *image)
     gtk_widget_add_events(target, GDK_BUTTON_PRESS_MASK);
     gtk_container_add(GTK_CONTAINER(target), image);
     Trigger *trigger = g_new0(Trigger, 1);
+    trigger->theme = theme;
     g_signal_connect(target, "button-press-event", G_CALLBACK(logo_clicked), trigger);
     g_signal_connect(target, "unmap", G_CALLBACK(reset_clicks), trigger);
     g_signal_connect(target, "destroy", G_CALLBACK(trigger_destroyed), trigger);
     return target;
+}
+
+GtkWidget *modulez_about_tribute_wrap(GtkWidget *image)
+{
+    return modulez_about_tribute_wrap_themed(image, NULL);
 }
