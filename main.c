@@ -165,6 +165,8 @@ static RadioStation radio_dynamic_station;
 enum { WORLD_NAME, WORLD_COUNTRY, WORLD_TAGS, WORLD_QUALITY, WORLD_STATE,
        WORLD_URL, WORLD_WEBSITE, WORLD_UUID, WORLD_COLS };
 static GtkListStore *world_store;
+static GtkListStore *saved_stores[2];
+static GtkWidget *saved_views[2];
 static GtkWidget *world_view, *world_name, *world_country, *world_tag;
 static GtkWidget *world_status, *world_play, *world_website, *world_next, *world_prev;
 static GCancellable *world_cancel;
@@ -208,6 +210,23 @@ static void radio_mark_active(const char *state)
         g_free(previous);
         valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(world_store), &iter);
     }
+    for (guint k = 0; k < 2; k++) {
+        if (!saved_stores[k]) continue;
+        GtkTreeModel *m = GTK_TREE_MODEL(saved_stores[k]);
+        valid = gtk_tree_model_get_iter_first(m, &iter);
+        while (valid) {
+            gchar *uuid = NULL, *previous = NULL;
+            gtk_tree_model_get(m, &iter, WORLD_UUID, &uuid, WORLD_STATE, &previous, -1);
+            gchar *retro = g_strdup_printf("retro:%u", radio_active);
+            const char *active = radio_dynamic_uuid ? radio_dynamic_uuid : retro;
+            const char *next = g_strcmp0(uuid, active) == 0 ? state : "";
+            if (g_strcmp0(previous, next) != 0)
+                gtk_list_store_set(saved_stores[k], &iter, WORLD_STATE, next, -1);
+            g_free(retro); g_free(uuid); g_free(previous);
+            valid = gtk_tree_model_iter_next(m, &iter);
+        }
+    }
+
 }
 static SidAudio *sid_audio;
 static UadeAudio *uade_audio;
@@ -1519,6 +1538,8 @@ static void on_world_activated(GtkTreeView *view, GtkTreePath *path,
     if (gtk_tree_model_get_iter(model, &iter, path)) world_play_iter(model, &iter);
 }
 
+static void on_save_favorite(GtkButton *button, gpointer data);
+
 static GtkWidget *world_radio_page(void)
 {
     GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
@@ -1562,6 +1583,9 @@ static GtkWidget *world_radio_page(void)
     world_next = gtk_button_new_with_label("Next");
     gtk_box_pack_start(GTK_BOX(buttons), world_play, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(buttons), world_website, FALSE, FALSE, 0);
+    GtkWidget *favorite = gtk_button_new_with_label("★ Favorite");
+    gtk_box_pack_start(GTK_BOX(buttons), favorite, FALSE, FALSE, 0);
+    g_signal_connect(favorite, "clicked", G_CALLBACK(on_save_favorite), GINT_TO_POINTER(1));
     gtk_box_pack_end(GTK_BOX(buttons), world_next, FALSE, FALSE, 0);
     gtk_box_pack_end(GTK_BOX(buttons), world_prev, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(page), buttons, FALSE, FALSE, 0);
@@ -1586,12 +1610,241 @@ static GtkWidget *world_radio_page(void)
     return page;
 }
 
+/* Saved stations use stable IDs and copies of the stream URL, never result indices. */
+static const gint saved_fields[] = {WORLD_NAME, WORLD_COUNTRY, WORLD_TAGS,
+    WORLD_QUALITY, WORLD_URL, WORLD_WEBSITE, WORLD_UUID};
+static const char *saved_keys[] = {"name", "country", "genre", "quality", "url", "website", "uuid"};
+
+static void theme_dialog(GtkWidget *dialog);
+
+static void saved_message(const char *text)
+{
+    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(window), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", text);
+    theme_dialog(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+static gboolean saved_write(void)
+{
+    GKeyFile *key = g_key_file_new();
+    for (guint k = 0; k < 2; ++k) {
+        GtkTreeModel *model = GTK_TREE_MODEL(saved_stores[k]);
+        GtkTreeIter iter;
+        guint n = 0;
+        for (gboolean valid = gtk_tree_model_get_iter_first(model, &iter); valid;
+             valid = gtk_tree_model_iter_next(model, &iter)) {
+            gchar *group = g_strdup_printf("%s-%u", k ? "custom" : "favorite", n++);
+            for (guint j = 0; j < G_N_ELEMENTS(saved_fields); ++j) {
+                gchar *value = NULL;
+                gtk_tree_model_get(model, &iter, saved_fields[j], &value, -1);
+                g_key_file_set_string(key, group, saved_keys[j], value ? value : "");
+                g_free(value);
+            }
+            g_free(group);
+        }
+    }
+    gchar *path = player_config_path("radio-stations.ini");
+    gchar *dir = g_path_get_dirname(path);
+    g_mkdir_with_parents(dir, 0700);
+    GError *error = NULL;
+    gboolean ok = g_key_file_save_to_file(key, path, &error);
+    if (!ok) saved_message(error ? error->message : "Could not save radio stations.");
+    g_clear_error(&error); g_free(dir); g_free(path); g_key_file_unref(key);
+    return ok;
+}
+
+static void saved_load(void)
+{
+    GKeyFile *key = g_key_file_new();
+    gchar *path = player_config_path("radio-stations.ini");
+    GError *error = NULL;
+    if (g_key_file_load_from_file(key, path, G_KEY_FILE_NONE, &error)) {
+        gsize count = 0;
+        gchar **groups = g_key_file_get_groups(key, &count);
+        for (gsize i = 0; i < count; ++i) {
+            guint k;
+            if (g_str_has_prefix(groups[i], "favorite-")) k = 0;
+            else if (g_str_has_prefix(groups[i], "custom-")) k = 1;
+            else continue;
+            gchar *values[G_N_ELEMENTS(saved_fields)];
+            for (guint j = 0; j < G_N_ELEMENTS(saved_fields); ++j)
+                values[j] = g_key_file_get_string(key, groups[i], saved_keys[j], NULL);
+            if (values[0] && *values[0] && world_http_url(values[4]) && values[6] && *values[6]) {
+                GtkTreeIter iter;
+                gtk_list_store_append(saved_stores[k], &iter);
+                for (guint j = 0; j < G_N_ELEMENTS(saved_fields); ++j)
+                    gtk_list_store_set(saved_stores[k], &iter, saved_fields[j], values[j], -1);
+                gtk_list_store_set(saved_stores[k], &iter, WORLD_STATE, "", -1);
+            }
+            for (guint j = 0; j < G_N_ELEMENTS(saved_fields); ++j) g_free(values[j]);
+        }
+        g_strfreev(groups);
+    } else if (!g_error_matches(error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
+        g_warning("Saved radio stations: %s", error ? error->message : "Cannot read file");
+    }
+    g_clear_error(&error); g_free(path); g_key_file_unref(key);
+}
+
+static gboolean saved_selected(GtkWidget *view, GtkTreeModel **model, GtkTreeIter *iter)
+{
+    return gtk_tree_selection_get_selected(gtk_tree_view_get_selection(GTK_TREE_VIEW(view)), model, iter);
+}
+
+static void on_save_favorite(GtkButton *button, gpointer data)
+{
+    (void)button;
+    gchar *v[G_N_ELEMENTS(saved_fields)] = {NULL};
+    if (GPOINTER_TO_INT(data) == 0) {
+        guint id;
+        if (!radio_selected(&id)) return;
+        const RadioStation *r = &radio_stations[id];
+        v[0] = g_strdup(r->name); v[2] = g_strdup(r->genre); v[3] = g_strdup(r->quality);
+        v[4] = g_strdup(r->url); v[5] = g_strdup(r->website); v[6] = g_strdup_printf("retro:%u", id);
+    } else {
+        GtkTreeModel *model; GtkTreeIter iter;
+        GtkWidget *view = GPOINTER_TO_INT(data) == 1 ? world_view : saved_views[1];
+        if (!saved_selected(view, &model, &iter)) return;
+        for (guint j = 0; j < G_N_ELEMENTS(saved_fields); ++j)
+            gtk_tree_model_get(model, &iter, saved_fields[j], &v[j], -1);
+    }
+    GtkTreeModel *model = GTK_TREE_MODEL(saved_stores[0]); GtkTreeIter iter;
+    gboolean duplicate = FALSE;
+    for (gboolean valid = gtk_tree_model_get_iter_first(model, &iter); valid;
+         valid = gtk_tree_model_iter_next(model, &iter)) {
+        gchar *uuid = NULL;
+        gtk_tree_model_get(model, &iter, WORLD_UUID, &uuid, -1);
+        duplicate = g_strcmp0(uuid, v[6]) == 0;
+        g_free(uuid); if (duplicate) break;
+    }
+    if (duplicate) saved_message("Station is already in Favorites.");
+    else if (v[6] && world_http_url(v[4])) {
+        gtk_list_store_append(saved_stores[0], &iter);
+        for (guint j = 0; j < G_N_ELEMENTS(saved_fields); ++j)
+            gtk_list_store_set(saved_stores[0], &iter, saved_fields[j], v[j], -1);
+        gtk_list_store_set(saved_stores[0], &iter, WORLD_STATE, "", -1);
+        if (saved_write()) saved_message("Station added to Favorites.");
+    }
+    for (guint j = 0; j < G_N_ELEMENTS(saved_fields); ++j) g_free(v[j]);
+}
+
+static void saved_play_iter(GtkTreeModel *model, GtkTreeIter *iter)
+{
+    gchar *uuid = NULL;
+    gtk_tree_model_get(model, iter, WORLD_UUID, &uuid, -1);
+    if (uuid && g_str_has_prefix(uuid, "retro:")) {
+        guint64 id = g_ascii_strtoull(uuid + 6, NULL, 10);
+        if (id < G_N_ELEMENTS(radio_stations)) start_radio_station((guint)id);
+    } else world_play_iter(model, iter);
+    g_free(uuid);
+}
+static void on_saved_play(GtkButton *button, gpointer data)
+{
+    (void)button; GtkTreeModel *model; GtkTreeIter iter;
+    if (saved_selected(saved_views[GPOINTER_TO_INT(data)], &model, &iter)) saved_play_iter(model, &iter);
+}
+static void on_saved_activated(GtkTreeView *view, GtkTreePath *path, GtkTreeViewColumn *column, gpointer data)
+{
+    (void)column; (void)data; GtkTreeIter iter;
+    GtkTreeModel *model = gtk_tree_view_get_model(view);
+    if (gtk_tree_model_get_iter(model, &iter, path)) saved_play_iter(model, &iter);
+}
+static void on_saved_remove(GtkButton *button, gpointer data)
+{
+    (void)button; guint k = GPOINTER_TO_INT(data); GtkTreeModel *model; GtkTreeIter iter;
+    if (!saved_selected(saved_views[k], &model, &iter)) return;
+    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(window), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_QUESTION, GTK_BUTTONS_YES_NO, "Remove the selected saved station?");
+    theme_dialog(dialog);
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog)); gtk_widget_destroy(dialog);
+    if (response == GTK_RESPONSE_YES) { gtk_list_store_remove(saved_stores[k], &iter); saved_write(); }
+}
+
+static void on_custom_edit(GtkButton *button, gpointer data)
+{
+    (void)button; gboolean edit = GPOINTER_TO_INT(data); GtkTreeModel *model; GtkTreeIter iter;
+    if (edit && !saved_selected(saved_views[1], &model, &iter)) return;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(edit ? "Edit station" : "Add station", GTK_WINDOW(window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, "Cancel", GTK_RESPONSE_CANCEL, "Save", GTK_RESPONSE_OK, NULL);
+    theme_dialog(dialog);
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *grid = gtk_grid_new(); gtk_grid_set_row_spacing(GTK_GRID(grid), 8); gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+    gtk_container_set_border_width(GTK_CONTAINER(grid), 12);
+    gtk_container_add(GTK_CONTAINER(content), grid);
+    const char *labels[] = {"Name", "Stream URL", "Genre", "Website"};
+    gint fields[] = {WORLD_NAME, WORLD_URL, WORLD_TAGS, WORLD_WEBSITE};
+    GtkWidget *entries[4];
+    for (guint i = 0; i < 4; ++i) {
+        GtkWidget *label = gtk_label_new(labels[i]); gtk_widget_set_halign(label, GTK_ALIGN_START);
+        entries[i] = gtk_entry_new(); gtk_entry_set_width_chars(GTK_ENTRY(entries[i]), 38);
+        gtk_grid_attach(GTK_GRID(grid), label, 0, i, 1, 1); gtk_grid_attach(GTK_GRID(grid), entries[i], 1, i, 1, 1);
+        if (edit) { gchar *value = NULL; gtk_tree_model_get(model, &iter, fields[i], &value, -1);
+            gtk_entry_set_text(GTK_ENTRY(entries[i]), value ? value : ""); g_free(value); }
+    }
+    gtk_widget_show_all(content);
+    while (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        const char *name = gtk_entry_get_text(GTK_ENTRY(entries[0]));
+        const char *url = gtk_entry_get_text(GTK_ENTRY(entries[1]));
+        const char *website = gtk_entry_get_text(GTK_ENTRY(entries[3]));
+        if (!*name || !world_http_url(url) || (*website && !world_http_url(website))) {
+            saved_message("Enter a name and an HTTP or HTTPS stream URL. Website is optional."); continue;
+        }
+        if (!edit) {
+            gchar *id = g_uuid_string_random(); gchar *uuid = g_strconcat("custom:", id, NULL);
+            gtk_list_store_append(saved_stores[1], &iter);
+            gtk_list_store_set(saved_stores[1], &iter, WORLD_UUID, uuid, WORLD_COUNTRY, "", WORLD_QUALITY, "Auto", WORLD_STATE, "", -1);
+            g_free(uuid); g_free(id);
+        }
+        for (guint i = 0; i < 4; ++i)
+            gtk_list_store_set(saved_stores[1], &iter, fields[i], gtk_entry_get_text(GTK_ENTRY(entries[i])), -1);
+        saved_write(); break;
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static GtkWidget *saved_radio_page(guint k)
+{
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    saved_stores[k] = gtk_list_store_new(WORLD_COLS, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
+        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    GtkWidget *view = saved_views[k] = gtk_tree_view_new_with_model(GTK_TREE_MODEL(saved_stores[k]));
+    gtk_widget_set_name(view, "radio-view");
+    const char *labels[] = {"Station", "Genre", "Quality", "Status"};
+    gint fields[] = {WORLD_NAME, WORLD_TAGS, WORLD_QUALITY, WORLD_STATE};
+    for (guint i = 0; i < 4; ++i) {
+        GtkCellRenderer *renderer = gtk_cell_renderer_text_new(); g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+        GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes(labels[i], renderer, "text", fields[i], NULL);
+        gtk_tree_view_column_set_resizable(col, TRUE); gtk_tree_view_column_set_min_width(col, 60);
+        gtk_tree_view_column_set_expand(col, i < 2); gtk_tree_view_append_column(GTK_TREE_VIEW(view), col);
+    }
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL); gtk_widget_set_size_request(scroll, -1, 120);
+    gtk_container_add(GTK_CONTAINER(scroll), view); gtk_box_pack_start(GTK_BOX(page), scroll, TRUE, TRUE, 0);
+    GtkWidget *buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *play = gtk_button_new_with_label("▶ Play Station"), *remove = gtk_button_new_with_label("Remove");
+    gtk_box_pack_start(GTK_BOX(buttons), play, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(buttons), remove, FALSE, FALSE, 0);
+    g_signal_connect(play, "clicked", G_CALLBACK(on_saved_play), GINT_TO_POINTER(k));
+    g_signal_connect(remove, "clicked", G_CALLBACK(on_saved_remove), GINT_TO_POINTER(k));
+    g_signal_connect(view, "row-activated", G_CALLBACK(on_saved_activated), NULL);
+    if (k) {
+        GtkWidget *add = gtk_button_new_with_label("Add"), *edit = gtk_button_new_with_label("Edit"), *favorite = gtk_button_new_with_label("★ Favorite");
+        gtk_box_pack_start(GTK_BOX(buttons), add, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(buttons), edit, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(buttons), favorite, FALSE, FALSE, 0);
+        g_signal_connect(add, "clicked", G_CALLBACK(on_custom_edit), GINT_TO_POINTER(0));
+        g_signal_connect(edit, "clicked", G_CALLBACK(on_custom_edit), GINT_TO_POINTER(1));
+        g_signal_connect(favorite, "clicked", G_CALLBACK(on_save_favorite), GINT_TO_POINTER(2));
+    }
+    gtk_box_pack_start(GTK_BOX(page), buttons, FALSE, FALSE, 0);
+    return page;
+}
+
 /* Category navigation is independent of the active decoder. */
 static void on_radio_category_changed(GtkComboBox *combo, gpointer data)
 {
     GtkStack *stack = GTK_STACK(data);
     gtk_stack_set_visible_child_name(stack,
-        gtk_combo_box_get_active(combo) == 1 ? "world" : "retro");
+        (const char *[]) {"retro", "world", "favorites", "custom"}[
+            CLAMP(gtk_combo_box_get_active(combo), 0, 3)]);
 }
 
 static void on_radio_stop(GtkButton *button, gpointer data)
@@ -2391,6 +2644,31 @@ static void theme_dialog(GtkWidget *dialog)
 {
     gtk_style_context_add_class(gtk_widget_get_style_context(dialog),
                                 "xmp-dialog");
+
+    /* Keep GTK responsible for titlebar gestures and delete-event handling.
+     * Match the main window's native fallback on non-composited desktops. */
+    GdkScreen *screen = gtk_widget_get_screen(dialog);
+    if (modern_window && screen && gdk_screen_is_composited(screen) &&
+        gdk_screen_get_rgba_visual(screen) && !gtk_widget_get_realized(dialog)) {
+        GtkWidget *bar = gtk_window_get_titlebar(GTK_WINDOW(dialog));
+        if (!bar) {
+            const gchar *title = gtk_window_get_title(GTK_WINDOW(dialog));
+            bar = gtk_header_bar_new();
+            gtk_header_bar_set_title(GTK_HEADER_BAR(bar),
+                title && *title ? title : "Modulez Player");
+            gtk_header_bar_set_has_subtitle(GTK_HEADER_BAR(bar), FALSE);
+            gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(bar), TRUE);
+            gtk_header_bar_set_decoration_layout(GTK_HEADER_BAR(bar), ":close");
+            gtk_window_set_titlebar(GTK_WINDOW(dialog), bar);
+            gtk_widget_show(bar);
+        }
+        gtk_style_context_add_class(gtk_widget_get_style_context(dialog),
+                                    "modulez-modern-dialog");
+        gtk_style_context_add_class(gtk_widget_get_style_context(bar),
+                                    "modulez-dialog-titlebar");
+        gtk_widget_set_name(bar, "modulez-dialog-titlebar");
+        gtk_widget_set_name(dialog, "modulez-dialog-window");
+    }
 
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     GtkWidget *actions = gtk_dialog_get_action_area(GTK_DIALOG(dialog));
@@ -5836,8 +6114,46 @@ static void update_custom_theme(void)
         "filechooser treeview:selected, filechooser iconview:selected,"
         "menuitem:selected, menuitem:hover {background-color:%s;color:#ffffff;}"
         "notebook tab:checked {border-bottom:2px solid %s;}"
-        /* Scope client-side decorations to the main player only. GTK still
-         * owns the frame extents, resize handles and titlebar gestures. */
+        /* Dialog frames use the same palette as the main window. */
+        "#modulez-dialog-window, #modulez-dialog-window:backdrop {"
+        "background-color:@modulez_tribute_background;background-image:none;"
+        "border:0;box-shadow:none;border-radius:16px;}"
+        "#modulez-dialog-window.csd {"
+        "background-color:@modulez_tribute_background;background-image:none;"
+        "border-radius:16px;}"
+        "#modulez-dialog-window.csd decoration {"
+        "background:transparent;border:0;"
+        "border-radius:16px;box-shadow:0 6px 18px 2px rgba(0,0,0,0.55);}" 
+        /* Remove desktop-theme gradients from dialog surfaces, including
+         * GtkMessageDialog's internal message area and titlebar boxes. */
+        "window.xmp-dialog, window.xmp-dialog.background,"
+        "window.xmp-dialog .xmp-dialog-surface, window.xmp-dialog .dialog-vbox,"
+        "window.xmp-dialog .dialog-action-box, window.xmp-dialog box,"
+        "window.xmp-dialog grid, window.xmp-dialog .message-area {"
+        "background-color:@modulez_tribute_background;background-image:none;box-shadow:none;}"
+        "#modulez-dialog-titlebar,"
+        "#modulez-dialog-titlebar:backdrop {"
+        "background-color:@modulez_shell_panel;background-image:none;"
+        "border:0;box-shadow:none;color:#e6e6e6;}"
+        "#modulez-dialog-titlebar box {"
+        "background:transparent;box-shadow:none;}"
+        "#modulez-dialog-titlebar {"
+        "background-color:@modulez_shell_panel;background-image:none;"
+        "border-radius:16px 16px 0 0;border:0;box-shadow:none;"
+        "min-height:28px;padding:3px 8px;color:#e6e6e6;}"
+        "#modulez-dialog-titlebar button.titlebutton {"
+        "background-color:@modulez_tribute_background;background-image:none;"
+        "border-radius:999px;border:0;box-shadow:none;padding:3px;"
+        "min-width:22px;min-height:22px;color:#e6e6e6;}"
+        "#modulez-dialog-titlebar button.titlebutton:hover {"
+        "background-color:alpha(@modulez_tribute_accent,0.30);}"
+        "#modulez-dialog-titlebar button.titlebutton.close:hover {"
+        "background-color:#a33e49;}"
+        "window.modulez-modern-dialog.maximized, window.modulez-modern-dialog.tiled,"
+        "window.modulez-modern-dialog.maximized decoration, window.modulez-modern-dialog.tiled decoration,"
+        "window.modulez-modern-dialog.maximized .modulez-dialog-titlebar,"
+        "window.modulez-modern-dialog.tiled .modulez-dialog-titlebar {border-radius:0;box-shadow:none;}"
+        /* GTK still owns the main frame extents, resize handles and titlebar gestures. */
         "window#modulez-main-window.csd {"
         "background-color:@modulez_tribute_background;background-image:none;"
         "border-radius:32px;}"
@@ -7389,6 +7705,8 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     GtkWidget *radio_category = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_category), "Demoscene / Retro");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_category), "World Radio");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_category), "Favorites");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_category), "Custom Stations");
     gtk_combo_box_set_active(GTK_COMBO_BOX(radio_category), 0);
     gtk_box_pack_start(GTK_BOX(radio_page), radio_category, FALSE, FALSE, 0);
     GtkWidget *radio_categories = gtk_stack_new();
@@ -7398,6 +7716,9 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_stack_add_named(GTK_STACK(radio_categories), radio_retro, "retro");
     GtkWidget *radio_world = world_radio_page();
     gtk_stack_add_named(GTK_STACK(radio_categories), radio_world, "world");
+    gtk_stack_add_named(GTK_STACK(radio_categories), saved_radio_page(0), "favorites");
+    gtk_stack_add_named(GTK_STACK(radio_categories), saved_radio_page(1), "custom");
+    saved_load();
     gtk_stack_set_visible_child_name(GTK_STACK(radio_categories), "retro");
     g_signal_connect(radio_category, "changed", G_CALLBACK(on_radio_category_changed), radio_categories);
     GtkWidget *radio_search = gtk_search_entry_new();
@@ -7437,6 +7758,9 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_box_pack_start(GTK_BOX(radio_buttons), radio_play_button, FALSE, FALSE, 0);
     radio_website = gtk_link_button_new_with_label(radio_stations[0].website, "Station website");
     gtk_box_pack_start(GTK_BOX(radio_buttons), radio_website, FALSE, FALSE, 0);
+    GtkWidget *retro_favorite = gtk_button_new_with_label("★ Favorite");
+    gtk_box_pack_start(GTK_BOX(radio_buttons), retro_favorite, FALSE, FALSE, 0);
+    g_signal_connect(retro_favorite, "clicked", G_CALLBACK(on_save_favorite), GINT_TO_POINTER(0));
     gtk_box_pack_start(GTK_BOX(radio_retro), radio_buttons, FALSE, FALSE, 0);
     GtkWidget *radio_stop_button = make_button("■ Stop Radio", G_CALLBACK(on_radio_stop));
     gtk_widget_set_halign(radio_stop_button, GTK_ALIGN_START);
