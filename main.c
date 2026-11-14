@@ -150,6 +150,9 @@ static const RadioStation radio_stations[] = {
     {"CVGM", "Game music / demoscene", "MP3 192 kbps", "https://slacker.cvgm.net/cvgm192", "https://radio.cvgm.net/"},
     {"SLAY Radio", "Commodore 64 remixes", "MP3", "http://relay4.slayradio.org:8000/", "https://www.slayradio.org/"},
     {"Rainwave Chiptunes", "Video game chiptunes", "MP3", "https://relay.rainwave.cc/chiptune.mp3", "https://rainwave.cc/chiptune/"},
+    {"ModFM", "Tracker music", "Auto", "http://radio.modules.pl:8500/;stream/1", "https://modules.pl/"},
+    {"NoLife Radio", "Video game music", "Auto", "https://listen.nolife-radio.com/stream", "https://nolife-radio.com/"},
+    {"SceneSat Compo Backgrounds", "Demoscene", "MP3 HQ", "https://streams.scenesat.com/compobg/hq.mp3", "https://scenesat.com/"},
 };
 /* Only the GTK thread changes this index, after joining the old worker. */
 static guint radio_active = 0;
@@ -1262,6 +1265,14 @@ static void on_radio_search(GtkEditable *entry, gpointer data)
     g_free(radio_query);
     radio_query = g_utf8_casefold(gtk_entry_get_text(GTK_ENTRY(entry)), -1);
     gtk_tree_model_filter_refilter(radio_filter);
+}
+
+/* Category navigation is independent of the active decoder. */
+static void on_radio_category_changed(GtkComboBox *combo, gpointer data)
+{
+    GtkStack *stack = GTK_STACK(data);
+    gtk_stack_set_visible_child_name(stack,
+        gtk_combo_box_get_active(combo) == 1 ? "world" : "retro");
 }
 
 static void on_radio_stop(GtkButton *button, gpointer data)
@@ -7042,9 +7053,30 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     GtkWidget *radio_heading = gtk_label_new("Internet Radio");
     gtk_style_context_add_class(gtk_widget_get_style_context(radio_heading), "module-title");
     gtk_box_pack_start(GTK_BOX(radio_page), radio_heading, FALSE, FALSE, 0);
+    GtkWidget *radio_category = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_category), "Demoscene / Retro");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(radio_category), "World Radio");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(radio_category), 0);
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_category, FALSE, FALSE, 0);
+    GtkWidget *radio_categories = gtk_stack_new();
+    gtk_stack_set_homogeneous(GTK_STACK(radio_categories), FALSE);
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_categories, TRUE, TRUE, 0);
+    GtkWidget *radio_retro = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_stack_add_named(GTK_STACK(radio_categories), radio_retro, "retro");
+    GtkWidget *radio_world = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    GtkWidget *world_info = gtk_label_new("World Radio — Radio Browser integration is coming next.");
+    gtk_label_set_line_wrap(GTK_LABEL(world_info), TRUE);
+    gtk_box_pack_start(GTK_BOX(radio_world), world_info, FALSE, FALSE, 0);
+    GtkWidget *world_link = gtk_link_button_new_with_label(
+        "https://www.radio-browser.info/", "Visit Radio Browser");
+    gtk_widget_set_halign(world_link, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(radio_world), world_link, FALSE, FALSE, 0);
+    gtk_stack_add_named(GTK_STACK(radio_categories), radio_world, "world");
+    gtk_stack_set_visible_child_name(GTK_STACK(radio_categories), "retro");
+    g_signal_connect(radio_category, "changed", G_CALLBACK(on_radio_category_changed), radio_categories);
     GtkWidget *radio_search = gtk_search_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(radio_search), "Search stations, genres or formats…");
-    gtk_box_pack_start(GTK_BOX(radio_page), radio_search, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(radio_retro), radio_search, FALSE, FALSE, 0);
     radio_store = gtk_list_store_new(RADIO_COLS, G_TYPE_UINT, G_TYPE_STRING,
         G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
     for (guint i = 0; i < G_N_ELEMENTS(radio_stations); ++i) {
@@ -7073,15 +7105,16 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(radio_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_widget_set_size_request(radio_scroll, -1, 120);
     gtk_container_add(GTK_CONTAINER(radio_scroll), radio_view);
-    gtk_box_pack_start(GTK_BOX(radio_page), radio_scroll, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(radio_retro), radio_scroll, TRUE, TRUE, 0);
     GtkWidget *radio_buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     radio_play_button = make_button("▶ Play Station", G_CALLBACK(on_radio_play));
     gtk_box_pack_start(GTK_BOX(radio_buttons), radio_play_button, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(radio_buttons),
-        make_button("■ Stop Radio", G_CALLBACK(on_radio_stop)), FALSE, FALSE, 0);
     radio_website = gtk_link_button_new_with_label(radio_stations[0].website, "Station website");
     gtk_box_pack_start(GTK_BOX(radio_buttons), radio_website, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(radio_page), radio_buttons, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(radio_retro), radio_buttons, FALSE, FALSE, 0);
+    GtkWidget *radio_stop_button = make_button("■ Stop Radio", G_CALLBACK(on_radio_stop));
+    gtk_widget_set_halign(radio_stop_button, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_stop_button, FALSE, FALSE, 0);
     radio_status_label = gtk_label_new("Stopped");
     radio_title_label = gtk_label_new("—");
     gtk_label_set_ellipsize(GTK_LABEL(radio_status_label), PANGO_ELLIPSIZE_END);
