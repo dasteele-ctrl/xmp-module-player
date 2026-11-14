@@ -19,6 +19,11 @@ Modulez Player brings classic tracker music and regular audio playback to the Li
 
 ## Features
 
+- 🌐 **Open URL** — download and play audio and tracker files directly from HTTP/HTTPS URLs, including ModArchive and Modland
+- 🎵 **PSID and RSID support** — recognizes `.sid`, `.psid`, and `.rsid` filenames
+- 📥 **Integrated URL downloader** — cancellation, error handling, decoded filenames, and persistent local storage
+- 🎨 **Refined interface** — rounded buttons and tabs, balanced playback controls, and an expandable volume slider
+
 - **Wavescope Vis tab** with 34 standard visualization modes and projectM / MilkDrop
 - **MilkDrop preset library** with 13 bundled starters, multi-file import, persistent user storage, and right-click next/previous/random controls
 - **Offline visualizations** fed directly from playback after EQ and volume; rendering pauses when hidden
@@ -132,13 +137,13 @@ See [all releases](../../releases) for earlier versions.
 
 ### Running the AppImage
 
-1. Download the versioned `Modulez-Player-v1.7.5-x86_64.AppImage` file from Release v1.7.5.
+1. Download the versioned `Modulez-Player-v1.7.7-x86_64.AppImage` file from Release v1.7.7.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x Modulez-Player-v1.7.5-x86_64.AppImage
-   ./Modulez-Player-v1.7.5-x86_64.AppImage
+   chmod +x Modulez-Player-v1.7.7-x86_64.AppImage
+   ./Modulez-Player-v1.7.7-x86_64.AppImage
    ```
 
 ### Add the player to your application menu
