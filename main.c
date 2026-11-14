@@ -3,6 +3,7 @@
 #include <gtk/gtk.h>
 #include <gio/gio.h>
 #include <libsoup/soup.h>
+#include <json-glib/json-glib.h>
 #include <glib/gstdio.h>
 #include <SDL.h>
 #include <xmp.h>
@@ -156,8 +157,21 @@ static const RadioStation radio_stations[] = {
 };
 /* Only the GTK thread changes this index, after joining the old worker. */
 static guint radio_active = 0;
-#define radio_name (radio_stations[radio_active].name)
-#define radio_url (radio_stations[radio_active].url)
+/* Owned by the GTK thread; replaced only after joining the decoder. */
+static gchar *radio_dynamic_name, *radio_dynamic_url, *radio_dynamic_uuid;
+static RadioStation radio_dynamic_station;
+#define radio_name (radio_dynamic_name ? radio_dynamic_name : radio_stations[radio_active].name)
+#define radio_url (radio_dynamic_url ? radio_dynamic_url : radio_stations[radio_active].url)
+enum { WORLD_NAME, WORLD_COUNTRY, WORLD_TAGS, WORLD_QUALITY, WORLD_STATE,
+       WORLD_URL, WORLD_WEBSITE, WORLD_UUID, WORLD_COLS };
+static GtkListStore *world_store;
+static GtkWidget *world_view, *world_name, *world_country, *world_tag;
+static GtkWidget *world_status, *world_play, *world_website, *world_next, *world_prev;
+static GCancellable *world_cancel;
+static gboolean world_closing;
+static guint world_offset;
+static gchar *world_params;
+#define WORLD_LIMIT 100
 enum { RADIO_ID, RADIO_NAME, RADIO_GENRE, RADIO_QUALITY, RADIO_STATE, RADIO_COLS };
 static GtkListStore *radio_store;
 static GtkWidget *radio_view, *radio_website, *radio_play_button;
@@ -172,13 +186,27 @@ static void radio_mark_active(const char *state)
     while (valid) {
         guint id;
         gtk_tree_model_get(GTK_TREE_MODEL(radio_store), &iter, RADIO_ID, &id, -1);
-        const char *next = id == radio_active ? state : "";
+        const char *next = !radio_dynamic_name && id == radio_active ? state : "";
         gchar *previous = NULL;
         gtk_tree_model_get(GTK_TREE_MODEL(radio_store), &iter, RADIO_STATE, &previous, -1);
         if (g_strcmp0(previous, next) != 0)
             gtk_list_store_set(radio_store, &iter, RADIO_STATE, next, -1);
         g_free(previous);
         valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(radio_store), &iter);
+    }
+    if (!world_store) return;
+    valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(world_store), &iter);
+    while (valid) {
+        gchar *uuid = NULL, *previous = NULL;
+        gtk_tree_model_get(GTK_TREE_MODEL(world_store), &iter,
+                           WORLD_UUID, &uuid, WORLD_STATE, &previous, -1);
+        const char *next = radio_dynamic_uuid &&
+            g_strcmp0(uuid, radio_dynamic_uuid) == 0 ? state : "";
+        if (g_strcmp0(previous, next) != 0)
+            gtk_list_store_set(world_store, &iter, WORLD_STATE, next, -1);
+        g_free(uuid);
+        g_free(previous);
+        valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(world_store), &iter);
     }
 }
 static SidAudio *sid_audio;
@@ -1144,11 +1172,22 @@ static int open_ffmpeg_audio(const char *filename)
 static void on_play(GtkButton *button, gpointer data);
 static void on_stop(GtkButton *button, gpointer data);
 
-static void start_radio_station(guint id)
+static void start_radio_source(guint id, const char *name, const char *url,
+                               const char *uuid)
 {
-    if (!audio_device || !ctx || id >= G_N_ELEMENTS(radio_stations)) return;
+    if (!audio_device || !ctx || (!name && id >= G_N_ELEMENTS(radio_stations))) return;
+    /* Duplicate before stopping: restart may pass the current owned strings. */
+    gchar *new_name = g_strdup(name), *new_url = g_strdup(url), *new_uuid = g_strdup(uuid);
     stop_ffmpeg_decoder();
+    g_free(radio_dynamic_name);
+    g_free(radio_dynamic_url);
+    g_free(radio_dynamic_uuid);
+    radio_dynamic_name = new_name;
+    radio_dynamic_url = new_url;
+    radio_dynamic_uuid = new_uuid;
     radio_active = id;
+    radio_dynamic_station.name = new_name;
+    radio_dynamic_station.url = new_url;
     zx_cancel_pending();
     zx_remove_active();
     SDL_LockAudioDevice(audio_device);
@@ -1177,7 +1216,7 @@ static void start_radio_station(guint id)
     radio_title[0] = radio_error[0] = '\0';
     g_mutex_unlock(&radio_mutex);
     SDL_AtomicSet(&decoder_stop, 0);
-    decoder_thread = SDL_CreateThread(radio_worker, "radio-decoder", (void *)&radio_stations[id]);
+    decoder_thread = SDL_CreateThread(radio_worker, "radio-decoder", (void *)(radio_dynamic_name ? &radio_dynamic_station : &radio_stations[id]));
     if (!decoder_thread) {
         stopped = 1;
         set_status("Could not start radio decoder");
@@ -1197,9 +1236,14 @@ static void start_radio_station(guint id)
     update_play_button();
 }
 
+static void start_radio_station(guint id)
+{
+    start_radio_source(id, NULL, NULL, NULL);
+}
+
 static void start_radio(void)
 {
-    start_radio_station(radio_active);
+    start_radio_source(radio_active, radio_dynamic_name, radio_dynamic_url, radio_dynamic_uuid);
 }
 
 static gboolean radio_selected(guint *id)
@@ -1265,6 +1309,281 @@ static void on_radio_search(GtkEditable *entry, gpointer data)
     g_free(radio_query);
     radio_query = g_utf8_casefold(gtk_entry_get_text(GTK_ENTRY(entry)), -1);
     gtk_tree_model_filter_refilter(radio_filter);
+}
+
+
+/* Radio Browser search runs off the GTK thread, including DNS and HTTP. */
+static const char *world_json_string(JsonObject *obj, const char *key)
+{
+    JsonNode *node = json_object_get_member(obj, key);
+    return node && JSON_NODE_HOLDS_VALUE(node) &&
+        json_node_get_value_type(node) == G_TYPE_STRING ? json_node_get_string(node) : "";
+}
+
+static gboolean world_http_url(const char *url)
+{
+    return url && (g_str_has_prefix(url, "https://") || g_str_has_prefix(url, "http://"));
+}
+
+static void world_search_worker(GTask *task, gpointer source, gpointer data,
+                                GCancellable *cancel)
+{
+    (void)source;
+    const gchar *query = data;
+    GResolver *resolver = g_resolver_get_default();
+    GList *targets = g_resolver_lookup_service(resolver, "api", "tcp",
+                                               "radio-browser.info", cancel, NULL);
+    g_object_unref(resolver);
+    GPtrArray *hosts = g_ptr_array_new_with_free_func(g_free);
+    for (GList *l = targets; l; l = l->next) {
+        const gchar *host = g_srv_target_get_hostname(l->data);
+        if (host && *host) g_ptr_array_add(hosts, g_strdup(host));
+    }
+    g_resolver_free_targets(targets);
+    if (!hosts->len) g_ptr_array_add(hosts, g_strdup("de1.api.radio-browser.info"));
+    SoupSession *session = soup_session_new_with_options("timeout", 12u,
+        "user-agent", "ModulezPlayer/1.8.0", NULL);
+    guint first = g_random_int_range(0, hosts->len);
+    for (guint i = 0; i < hosts->len && !g_cancellable_is_cancelled(cancel); ++i) {
+        const gchar *host = g_ptr_array_index(hosts, (first + i) % hosts->len);
+        gchar *url = g_strdup_printf("https://%s/json/stations/search?%s", host, query);
+        SoupMessage *msg = soup_message_new("GET", url);
+        g_free(url);
+        if (!msg) continue;
+        GBytes *bytes = soup_session_send_and_read(session, msg, cancel, NULL);
+        if (bytes && SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(msg))) {
+            gsize len;
+            const gchar *body = g_bytes_get_data(bytes, &len);
+            JsonParser *parser = json_parser_new();
+            if (json_parser_load_from_data(parser, body, len, NULL) &&
+                JSON_NODE_HOLDS_ARRAY(json_parser_get_root(parser))) {
+                g_object_unref(parser);
+                g_object_unref(msg);
+                g_object_unref(session);
+                g_ptr_array_unref(hosts);
+                g_task_return_pointer(task, bytes, (GDestroyNotify)g_bytes_unref);
+                return;
+            }
+            g_object_unref(parser);
+        }
+        if (bytes) g_bytes_unref(bytes);
+        g_object_unref(msg);
+    }
+    g_object_unref(session);
+    g_ptr_array_unref(hosts);
+    if (!g_task_return_error_if_cancelled(task))
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED,
+                                "Radio Browser unavailable. Try searching again.");
+}
+
+static void world_search_complete(GObject *source, GAsyncResult *result, gpointer data)
+{
+    (void)source; (void)data;
+    GTask *task = G_TASK(result);
+    GError *error = NULL;
+    GBytes *bytes = g_task_propagate_pointer(task, &error);
+    if (world_closing || g_task_get_cancellable(task) != world_cancel) goto done;
+    g_clear_object(&world_cancel);
+    if (!bytes) {
+        gtk_label_set_text(GTK_LABEL(world_status), error ? error->message : "Search failed");
+        gtk_widget_set_sensitive(world_prev, world_offset > 0);
+        gtk_widget_set_sensitive(world_next, FALSE);
+        goto done;
+    }
+    gsize len;
+    const gchar *body = g_bytes_get_data(bytes, &len);
+    JsonParser *parser = json_parser_new();
+    if (!json_parser_load_from_data(parser, body, len, NULL)) {
+        gtk_label_set_text(GTK_LABEL(world_status), "Invalid directory response");
+        g_object_unref(parser);
+        goto done;
+    }
+    JsonArray *array = json_node_get_array(json_parser_get_root(parser));
+    guint count = json_array_get_length(array), shown = 0;
+    gtk_list_store_clear(world_store);
+    for (guint i = 0; i < count; ++i) {
+        JsonNode *node = json_array_get_element(array, i);
+        if (!JSON_NODE_HOLDS_OBJECT(node)) continue;
+        JsonObject *obj = json_node_get_object(node);
+        const char *name = world_json_string(obj, "name");
+        const char *uuid = world_json_string(obj, "stationuuid");
+        const char *url = world_json_string(obj, "url_resolved");
+        if (!world_http_url(url)) url = world_json_string(obj, "url");
+        if (!*name || !*uuid || !world_http_url(url)) continue;
+        const char *codec = world_json_string(obj, "codec");
+        JsonNode *bit = json_object_get_member(obj, "bitrate");
+        gint64 bitrate = bit && JSON_NODE_HOLDS_VALUE(bit) &&
+            json_node_get_value_type(bit) == G_TYPE_INT64 ? json_node_get_int(bit) : 0;
+        gchar *quality = bitrate > 0 ? g_strdup_printf("%s %" G_GINT64_FORMAT " kbps", codec, bitrate) : g_strdup(codec);
+        GtkTreeIter iter;
+        gtk_list_store_append(world_store, &iter);
+        gtk_list_store_set(world_store, &iter, WORLD_NAME, name,
+            WORLD_COUNTRY, world_json_string(obj, "countrycode"),
+            WORLD_TAGS, world_json_string(obj, "tags"), WORLD_QUALITY, quality,
+            WORLD_URL, url, WORLD_WEBSITE, world_json_string(obj, "homepage"),
+            WORLD_UUID, uuid, WORLD_STATE, "", -1);
+        g_free(quality);
+        ++shown;
+    }
+    g_object_unref(parser);
+    gchar *message = g_strdup_printf("%u stations • Page %u", shown, world_offset / WORLD_LIMIT + 1);
+    gtk_label_set_text(GTK_LABEL(world_status), message);
+    g_free(message);
+    gtk_widget_set_sensitive(world_next, count >= WORLD_LIMIT);
+    gtk_widget_set_sensitive(world_prev, world_offset > 0);
+    if (playback_mode == PLAYBACK_RADIO && !stopped)
+        radio_mark_active(SDL_AtomicGet(&radio_ready) ? "Playing" : "Connecting");
+done:
+    if (bytes) g_bytes_unref(bytes);
+    g_clear_error(&error);
+}
+
+static void world_request(void)
+{
+    if (world_cancel) g_cancellable_cancel(world_cancel);
+    g_clear_object(&world_cancel);
+    world_cancel = g_cancellable_new();
+    gchar *query = g_strdup_printf("hidebroken=true&order=votes&reverse=true%s&offset=%u&limit=%u",
+                                   world_params, world_offset, WORLD_LIMIT);
+    gtk_list_store_clear(world_store);
+    gtk_label_set_text(GTK_LABEL(world_status), "Searching Radio Browser…");
+    gtk_widget_set_sensitive(world_next, FALSE);
+    gtk_widget_set_sensitive(world_prev, FALSE);
+    GTask *task = g_task_new(NULL, world_cancel, world_search_complete, NULL);
+    g_task_set_task_data(task, query, g_free);
+    g_task_run_in_thread(task, world_search_worker);
+    g_object_unref(task);
+}
+
+static void on_world_search(GtkWidget *widget, gpointer data)
+{
+    (void)widget; (void)data;
+    gchar *name = g_uri_escape_string(gtk_entry_get_text(GTK_ENTRY(world_name)), NULL, FALSE);
+    gchar *country = g_ascii_strup(gtk_entry_get_text(GTK_ENTRY(world_country)), -1);
+    g_strstrip(country);
+    gchar *cc = g_uri_escape_string(country, NULL, FALSE);
+    gchar *tag = g_uri_escape_string(gtk_entry_get_text(GTK_ENTRY(world_tag)), NULL, FALSE);
+    g_free(world_params);
+    world_params = g_strdup_printf("%s%s%s%s%s%s",
+        *name ? "&name=" : "", name, *cc ? "&countrycode=" : "", cc,
+        *tag ? "&tag=" : "", tag);
+    g_free(name); g_free(country); g_free(cc); g_free(tag);
+    world_offset = 0;
+    world_request();
+}
+
+static void on_world_page(GtkButton *button, gpointer data)
+{
+    (void)button;
+    if (!world_params) return;
+    if (GPOINTER_TO_INT(data) > 0) world_offset += WORLD_LIMIT;
+    else world_offset = world_offset >= WORLD_LIMIT ? world_offset - WORLD_LIMIT : 0;
+    world_request();
+}
+
+static void on_world_selection(GtkTreeSelection *selection, gpointer data)
+{
+    (void)data;
+    GtkTreeModel *model; GtkTreeIter iter;
+    gboolean selected = gtk_tree_selection_get_selected(selection, &model, &iter);
+    gchar *website = NULL;
+    if (selected) gtk_tree_model_get(model, &iter, WORLD_WEBSITE, &website, -1);
+    gtk_widget_set_sensitive(world_play, selected);
+    gtk_widget_set_sensitive(world_website, world_http_url(website));
+    if (world_http_url(website)) gtk_link_button_set_uri(GTK_LINK_BUTTON(world_website), website);
+    g_free(website);
+}
+
+static void world_play_iter(GtkTreeModel *model, GtkTreeIter *iter)
+{
+    gchar *name = NULL, *url = NULL, *uuid = NULL;
+    gtk_tree_model_get(model, iter, WORLD_NAME, &name, WORLD_URL, &url, WORLD_UUID, &uuid, -1);
+    if (name && world_http_url(url)) start_radio_source(0, name, url, uuid);
+    g_free(name); g_free(url); g_free(uuid);
+}
+
+static void on_world_play(GtkButton *button, gpointer data)
+{
+    (void)button; (void)data;
+    GtkTreeModel *model; GtkTreeIter iter;
+    if (gtk_tree_selection_get_selected(gtk_tree_view_get_selection(GTK_TREE_VIEW(world_view)), &model, &iter))
+        world_play_iter(model, &iter);
+}
+
+static void on_world_activated(GtkTreeView *view, GtkTreePath *path,
+                               GtkTreeViewColumn *column, gpointer data)
+{
+    (void)column; (void)data;
+    GtkTreeModel *model = gtk_tree_view_get_model(view);
+    GtkTreeIter iter;
+    if (gtk_tree_model_get_iter(model, &iter, path)) world_play_iter(model, &iter);
+}
+
+static GtkWidget *world_radio_page(void)
+{
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    world_name = gtk_search_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(world_name), "Station name (optional)");
+    gtk_box_pack_start(GTK_BOX(page), world_name, FALSE, FALSE, 0);
+    GtkWidget *filters = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    world_country = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(world_country), "Country code (US, GB, DE…)");
+    gtk_entry_set_width_chars(GTK_ENTRY(world_country), 16);
+    gtk_entry_set_max_length(GTK_ENTRY(world_country), 2);
+    world_tag = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(world_tag), "Genre (rock, jazz…)");
+    GtkWidget *search = gtk_button_new_with_label("Search");
+    gtk_box_pack_start(GTK_BOX(filters), world_country, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(filters), world_tag, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(filters), search, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(page), filters, FALSE, FALSE, 0);
+    world_store = gtk_list_store_new(WORLD_COLS, G_TYPE_STRING, G_TYPE_STRING,
+        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    world_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(world_store));
+    gtk_widget_set_name(world_view, "radio-view");
+    const char *columns[] = {"Station", "Country", "Genre", "Quality", "Status"};
+    for (guint i = 0; i < G_N_ELEMENTS(columns); ++i) {
+        GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+        g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+        GtkTreeViewColumn *column = gtk_tree_view_column_new_with_attributes(columns[i], renderer, "text", i, NULL);
+        gtk_tree_view_column_set_resizable(column, TRUE);
+        gtk_tree_view_column_set_min_width(column, 60);
+        gtk_tree_view_column_set_expand(column, i == 0 || i == 2);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(world_view), column);
+    }
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_size_request(scroll, -1, 120);
+    gtk_container_add(GTK_CONTAINER(scroll), world_view);
+    gtk_box_pack_start(GTK_BOX(page), scroll, TRUE, TRUE, 0);
+    GtkWidget *buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    world_play = gtk_button_new_with_label("▶ Play Station");
+    world_website = gtk_link_button_new_with_label("https://www.radio-browser.info/", "Station website");
+    world_prev = gtk_button_new_with_label("Previous");
+    world_next = gtk_button_new_with_label("Next");
+    gtk_box_pack_start(GTK_BOX(buttons), world_play, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(buttons), world_website, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(buttons), world_next, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(buttons), world_prev, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(page), buttons, FALSE, FALSE, 0);
+    world_status = gtk_label_new("Search or leave filters blank to browse popular stations.");
+    gtk_label_set_line_wrap(GTK_LABEL(world_status), TRUE);
+    gtk_box_pack_start(GTK_BOX(page), world_status, FALSE, FALSE, 0);
+    GtkWidget *link = gtk_link_button_new_with_label("https://www.radio-browser.info/", "Powered by Radio Browser");
+    gtk_box_pack_start(GTK_BOX(page), link, FALSE, FALSE, 0);
+    gtk_widget_set_sensitive(world_play, FALSE);
+    gtk_widget_set_sensitive(world_website, FALSE);
+    gtk_widget_set_sensitive(world_prev, FALSE);
+    gtk_widget_set_sensitive(world_next, FALSE);
+    g_signal_connect(search, "clicked", G_CALLBACK(on_world_search), NULL);
+    g_signal_connect(world_name, "activate", G_CALLBACK(on_world_search), NULL);
+    g_signal_connect(world_country, "activate", G_CALLBACK(on_world_search), NULL);
+    g_signal_connect(world_tag, "activate", G_CALLBACK(on_world_search), NULL);
+    g_signal_connect(world_prev, "clicked", G_CALLBACK(on_world_page), GINT_TO_POINTER(-1));
+    g_signal_connect(world_next, "clicked", G_CALLBACK(on_world_page), GINT_TO_POINTER(1));
+    g_signal_connect(world_play, "clicked", G_CALLBACK(on_world_play), NULL);
+    g_signal_connect(world_view, "row-activated", G_CALLBACK(on_world_activated), NULL);
+    g_signal_connect(gtk_tree_view_get_selection(GTK_TREE_VIEW(world_view)), "changed", G_CALLBACK(on_world_selection), NULL);
+    return page;
 }
 
 /* Category navigation is independent of the active decoder. */
@@ -5974,6 +6293,10 @@ static void on_destroy(GtkWidget *widget, gpointer data)
 {
     (void)widget;
     (void)data;
+    world_closing = TRUE;
+    if (world_cancel) g_cancellable_cancel(world_cancel);
+    g_clear_object(&world_cancel);
+    g_clear_pointer(&world_params, g_free);
 
     xmp_tray_icon_free(tray_icon);
     tray_icon = NULL;
@@ -7063,14 +7386,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_box_pack_start(GTK_BOX(radio_page), radio_categories, TRUE, TRUE, 0);
     GtkWidget *radio_retro = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_stack_add_named(GTK_STACK(radio_categories), radio_retro, "retro");
-    GtkWidget *radio_world = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    GtkWidget *world_info = gtk_label_new("World Radio — Radio Browser integration is coming next.");
-    gtk_label_set_line_wrap(GTK_LABEL(world_info), TRUE);
-    gtk_box_pack_start(GTK_BOX(radio_world), world_info, FALSE, FALSE, 0);
-    GtkWidget *world_link = gtk_link_button_new_with_label(
-        "https://www.radio-browser.info/", "Visit Radio Browser");
-    gtk_widget_set_halign(world_link, GTK_ALIGN_CENTER);
-    gtk_box_pack_start(GTK_BOX(radio_world), world_link, FALSE, FALSE, 0);
+    GtkWidget *radio_world = world_radio_page();
     gtk_stack_add_named(GTK_STACK(radio_categories), radio_world, "world");
     gtk_stack_set_visible_child_name(GTK_STACK(radio_categories), "retro");
     g_signal_connect(radio_category, "changed", G_CALLBACK(on_radio_category_changed), radio_categories);
@@ -7131,7 +7447,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_tree_path_free(first_station);
     on_radio_selection(radio_selection, NULL);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), radio_page,
-        compact_tab_label("Radio", "Live chiptune and tracker music streaming"));
+        compact_tab_label("Radio", "Live retro and worldwide radio streaming"));
 
     /* Classic IRC chat, using the same GTK notebook and dark theme. */
     xmp_irc_add_notebook_page(GTK_NOTEBOOK(notebook));
