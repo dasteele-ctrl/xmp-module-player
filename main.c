@@ -139,8 +139,45 @@ static GMutex radio_mutex;
 static char radio_title[1024], radio_error[512];
 static SDL_atomic_t radio_ready;
 static GtkWidget *radio_status_label, *radio_title_label;
-static const char radio_url[] = "https://radio.ericade.net/sc/stream/1/";
-static const char radio_name[] = "ERICADE Radio";
+typedef struct {
+    const char *name, *genre, *quality, *url, *website;
+} RadioStation;
+static const RadioStation radio_stations[] = {
+    {"ERICADE Radio", "Tracker / demoscene", "MP3 192 kbps", "https://radio.ericade.net/sc/stream/1/", "https://ericade.radio/"},
+    {"Nectarine", "Demoscene", "MP3 192 kbps", "https://nectarine.inversi0n.org/necta192.mp3", "https://scenestream.net/"},
+    {"SceneSat", "Demoscene / electronic", "MP3 HQ", "https://streams.scenesat.com/main/hq.mp3", "https://scenesat.com/"},
+    {"Kohina", "Classic chiptunes", "Ogg Vorbis", "http://kohina.duckdns.org:8000/stream.ogg", "https://www.kohina.com/"},
+    {"CVGM", "Game music / demoscene", "MP3 192 kbps", "https://slacker.cvgm.net/cvgm192", "https://radio.cvgm.net/"},
+    {"SLAY Radio", "Commodore 64 remixes", "MP3", "http://relay4.slayradio.org:8000/", "https://www.slayradio.org/"},
+    {"Rainwave Chiptunes", "Video game chiptunes", "MP3", "https://relay.rainwave.cc/chiptune.mp3", "https://rainwave.cc/chiptune/"},
+};
+/* Only the GTK thread changes this index, after joining the old worker. */
+static guint radio_active = 0;
+#define radio_name (radio_stations[radio_active].name)
+#define radio_url (radio_stations[radio_active].url)
+enum { RADIO_ID, RADIO_NAME, RADIO_GENRE, RADIO_QUALITY, RADIO_STATE, RADIO_COLS };
+static GtkListStore *radio_store;
+static GtkWidget *radio_view, *radio_website, *radio_play_button;
+static GtkTreeModelFilter *radio_filter;
+static gchar *radio_query;
+
+static void radio_mark_active(const char *state)
+{
+    if (!radio_store) return;
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(radio_store), &iter);
+    while (valid) {
+        guint id;
+        gtk_tree_model_get(GTK_TREE_MODEL(radio_store), &iter, RADIO_ID, &id, -1);
+        const char *next = id == radio_active ? state : "";
+        gchar *previous = NULL;
+        gtk_tree_model_get(GTK_TREE_MODEL(radio_store), &iter, RADIO_STATE, &previous, -1);
+        if (g_strcmp0(previous, next) != 0)
+            gtk_list_store_set(radio_store, &iter, RADIO_STATE, next, -1);
+        g_free(previous);
+        valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(radio_store), &iter);
+    }
+}
 static SidAudio *sid_audio;
 static UadeAudio *uade_audio;
 static MidiAudio *midi_audio;
@@ -338,9 +375,9 @@ static int radio_interrupt(void *opaque)
 
 static int radio_worker(void *unused)
 {
-    (void)unused;
+    const RadioStation *station = unused;
     char error[512] = "", title[1024] = "";
-    FfmpegAudio *audio = ffmpeg_audio_open_stream(radio_url,
+    FfmpegAudio *audio = ffmpeg_audio_open_stream(station->url,
         radio_interrupt, NULL, error, sizeof(error));
     int16_t chunk[4096 * 2];
     if (audio) {
@@ -430,6 +467,7 @@ static void stop_ffmpeg_decoder(void)
     ffmpeg_position_frames = 0;
     ffmpeg_duration_ms = 0;
     SDL_AtomicSet(&radio_ready, 0);
+    radio_mark_active("");
     if (radio_status_label) {
         gtk_label_set_text(GTK_LABEL(radio_status_label), "Stopped");
         gtk_label_set_text(GTK_LABEL(radio_title_label), "—");
@@ -1103,10 +1141,11 @@ static int open_ffmpeg_audio(const char *filename)
 static void on_play(GtkButton *button, gpointer data);
 static void on_stop(GtkButton *button, gpointer data);
 
-static void start_radio(void)
+static void start_radio_station(guint id)
 {
-    if (!audio_device || !ctx) return;
+    if (!audio_device || !ctx || id >= G_N_ELEMENTS(radio_stations)) return;
     stop_ffmpeg_decoder();
+    radio_active = id;
     zx_cancel_pending();
     zx_remove_active();
     SDL_LockAudioDevice(audio_device);
@@ -1135,7 +1174,7 @@ static void start_radio(void)
     radio_title[0] = radio_error[0] = '\0';
     g_mutex_unlock(&radio_mutex);
     SDL_AtomicSet(&decoder_stop, 0);
-    decoder_thread = SDL_CreateThread(radio_worker, "radio-decoder", NULL);
+    decoder_thread = SDL_CreateThread(radio_worker, "radio-decoder", (void *)&radio_stations[id]);
     if (!decoder_thread) {
         stopped = 1;
         set_status("Could not start radio decoder");
@@ -1148,14 +1187,81 @@ static void start_radio(void)
     SDL_UnlockAudioDevice(audio_device);
     SDL_PauseAudioDevice(audio_device, 0);
     gtk_label_set_text(GTK_LABEL(radio_status_label), "Connecting…");
-    set_status("Connecting to ERICADE Radio…");
+    gchar *message = g_strdup_printf("Connecting to %s…", radio_name);
+    set_status(message);
+    g_free(message);
+    radio_mark_active("Connecting");
     update_play_button();
+}
+
+static void start_radio(void)
+{
+    start_radio_station(radio_active);
+}
+
+static gboolean radio_selected(guint *id)
+{
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+    if (!radio_view || !gtk_tree_selection_get_selected(
+            gtk_tree_view_get_selection(GTK_TREE_VIEW(radio_view)), &model, &iter))
+        return FALSE;
+    gtk_tree_model_get(model, &iter, RADIO_ID, id, -1);
+    return *id < G_N_ELEMENTS(radio_stations);
+}
+
+static void on_radio_selection(GtkTreeSelection *selection, gpointer data)
+{
+    (void)selection; (void)data;
+    guint id;
+    gboolean selected = radio_selected(&id);
+    gtk_widget_set_sensitive(radio_play_button, selected);
+    gtk_widget_set_sensitive(radio_website, selected);
+    if (selected)
+        gtk_link_button_set_uri(GTK_LINK_BUTTON(radio_website), radio_stations[id].website);
 }
 
 static void on_radio_play(GtkButton *button, gpointer data)
 {
     (void)button; (void)data;
-    start_radio();
+    guint id;
+    if (radio_selected(&id)) start_radio_station(id);
+}
+
+static void on_radio_activated(GtkTreeView *view, GtkTreePath *path,
+                               GtkTreeViewColumn *column, gpointer data)
+{
+    (void)column; (void)data;
+    GtkTreeModel *model = gtk_tree_view_get_model(view);
+    GtkTreeIter iter;
+    guint id;
+    if (gtk_tree_model_get_iter(model, &iter, path)) {
+        gtk_tree_model_get(model, &iter, RADIO_ID, &id, -1);
+        start_radio_station(id);
+    }
+}
+
+static gboolean radio_visible(GtkTreeModel *model, GtkTreeIter *iter, gpointer data)
+{
+    (void)data;
+    if (!radio_query || !*radio_query) return TRUE;
+    guint id;
+    gtk_tree_model_get(model, iter, RADIO_ID, &id, -1);
+    const RadioStation *station = &radio_stations[id];
+    gchar *text = g_strdup_printf("%s %s %s", station->name, station->genre, station->quality);
+    gchar *folded = g_utf8_casefold(text, -1);
+    gboolean match = strstr(folded, radio_query) != NULL;
+    g_free(folded);
+    g_free(text);
+    return match;
+}
+
+static void on_radio_search(GtkEditable *entry, gpointer data)
+{
+    (void)data;
+    g_free(radio_query);
+    radio_query = g_utf8_casefold(gtk_entry_get_text(GTK_ENTRY(entry)), -1);
+    gtk_tree_model_filter_refilter(radio_filter);
 }
 
 static void on_radio_stop(GtkButton *button, gpointer data)
@@ -4786,7 +4892,11 @@ static gboolean update_display(gpointer data)
             g_free(valid);
             const char *status = ended ? (error[0] ? error : "Disconnected") :
                 SDL_AtomicGet(&radio_ready) ? "Live radio playing" : "Connecting…";
-            gtk_label_set_text(GTK_LABEL(radio_status_label), status);
+            gchar *station_status = g_strdup_printf("%s — %s", radio_name, status);
+            gtk_label_set_text(GTK_LABEL(radio_status_label), station_status);
+            g_free(station_status);
+            radio_mark_active(ended ? "Disconnected" :
+                SDL_AtomicGet(&radio_ready) ? "Playing" : "Connecting");
             set_status(status);
         }
         update_play_button();
@@ -5381,7 +5491,7 @@ static void update_custom_theme(void)
         "filechooser placessidebar, filechooser placessidebar row,"
         "label#sample-details, label#about-description {background-color:%s;color:#e6e6e6;}"
         "entry, spinbutton, spinbutton entry, filechooser entry,"
-        "treeview#playlist-view, treeview#soundfont-view,"
+        "treeview#playlist-view, treeview#soundfont-view, treeview#radio-view,"
         "list#sample-list, list#sample-list row,"
         "textview#module-comments, textview#module-comments text,"
         "filechooser scrolledwindow, filechooser viewport, filechooser .view,"
@@ -5389,9 +5499,10 @@ static void update_custom_theme(void)
         "button, combobox button, spinbutton button, notebook tab {"
         "background-color:%s;color:#e6e6e6;border-color:#555555;}"
         "button:hover, notebook tab:hover, menuitem:hover,"
+        "treeview#radio-view:hover:not(:selected),"
         "filechooser placessidebar row:hover {background-color:%s;}"
         "notebook tab:checked, treeview#playlist-view:selected,"
-        "treeview#soundfont-view:selected, list#sample-list row:selected,"
+        "treeview#soundfont-view:selected, treeview#radio-view:selected, list#sample-list row:selected,"
         "filechooser treeview:selected, filechooser iconview:selected,"
         "menuitem:selected, menuitem:hover {background-color:%s;color:#ffffff;}"
         "notebook tab:checked {border-bottom:2px solid %s;}"
@@ -5573,6 +5684,9 @@ static void apply_style(void)
         "treeview#soundfont-view { background-color: #050d11; color: #dbeff0; }"
         "treeview#soundfont-view:selected { background-color: #16515a; color: #ffffff; }"
         "treeview#soundfont-view row:hover { background-color: #10242d; }"
+        "treeview#radio-view { background-color: #050d11; color: #dbeff0; }"
+        "treeview#radio-view:selected { background-color: #16515a; color: #ffffff; }"
+        "treeview#radio-view:hover:not(:selected) { background-color: #10242d; }"
         "box#samples-page { background-color: #071218; }"
         "scrolledwindow#sample-scroll, scrolledwindow#sample-scroll viewport {"
         " background-color: #050d11; background-image: none; }"
@@ -6922,31 +7036,67 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         GTK_NOTEBOOK(notebook), hvsc_page,
         gtk_label_new("HVSC"));
 
-    /* First live radio preset; the native GTK theme applies automatically. */
-    GtkWidget *radio_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_container_set_border_width(GTK_CONTAINER(radio_page), 16);
+    /* Searchable station directory; use the existing themed GTK widgets. */
+    GtkWidget *radio_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(radio_page), 12);
     GtkWidget *radio_heading = gtk_label_new("Internet Radio");
-    gtk_style_context_add_class(gtk_widget_get_style_context(radio_heading),
-                                "module-title");
+    gtk_style_context_add_class(gtk_widget_get_style_context(radio_heading), "module-title");
     gtk_box_pack_start(GTK_BOX(radio_page), radio_heading, FALSE, FALSE, 0);
-    GtkWidget *station = gtk_label_new("ERICADE Radio — Demoscene / Tracker Music");
-    gtk_label_set_line_wrap(GTK_LABEL(station), TRUE);
-    gtk_box_pack_start(GTK_BOX(radio_page), station, FALSE, FALSE, 0);
+    GtkWidget *radio_search = gtk_search_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(radio_search), "Search stations, genres or formats…");
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_search, FALSE, FALSE, 0);
+    radio_store = gtk_list_store_new(RADIO_COLS, G_TYPE_UINT, G_TYPE_STRING,
+        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    for (guint i = 0; i < G_N_ELEMENTS(radio_stations); ++i) {
+        GtkTreeIter iter;
+        gtk_list_store_append(radio_store, &iter);
+        gtk_list_store_set(radio_store, &iter, RADIO_ID, i,
+            RADIO_NAME, radio_stations[i].name, RADIO_GENRE, radio_stations[i].genre,
+            RADIO_QUALITY, radio_stations[i].quality, RADIO_STATE, "", -1);
+    }
+    radio_filter = GTK_TREE_MODEL_FILTER(gtk_tree_model_filter_new(GTK_TREE_MODEL(radio_store), NULL));
+    gtk_tree_model_filter_set_visible_func(radio_filter, radio_visible, NULL, NULL);
+    radio_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(radio_filter));
+    gtk_widget_set_name(radio_view, "radio-view");
+    const char *radio_columns[] = {"Station", "Genre", "Quality", "Status"};
+    for (guint i = 0; i < G_N_ELEMENTS(radio_columns); ++i) {
+        GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+        g_object_set(renderer, "ellipsize", PANGO_ELLIPSIZE_END, NULL);
+        GtkTreeViewColumn *column = gtk_tree_view_column_new_with_attributes(
+            radio_columns[i], renderer, "text", RADIO_NAME + i, NULL);
+        gtk_tree_view_column_set_resizable(column, TRUE);
+        gtk_tree_view_column_set_min_width(column, 65);
+        gtk_tree_view_column_set_expand(column, i < 2);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(radio_view), column);
+    }
+    GtkWidget *radio_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(radio_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(radio_scroll, -1, 120);
+    gtk_container_add(GTK_CONTAINER(radio_scroll), radio_view);
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_scroll, TRUE, TRUE, 0);
     GtkWidget *radio_buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_widget_set_halign(radio_buttons, GTK_ALIGN_CENTER);
+    radio_play_button = make_button("▶ Play Station", G_CALLBACK(on_radio_play));
+    gtk_box_pack_start(GTK_BOX(radio_buttons), radio_play_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(radio_buttons),
-                       make_button("▶ Play Radio", G_CALLBACK(on_radio_play)), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(radio_buttons),
-                       make_button("■ Stop Radio", G_CALLBACK(on_radio_stop)), FALSE, FALSE, 0);
+        make_button("■ Stop Radio", G_CALLBACK(on_radio_stop)), FALSE, FALSE, 0);
+    radio_website = gtk_link_button_new_with_label(radio_stations[0].website, "Station website");
+    gtk_box_pack_start(GTK_BOX(radio_buttons), radio_website, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(radio_page), radio_buttons, FALSE, FALSE, 0);
     radio_status_label = gtk_label_new("Stopped");
     radio_title_label = gtk_label_new("—");
-    gtk_label_set_line_wrap(GTK_LABEL(radio_title_label), TRUE);
+    gtk_label_set_ellipsize(GTK_LABEL(radio_status_label), PANGO_ELLIPSIZE_END);
+    gtk_label_set_ellipsize(GTK_LABEL(radio_title_label), PANGO_ELLIPSIZE_END);
     gtk_label_set_selectable(GTK_LABEL(radio_title_label), TRUE);
     gtk_box_pack_start(GTK_BOX(radio_page), radio_status_label, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(radio_page), radio_title_label, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(radio_page),
-        gtk_link_button_new_with_label("https://ericade.radio/", "Station website"), FALSE, FALSE, 0);
+    GtkTreeSelection *radio_selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(radio_view));
+    g_signal_connect(radio_selection, "changed", G_CALLBACK(on_radio_selection), NULL);
+    g_signal_connect(radio_view, "row-activated", G_CALLBACK(on_radio_activated), NULL);
+    g_signal_connect(radio_search, "changed", G_CALLBACK(on_radio_search), NULL);
+    GtkTreePath *first_station = gtk_tree_path_new_first();
+    gtk_tree_selection_select_path(radio_selection, first_station);
+    gtk_tree_path_free(first_station);
+    on_radio_selection(radio_selection, NULL);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), radio_page,
         compact_tab_label("Radio", "Live chiptune and tracker music streaming"));
 
