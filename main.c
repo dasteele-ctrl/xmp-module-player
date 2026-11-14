@@ -46,7 +46,8 @@ typedef enum {
     PLAYBACK_SID,
     PLAYBACK_MIDI,
     PLAYBACK_ZX,
-    PLAYBACK_UADE
+    PLAYBACK_UADE,
+    PLAYBACK_RADIO
 } PlaybackMode;
 
 static PlaybackMode playback_mode = PLAYBACK_NONE;
@@ -90,6 +91,8 @@ static GtkWidget *volume_scale;
 static GtkWidget *play_button;
 static XmpTrayIcon *tray_icon;
 static gboolean minimize_to_tray = TRUE;
+static gboolean sidebar_collapsed = FALSE;
+static gboolean modern_window = TRUE;
 static GtkWidget *channels_label;
 static GtkWidget *details_label;
 static GtkWidget *scope_area;
@@ -131,6 +134,13 @@ static unsigned int audio_ring_write_pos;
 static SDL_Thread *decoder_thread;
 static SDL_atomic_t decoder_stop;
 static FfmpegAudio *ffmpeg_audio;
+/* Radio worker owns its FFmpeg context. Shared text is protected by a mutex. */
+static GMutex radio_mutex;
+static char radio_title[1024], radio_error[512];
+static SDL_atomic_t radio_ready;
+static GtkWidget *radio_status_label, *radio_title_label;
+static const char radio_url[] = "https://radio.ericade.net/sc/stream/1/";
+static const char radio_name[] = "ERICADE Radio";
 static SidAudio *sid_audio;
 static UadeAudio *uade_audio;
 static MidiAudio *midi_audio;
@@ -320,6 +330,63 @@ static int decoder_thread_fn(void *unused)
     return 0;
 }
 
+static int radio_interrupt(void *opaque)
+{
+    (void)opaque;
+    return SDL_AtomicGet(&decoder_stop);
+}
+
+static int radio_worker(void *unused)
+{
+    (void)unused;
+    char error[512] = "", title[1024] = "";
+    FfmpegAudio *audio = ffmpeg_audio_open_stream(radio_url,
+        radio_interrupt, NULL, error, sizeof(error));
+    int16_t chunk[4096 * 2];
+    if (audio) {
+        while (!SDL_AtomicGet(&decoder_stop)) {
+            SDL_LockAudioDevice(audio_device);
+            unsigned used = (audio_ring_write_pos + AUDIO_BUFFER_FRAMES -
+                             audio_ring_read_pos) % AUDIO_BUFFER_FRAMES;
+            unsigned room = AUDIO_BUFFER_FRAMES - used - 1;
+            SDL_UnlockAudioDevice(audio_device);
+            if (!room) { SDL_Delay(5); continue; }
+            int got = ffmpeg_audio_read(audio, chunk, MIN(room, 4096u));
+            if (got <= 0) {
+                g_strlcpy(error, got < 0 ? "Radio connection lost" :
+                          "Radio stream ended", sizeof(error));
+                break;
+            }
+            if (SDL_AtomicGet(&decoder_stop)) break;
+            ffmpeg_audio_stream_title(audio, title, sizeof(title));
+            if (title[0]) {
+                g_mutex_lock(&radio_mutex);
+                g_strlcpy(radio_title, title, sizeof(radio_title));
+                g_mutex_unlock(&radio_mutex);
+            }
+            SDL_LockAudioDevice(audio_device);
+            for (int i = 0; i < got; ++i) {
+                unsigned slot = audio_ring_write_pos;
+                audio_ring[slot * 2] = chunk[i * 2];
+                audio_ring[slot * 2 + 1] = chunk[i * 2 + 1];
+                audio_ring_write_pos = (slot + 1) % AUDIO_BUFFER_FRAMES;
+            }
+            SDL_UnlockAudioDevice(audio_device);
+            SDL_AtomicSet(&radio_ready, 1);
+        }
+        ffmpeg_audio_close(audio);
+    }
+    if (!SDL_AtomicGet(&decoder_stop)) {
+        g_mutex_lock(&radio_mutex);
+        g_strlcpy(radio_error, error[0] ? error : "Radio disconnected",
+                  sizeof(radio_error));
+        g_mutex_unlock(&radio_mutex);
+        SDL_AtomicSet(&ffmpeg_decode_error, 1);
+        SDL_AtomicSet(&ffmpeg_decode_finished, 1);
+    }
+    return 0;
+}
+
 static void stop_ffmpeg_decoder(void)
 {
     if (audio_device) close_pattern_preview();
@@ -362,6 +429,11 @@ static void stop_ffmpeg_decoder(void)
     SDL_AtomicSet(&ffmpeg_seek_requested, 0);
     ffmpeg_position_frames = 0;
     ffmpeg_duration_ms = 0;
+    SDL_AtomicSet(&radio_ready, 0);
+    if (radio_status_label) {
+        gtk_label_set_text(GTK_LABEL(radio_status_label), "Stopped");
+        gtk_label_set_text(GTK_LABEL(radio_title_label), "—");
+    }
 }
 
 static void zx_free_conversion(ZxConversion *job)
@@ -541,7 +613,8 @@ static void audio_callback(void *userdata, Uint8 *stream, int len)
             audio_ended = 1;
             playing = 0;
         }
-    } else if (playback_mode == PLAYBACK_FFMPEG ||
+    } else if (playback_mode == PLAYBACK_RADIO ||
+               playback_mode == PLAYBACK_FFMPEG ||
                playback_mode == PLAYBACK_ZX ||
                playback_mode == PLAYBACK_UADE) {
         int16_t *out = (int16_t *)stream;
@@ -626,7 +699,7 @@ static void on_volume_changed(GtkRange *range, gpointer user_data)
 static void update_play_button(void)
 {
     gtk_button_set_label(GTK_BUTTON(play_button),
-                         playing ? "❚❚  Pause" : "▶  Play");
+                         playing ? (playback_mode == PLAYBACK_RADIO ? "■  Stop" : "❚❚  Pause") : "▶  Play");
     if (title_label)
         xmp_tray_icon_update(tray_icon, playing,
                              gtk_label_get_text(GTK_LABEL(title_label)));
@@ -1028,6 +1101,69 @@ static int open_ffmpeg_audio(const char *filename)
 }
 
 static void on_play(GtkButton *button, gpointer data);
+static void on_stop(GtkButton *button, gpointer data);
+
+static void start_radio(void)
+{
+    if (!audio_device || !ctx) return;
+    stop_ffmpeg_decoder();
+    zx_cancel_pending();
+    zx_remove_active();
+    SDL_LockAudioDevice(audio_device);
+    playing = stopped = audio_ended = 0;
+    playback_mode = PLAYBACK_RADIO;
+    if (player_started) { xmp_end_player(ctx); player_started = 0; }
+    if (module_loaded) { xmp_release_module(ctx); module_loaded = 0; }
+    if (sid_audio) { sid_audio_close(sid_audio); sid_audio = NULL; }
+    if (midi_audio) { midi_audio_close(midi_audio); midi_audio = NULL; }
+    xmp_eq_reset_history(&equalizer);
+    SDL_UnlockAudioDevice(audio_device);
+    current_file[0] = '\0';
+    populate_sample_browser();
+    if (scope_area) gtk_widget_set_size_request(scope_area, 620, SCOPE_ROW_HEIGHT);
+    gtk_label_set_text(GTK_LABEL(title_label), radio_name);
+    gtk_label_set_text(GTK_LABEL(format_label), "Live radio (FFmpeg)");
+    gtk_label_set_text(GTK_LABEL(channels_label), "Stereo    44100 Hz");
+    gtk_label_set_text(GTK_LABEL(details_label), radio_url);
+    gtk_label_set_text(GTK_LABEL(time_label), "LIVE");
+    gtk_widget_set_sensitive(seek_scale, FALSE);
+    updating_seek = 1;
+    gtk_range_set_range(GTK_RANGE(seek_scale), 0, 1);
+    gtk_range_set_value(GTK_RANGE(seek_scale), 0);
+    updating_seek = 0;
+    g_mutex_lock(&radio_mutex);
+    radio_title[0] = radio_error[0] = '\0';
+    g_mutex_unlock(&radio_mutex);
+    SDL_AtomicSet(&decoder_stop, 0);
+    decoder_thread = SDL_CreateThread(radio_worker, "radio-decoder", NULL);
+    if (!decoder_thread) {
+        stopped = 1;
+        set_status("Could not start radio decoder");
+        gtk_label_set_text(GTK_LABEL(radio_status_label), "Could not start decoder");
+        update_play_button();
+        return;
+    }
+    SDL_LockAudioDevice(audio_device);
+    playing = 1;
+    SDL_UnlockAudioDevice(audio_device);
+    SDL_PauseAudioDevice(audio_device, 0);
+    gtk_label_set_text(GTK_LABEL(radio_status_label), "Connecting…");
+    set_status("Connecting to ERICADE Radio…");
+    update_play_button();
+}
+
+static void on_radio_play(GtkButton *button, gpointer data)
+{
+    (void)button; (void)data;
+    start_radio();
+}
+
+static void on_radio_stop(GtkButton *button, gpointer data)
+{
+    (void)button; (void)data;
+    if (playback_mode == PLAYBACK_RADIO) on_stop(NULL, NULL);
+}
+
 
 static void zx_apply_labels(void)
 {
@@ -2779,6 +2915,10 @@ static void on_export_wav(GtkButton *button, gpointer data)
         set_status("A WAV export is already running");
         return;
     }
+    if (playback_mode == PLAYBACK_RADIO) {
+        set_status("WAV export is not available for live radio");
+        return;
+    }
     if (playback_mode == PLAYBACK_NONE || !current_file[0]) {
         set_status("Open a music file before exporting it");
         return;
@@ -2960,6 +3100,11 @@ static void on_play(GtkButton *button, gpointer data)
     (void)button;
     (void)data;
 
+    if (playback_mode == PLAYBACK_RADIO) {
+        if (playing) on_stop(NULL, NULL);
+        else start_radio();
+        return;
+    }
     close_pattern_preview();
     SDL_LockAudioDevice(audio_device);
     preview_sample = NULL;
@@ -3100,7 +3245,8 @@ static void on_stop(GtkButton *button, gpointer data)
         SDL_LockAudioDevice(audio_device);
         xmp_stop_module(ctx);
         SDL_UnlockAudioDevice(audio_device);
-    } else if (playback_mode == PLAYBACK_FFMPEG ||
+    } else if (playback_mode == PLAYBACK_RADIO ||
+               playback_mode == PLAYBACK_FFMPEG ||
                playback_mode == PLAYBACK_ZX ||
                playback_mode == PLAYBACK_UADE) {
         stop_ffmpeg_decoder();
@@ -3146,7 +3292,7 @@ static void on_seek(GtkRange *range, gpointer data)
 {
     (void)data;
 
-    if (updating_seek)
+    if (updating_seek || playback_mode == PLAYBACK_RADIO)
         return;
 
     close_pattern_preview();
@@ -3222,8 +3368,18 @@ static gboolean draw_visualizer(GtkWidget *widget, cairo_t *cr,
     GtkAllocation a;
     gtk_widget_get_allocation(widget, &a);
     double w = a.width, h = a.height;
+    if (w < 2 || h < 2) return FALSE;
     double baseline = h - 8.0;
-    double max_height = h - 22.0;
+    double max_height = MAX(1.0, h - 16.0);
+    double radius = MIN(10.0, MIN(w, h) / 2.0);
+    cairo_save(cr);
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, w-radius, radius, radius, -G_PI/2, 0);
+    cairo_arc(cr, w-radius, h-radius, radius, 0, G_PI/2);
+    cairo_arc(cr, radius, h-radius, radius, G_PI/2, G_PI);
+    cairo_arc(cr, radius, radius, radius, G_PI, 3*G_PI/2);
+    cairo_close_path(cr);
+    cairo_clip(cr);
 
     cairo_set_source_rgb(cr, mini_viz_background.red,
                          mini_viz_background.green, mini_viz_background.blue);
@@ -3296,6 +3452,7 @@ static gboolean draw_visualizer(GtkWidget *widget, cairo_t *cr,
     cairo_move_to(cr, 8, baseline);
     cairo_line_to(cr, w - 8, baseline);
     cairo_stroke(cr);
+    cairo_restore(cr);
 
     return FALSE;
 }
@@ -3306,6 +3463,7 @@ static void update_visualizer_spectrum(void)
     if ((playback_mode != PLAYBACK_ZX &&
          playback_mode != PLAYBACK_MODULE &&
          playback_mode != PLAYBACK_FFMPEG &&
+         playback_mode != PLAYBACK_RADIO &&
          playback_mode != PLAYBACK_MIDI &&
          playback_mode != PLAYBACK_SID &&
          playback_mode != PLAYBACK_UADE) ||
@@ -3415,7 +3573,8 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
     cairo_set_source_rgb(cr, 0.028, 0.060, 0.075);
     cairo_paint(cr);
 
-    if (((zx_active_wav && playback_mode == PLAYBACK_FFMPEG) ||
+    if ((playback_mode == PLAYBACK_RADIO ||
+         (zx_active_wav && playback_mode == PLAYBACK_FFMPEG) ||
          playback_mode == PLAYBACK_ZX || playback_mode == PLAYBACK_MIDI ||
          playback_mode == PLAYBACK_UADE) &&
         width >= 80 && height >= 20) {
@@ -3435,6 +3594,8 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
                               ? "MIDI - mixed audio waveform"
                               : playback_mode == PLAYBACK_UADE
                               ? "Amiga (UADE) - mixed audio waveform"
+                              : playback_mode == PLAYBACK_RADIO
+                              ? "Radio - mixed audio waveform"
                               : "ZX Spectrum - mixed audio waveform");
         cairo_set_source_rgb(cr, 0.35, 0.90, 0.65);
         cairo_set_line_width(cr, 1.0);
@@ -4608,7 +4769,28 @@ static gboolean update_display(gpointer data)
     int current;
     int total;
 
-    if (playback_mode == PLAYBACK_FFMPEG ||
+    if (playback_mode == PLAYBACK_RADIO) {
+        SDL_LockAudioDevice(audio_device);
+        ended = audio_ended;
+        is_playing = playing;
+        SDL_UnlockAudioDevice(audio_device);
+        char title[1024], error[512];
+        g_mutex_lock(&radio_mutex);
+        g_strlcpy(title, radio_title, sizeof(title));
+        g_strlcpy(error, radio_error, sizeof(error));
+        g_mutex_unlock(&radio_mutex);
+        if (!stopped) {
+            gchar *valid = g_utf8_make_valid(title[0] ? title : radio_name, -1);
+            gtk_label_set_text(GTK_LABEL(title_label), valid);
+            gtk_label_set_text(GTK_LABEL(radio_title_label), valid);
+            g_free(valid);
+            const char *status = ended ? (error[0] ? error : "Disconnected") :
+                SDL_AtomicGet(&radio_ready) ? "Live radio playing" : "Connecting…";
+            gtk_label_set_text(GTK_LABEL(radio_status_label), status);
+            set_status(status);
+        }
+        update_play_button();
+    } else if (playback_mode == PLAYBACK_FFMPEG ||
         playback_mode == PLAYBACK_ZX ||
         playback_mode == PLAYBACK_UADE) {
         SDL_LockAudioDevice(audio_device);
@@ -4732,7 +4914,7 @@ static gboolean update_display(gpointer data)
             set_status("Playback finished");
     }
 
-    if (ended && !playlist_advance())
+    if (ended && playback_mode != PLAYBACK_RADIO && !playlist_advance())
         update_play_button();
 
     if ((visualizer_area && gtk_widget_get_mapped(visualizer_area)) ||
@@ -5187,6 +5369,7 @@ static void update_custom_theme(void)
     gchar *css = g_strdup_printf(
         "@define-color modulez_tribute_background %s;"
         "@define-color modulez_tribute_accent %s;"
+        "@define-color modulez_shell_panel %s;"
         "window, notebook, notebook stack, window.dialog, window.dialog.background,"
         "window.dialog box, window.dialog grid, window.dialog paned,"
         "window.dialog stack, window.xmp-dialog, .xmp-dialog-surface,"
@@ -5212,6 +5395,44 @@ static void update_custom_theme(void)
         "filechooser treeview:selected, filechooser iconview:selected,"
         "menuitem:selected, menuitem:hover {background-color:%s;color:#ffffff;}"
         "notebook tab:checked {border-bottom:2px solid %s;}"
+        /* Scope client-side decorations to the main player only. GTK still
+         * owns the frame extents, resize handles and titlebar gestures. */
+        "window#modulez-main-window.csd {"
+        "background-color:@modulez_tribute_background;background-image:none;"
+        "border-radius:32px;}"
+        "window#modulez-main-window.csd decoration {"
+        "border-radius:32px;box-shadow:0 6px 18px 2px rgba(0,0,0,0.55); }"
+        "#modulez-window-titlebar {"
+        "background-color:@modulez_tribute_background;background-image:none;"
+        "border-radius:32px 32px 0 0;border:0;box-shadow:none;"
+        "min-height:28px;padding:3px 8px;color:#e6e6e6;}"
+        "#modulez-window-titlebar button.titlebutton {"
+        "background-color:@modulez_shell_panel;background-image:none;"
+        "border-radius:999px;border:0;box-shadow:none;padding:3px;"
+        "min-width:22px;min-height:22px;color:#e6e6e6;}"
+        "#modulez-window-titlebar button.titlebutton:hover {"
+        "background-color:alpha(@modulez_tribute_accent,0.30);}"
+        "#modulez-window-titlebar button.titlebutton.close:hover {"
+        "background-color:#a33e49;}"
+        "window#modulez-main-window.maximized, window#modulez-main-window.fullscreen,"
+        "window#modulez-main-window.tiled,"
+        "window#modulez-main-window.maximized decoration,"
+        "window#modulez-main-window.fullscreen decoration,"
+        "window#modulez-main-window.tiled decoration,"
+        "window#modulez-main-window.maximized #modulez-window-titlebar,"
+        "window#modulez-main-window.fullscreen #modulez-window-titlebar,"
+        "window#modulez-main-window.tiled #modulez-window-titlebar {"
+        "border-radius:0;box-shadow:none;}"
+        "#modulez-header, #modulez-sidebar-panel, #modulez-footer {"
+        "background-color:@modulez_shell_panel;background-image:none;border-radius:12px;}"
+        "#modulez-sidebar-scroll, #modulez-sidebar-scroll viewport, #modulez-sidebar {"
+        "background:transparent;color:#e6e6e6;}"
+        "#modulez-sidebar row {background:transparent;border-radius:8px;margin:1px 3px;}"
+        "#modulez-sidebar row:selected, #modulez-sidebar row:selected:hover {background-color:alpha(@modulez_tribute_accent,0.30);}"
+        "#modulez-sidebar row:selected image, #modulez-sidebar row:selected label {color:@modulez_tribute_accent;}"
+        "#modulez-sidebar row:hover {background-color:alpha(@modulez_tribute_accent,0.15);}"
+        "#modulez-sidebar .dim-label {color:#b0b0b0;font-size:0.85em;}"
+        "#modulez-header button, #modulez-sidebar-panel button {padding:4px 10px;border-radius:10px;}"
         "scale highlight, progressbar progress, switch:checked {background-color:%s;}"
         "scale slider, #eq-sliders scale slider, switch slider {"
         "background-color:%s;border-color:%s;}"
@@ -5241,7 +5462,7 @@ static void update_custom_theme(void)
         "#xmp-irc-root notebook tab:checked {background-color:%s;"
         "color:#ffffff;border-bottom:2px solid %s;}"
         "#xmp-irc-root label {color:#e6e6e6;}"
-        ,base,accent,base,panel,field,panel,hover,selection,accent,accent,
+        ,base,accent,panel,base,panel,field,panel,hover,selection,accent,accent,
         accent,accent,field,accent,
         base,field,panel,hover,panel,panel,selection,accent);
     gtk_css_provider_load_from_data(custom_theme_provider, css, -1, NULL);
@@ -5435,6 +5656,14 @@ static void load_preferences(void)
     if (g_key_file_has_key(settings, "Appearance", "brightness", NULL))
         theme_brightness = CLAMP(g_key_file_get_integer(settings, "Appearance",
                                                       "brightness", NULL), 0, 100);
+    if (g_key_file_has_key(settings, "Window", "sidebar-collapsed", NULL))
+        sidebar_collapsed = g_key_file_get_boolean(settings, "Window", "sidebar-collapsed", NULL);
+    if (g_key_file_has_key(settings, "Window", "modern-window", NULL)) {
+        GError *error = NULL;
+        gboolean value = g_key_file_get_boolean(settings, "Window", "modern-window", &error);
+        if (!error) modern_window = value;
+        g_clear_error(&error);
+    }
     g_key_file_free(settings);
     g_free(path);
 }
@@ -5446,6 +5675,8 @@ static void save_preferences(void)
     GKeyFile *settings = g_key_file_new();
     g_key_file_set_boolean(settings, "Window", "minimize-to-tray",
                            minimize_to_tray);
+    g_key_file_set_boolean(settings, "Window", "sidebar-collapsed", sidebar_collapsed);
+    g_key_file_set_boolean(settings, "Window", "modern-window", modern_window);
     g_key_file_set_integer(settings, "Playback", "repeat-mode", repeat_mode);
     g_key_file_set_integer(settings, "Appearance", "theme-hue", theme_hue);
     g_key_file_set_integer(settings, "Appearance", "accent-hue", accent_hue);
@@ -5796,6 +6027,162 @@ static gboolean about_update_link(GtkLabel *label, const gchar *uri, gpointer da
     return TRUE;
 }
 
+/* Keep the existing notebook pages and use a separate navigation list. */
+typedef struct {
+    GtkNotebook *notebook;
+    GtkListBox *list;
+    GtkWidget *toggle;
+    GtkWidget *labels[20];
+    guint label_count;
+    gboolean syncing;
+} ModulezSidebar;
+
+static void sidebar_apply(ModulezSidebar *nav)
+{
+    for (guint i = 0; i < nav->label_count; ++i)
+        gtk_widget_set_visible(nav->labels[i], !sidebar_collapsed);
+    gtk_button_set_image(GTK_BUTTON(nav->toggle), gtk_image_new_from_icon_name(
+        sidebar_collapsed ? "go-next-symbolic" : "go-previous-symbolic",
+        GTK_ICON_SIZE_BUTTON));
+    gtk_widget_set_tooltip_text(nav->toggle,
+        sidebar_collapsed ? "Expand navigation" : "Collapse navigation");
+}
+
+static void sidebar_toggle(GtkButton *button, gpointer data)
+{
+    (void)button;
+    ModulezSidebar *nav = data;
+    sidebar_collapsed = !sidebar_collapsed;
+    sidebar_apply(nav);
+    save_preferences();
+}
+
+static void sidebar_selected(GtkListBox *list, GtkListBoxRow *row, gpointer data)
+{
+    (void)list;
+    ModulezSidebar *nav = data;
+    if (!row || nav->syncing) return;
+    int page = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "page-index")) - 1;
+    if (page >= 0) gtk_notebook_set_current_page(nav->notebook, page);
+}
+
+static void sidebar_page_changed(GtkNotebook *notebook, GtkWidget *page,
+                                 guint index, gpointer data)
+{
+    (void)notebook; (void)page;
+    ModulezSidebar *nav = data;
+    GList *rows = gtk_container_get_children(GTK_CONTAINER(nav->list));
+    nav->syncing = TRUE;
+    for (GList *it = rows; it; it = it->next) {
+        if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(it->data), "page-index")) == (int)index + 1) {
+            gtk_list_box_select_row(nav->list, GTK_LIST_BOX_ROW(it->data));
+            break;
+        }
+    }
+    nav->syncing = FALSE;
+    g_list_free(rows);
+}
+
+static ModulezSidebar *sidebar_create(GtkWidget *container, GtkNotebook *notebook)
+{
+    static const struct { const char *label, *icon; int page; } entries[] = {
+        {"PLAYER", NULL, -1},
+        {"Player", "audio-x-generic-symbolic", 0},
+        {"Samples", "media-record-symbolic", 1},
+        {"Patterns", "view-grid-symbolic", 2},
+        {"DISCOVER", NULL, -1},
+        {"Radio", "network-wireless-symbolic", 6},
+        {"HVSC", "folder-music-symbolic", 5},
+        {"IRC", "mail-message-new-symbolic", 7},
+        {"TOOLS", NULL, -1},
+        {"SoundFonts", "audio-x-generic-symbolic", 3},
+        {"Equalizer", "preferences-system-symbolic", 4},
+        {"Visualizer", "video-display-symbolic", 8},
+        {"SYSTEM", NULL, -1},
+        {"Preferences", "emblem-system-symbolic", 9},
+        {"About", "help-about-symbolic", 10}
+    };
+    ModulezSidebar *nav = g_new0(ModulezSidebar, 1);
+    nav->notebook = notebook;
+    GtkWidget *panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_name(panel, "modulez-sidebar-panel");
+    gtk_container_set_border_width(GTK_CONTAINER(panel), 4);
+    gtk_box_pack_start(GTK_BOX(container), panel, FALSE, FALSE, 0);
+    g_object_set_data_full(G_OBJECT(panel), "modulez-navigation", nav, g_free);
+    nav->toggle = gtk_button_new();
+    gtk_box_pack_start(GTK_BOX(panel), nav->toggle, FALSE, FALSE, 0);
+    g_signal_connect(nav->toggle, "clicked", G_CALLBACK(sidebar_toggle), nav);
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_name(scroll, "modulez-sidebar-scroll");
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(scroll), FALSE);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroll), 0);
+    gtk_box_pack_start(GTK_BOX(panel), scroll, TRUE, TRUE, 0);
+    nav->list = GTK_LIST_BOX(gtk_list_box_new());
+    gtk_widget_set_name(GTK_WIDGET(nav->list), "modulez-sidebar");
+    gtk_list_box_set_selection_mode(nav->list, GTK_SELECTION_SINGLE);
+    gtk_container_add(GTK_CONTAINER(scroll), GTK_WIDGET(nav->list));
+    for (guint i = 0; i < G_N_ELEMENTS(entries); ++i) {
+        GtkWidget *row = gtk_list_box_row_new();
+        GtkWidget *line = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        gtk_container_set_border_width(GTK_CONTAINER(line), 4);
+        gtk_container_add(GTK_CONTAINER(row), line);
+        GtkWidget *label = gtk_label_new(entries[i].label);
+        gtk_label_set_xalign(GTK_LABEL(label), 0);
+        if (entries[i].page < 0) {
+            gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(row), FALSE);
+            gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
+            gtk_style_context_add_class(gtk_widget_get_style_context(label), "dim-label");
+            /* Hide the entire section heading when collapsed. */
+            nav->labels[nav->label_count++] = row;
+            gtk_widget_set_no_show_all(row, TRUE);
+        } else {
+            GtkWidget *image = gtk_image_new_from_icon_name(entries[i].icon, GTK_ICON_SIZE_MENU);
+            gtk_box_pack_start(GTK_BOX(line), image, FALSE, FALSE, 0);
+            g_object_set_data(G_OBJECT(row), "page-index", GINT_TO_POINTER(entries[i].page + 1));
+            gtk_widget_set_tooltip_text(row, entries[i].label);
+            nav->labels[nav->label_count++] = label;
+            gtk_widget_set_no_show_all(label, TRUE);
+        }
+        gtk_box_pack_start(GTK_BOX(line), label, FALSE, FALSE, 0);
+        gtk_container_add(GTK_CONTAINER(nav->list), row);
+        gtk_widget_show_all(line);
+        gtk_widget_show(label);
+    }
+    g_signal_connect(nav->list, "row-selected", G_CALLBACK(sidebar_selected), nav);
+    g_signal_connect(notebook, "switch-page", G_CALLBACK(sidebar_page_changed), nav);
+    return nav;
+}
+
+/* Install the titlebar before the toplevel is realized. Do not implement
+ * custom dragging/resizing: GtkHeaderBar and GtkWindow already handle both. */
+static void install_window_decorations(void)
+{
+    GdkScreen *screen = gtk_widget_get_screen(window);
+    /* Non-composited X11 cannot display transparent rounded corners reliably.
+     * Keep a native window frame in that case, without changing the saved choice. */
+    if (!modern_window || !screen || !gdk_screen_is_composited(screen) ||
+        !gdk_screen_get_rgba_visual(screen))
+        return;
+
+    GtkWidget *bar = gtk_header_bar_new();
+    gtk_widget_set_name(window, "modulez-main-window");
+    gtk_widget_set_name(bar, "modulez-window-titlebar");
+    gtk_header_bar_set_title(GTK_HEADER_BAR(bar), "Modulez Player " MODULEZ_VERSION);
+    gtk_header_bar_set_has_subtitle(GTK_HEADER_BAR(bar), FALSE);
+    gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(bar), TRUE);
+    gtk_header_bar_set_decoration_layout(GTK_HEADER_BAR(bar), ":minimize,maximize,close");
+    gtk_window_set_titlebar(GTK_WINDOW(window), bar);
+}
+
+static void on_modern_window_changed(GtkToggleButton *button, gpointer data)
+{
+    (void)data;
+    modern_window = gtk_toggle_button_get_active(button);
+    save_preferences();
+    set_status("Window style saved. Quit and reopen Modulez Player to apply.");
+}
+
 static int create_player(void)
 {
     /* Request a dark GTK fallback for controls the application does not
@@ -5854,12 +6241,13 @@ static int create_player(void)
     g_signal_connect(window, "key-press-event",
                      G_CALLBACK(on_visualizer_shortcut), NULL);
     gtk_window_set_title(GTK_WINDOW(window), "Modulez Player " MODULEZ_VERSION);
+    install_window_decorations();
 
     /* Size the initial window to the monitor's usable area. GTK will not
      * honor a smaller default size if notebook pages request more space, so
      * the tall pages also use shorter minimum widgets on compact displays. */
     gint initial_width = 900;
-    gint initial_height = 850;
+    gint initial_height = 720;
     gboolean compact_ui = FALSE;
     GdkDisplay *display = gdk_display_get_default();
     GdkMonitor *monitor = display ? gdk_display_get_primary_monitor(display) : NULL;
@@ -5900,35 +6288,48 @@ static int create_player(void)
 
     GtkWidget *notebook = gtk_notebook_new();
     gtk_notebook_set_scrollable(GTK_NOTEBOOK(notebook), TRUE);
-    gtk_container_add(GTK_CONTAINER(window), notebook);
+    gtk_notebook_set_show_tabs(GTK_NOTEBOOK(notebook), FALSE);
+    gtk_notebook_set_show_border(GTK_NOTEBOOK(notebook), FALSE);
+    GtkWidget *shell = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(shell), compact_ui ? 8 : 12);
+    gtk_container_add(GTK_CONTAINER(window), shell);
+    GtkWidget *header = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_name(header, "modulez-header");
+    gtk_container_set_border_width(GTK_CONTAINER(header), 6);
+    gtk_box_pack_start(GTK_BOX(shell), header, FALSE, FALSE, 0);
+    GtkWidget *body = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(shell), body, TRUE, TRUE, 0);
 
     GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, compact_ui ? 8 : 12);
-    gtk_container_set_border_width(GTK_CONTAINER(outer), compact_ui ? 12 : 20);
+    gtk_container_set_border_width(GTK_CONTAINER(outer), compact_ui ? 4 : 8);
 
     GtkWidget *player_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, compact_ui ? 8 : 12);
     gtk_container_set_border_width(GTK_CONTAINER(player_page), compact_ui ? 4 : 8);
     gtk_box_pack_start(GTK_BOX(player_page), outer, TRUE, TRUE, 0);
 
     GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-    gtk_box_pack_start(GTK_BOX(outer), top, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(header), top, FALSE, FALSE, 0);
 
-    GdkPixbuf *small_cover = (app_icon && compact_ui)
-        ? gdk_pixbuf_scale_simple(app_icon, 80, 80, GDK_INTERP_BILINEAR)
+    GdkPixbuf *small_cover = app_icon
+        ? gdk_pixbuf_scale_simple(app_icon, compact_ui ? 48 : 60,
+                                  compact_ui ? 48 : 60, GDK_INTERP_BILINEAR)
         : NULL;
     GtkWidget *cover = app_icon
         ? gtk_image_new_from_pixbuf(small_cover ? small_cover : app_icon)
         : gtk_image_new();
     if (small_cover)
         g_object_unref(small_cover);
-    gtk_widget_set_size_request(cover, compact_ui ? 80 : 100,
-                               compact_ui ? 80 : 100);
+    gtk_widget_set_size_request(cover, compact_ui ? 48 : 60,
+                               compact_ui ? 48 : 60);
     gtk_box_pack_start(GTK_BOX(top), cover, FALSE, FALSE, 0);
 
-    GtkWidget *info = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *info = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     gtk_box_pack_start(GTK_BOX(top), info, TRUE, TRUE, 0);
 
     title_label = gtk_label_new("No module loaded");
     gtk_label_set_xalign(GTK_LABEL(title_label), 0);
+    gtk_label_set_ellipsize(GTK_LABEL(title_label), PANGO_ELLIPSIZE_END);
+    gtk_label_set_max_width_chars(GTK_LABEL(title_label), 32);
     gtk_widget_set_name(title_label, "module-title");
     gtk_style_context_add_class(gtk_widget_get_style_context(title_label),
                                 "module-title");
@@ -5936,23 +6337,24 @@ static int create_player(void)
 
     format_label = gtk_label_new("Open a music file to begin");
     gtk_label_set_xalign(GTK_LABEL(format_label), 0);
+    gtk_label_set_ellipsize(GTK_LABEL(format_label), PANGO_ELLIPSIZE_END);
     gtk_box_pack_start(GTK_BOX(info), format_label, FALSE, FALSE, 0);
 
     channels_label = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(channels_label), 0);
+    gtk_label_set_ellipsize(GTK_LABEL(channels_label), PANGO_ELLIPSIZE_END);
     gtk_box_pack_start(GTK_BOX(info), channels_label, FALSE, FALSE, 0);
 
-    /* Mirrored FFT spectrum in the open space at the top right. */
+    /* Full-width spectrum below the compact now-playing row. */
     visualizer_area = gtk_drawing_area_new();
-    gtk_widget_set_size_request(visualizer_area, compact_ui ? 280 : 320,
-                               compact_ui ? 80 : 100);
+    gtk_widget_set_size_request(visualizer_area, -1, compact_ui ? 52 : 64);
     gtk_widget_set_hexpand(visualizer_area, TRUE);
     g_signal_connect(visualizer_area, "draw",
                      G_CALLBACK(draw_visualizer), NULL);
-    gtk_box_pack_start(GTK_BOX(top), visualizer_area, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(header), visualizer_area, FALSE, TRUE, 0);
 
     GtkWidget *file_controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_pack_start(GTK_BOX(outer), file_controls, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(header), file_controls, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(file_controls),
         make_button("Open File", G_CALLBACK(on_open)), FALSE, FALSE, 0);
@@ -5978,7 +6380,7 @@ static int create_player(void)
 
     GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_set_homogeneous(GTK_BOX(controls), TRUE);
-    gtk_box_pack_start(GTK_BOX(outer), controls, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(header), controls, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(controls),
         make_button("|◀", G_CALLBACK(on_previous)), TRUE, TRUE, 0);
 
@@ -5991,7 +6393,7 @@ static int create_player(void)
     gtk_box_pack_start(GTK_BOX(controls),
         make_button("▶|", G_CALLBACK(on_next)), TRUE, TRUE, 0);
 
-    gtk_box_pack_start(GTK_BOX(outer),
+    gtk_box_pack_start(GTK_BOX(header),
         gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
 
     /* Keep the search and toggle reachable when the track list is collapsed. */
@@ -6024,10 +6426,12 @@ static int create_player(void)
     gtk_box_pack_start(GTK_BOX(playlist_controls),
         make_button("Save M3U", G_CALLBACK(on_playlist_save_m3u)),
         FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(playlist_controls),
+    GtkWidget *playlist_actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_box_pack_start(GTK_BOX(outer), playlist_actions, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(playlist_actions),
         make_button("Remove", G_CALLBACK(on_playlist_remove)),
         FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(playlist_controls),
+    gtk_box_pack_start(GTK_BOX(playlist_actions),
         make_button("Clear", G_CALLBACK(on_playlist_clear)),
         FALSE, FALSE, 0);
 
@@ -6041,7 +6445,7 @@ static int create_player(void)
     g_object_unref(playlist_filter); /* The view now owns the model. */
 
     GtkWidget *search_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_box_pack_start(GTK_BOX(outer), search_row, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(playlist_actions), search_row, TRUE, TRUE, 0);
     GtkWidget *search_entry = gtk_search_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry), "Search playlist…");
     gtk_box_pack_start(GTK_BOX(search_row), search_entry, TRUE, TRUE, 0);
@@ -6125,8 +6529,10 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     g_object_bind_property(show_patterns, "active", lower_box, "visible", G_BINDING_SYNC_CREATE);
     gtk_paned_set_position(GTK_PANED(content_pane), compact_ui ? 150 : 230);
 
-    GtkWidget *player_footer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    gtk_box_pack_start(GTK_BOX(outer), player_footer, FALSE, FALSE, 0);
+    GtkWidget *player_footer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_name(player_footer, "modulez-footer");
+    gtk_container_set_border_width(GTK_CONTAINER(player_footer), 4);
+    gtk_box_pack_start(GTK_BOX(shell), player_footer, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(player_footer), seek_scale, FALSE, FALSE, 0);
 
     time_label = gtk_label_new("00:00 / 00:00");
@@ -6143,6 +6549,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     status_label = gtk_label_new("Ready");
     gtk_label_set_xalign(GTK_LABEL(status_label), 0);
+    gtk_label_set_ellipsize(GTK_LABEL(status_label), PANGO_ELLIPSIZE_END);
     gtk_box_pack_start(GTK_BOX(player_footer), status_label, FALSE, FALSE, 0);
 
     gtk_notebook_append_page(
@@ -6515,6 +6922,34 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         GTK_NOTEBOOK(notebook), hvsc_page,
         gtk_label_new("HVSC"));
 
+    /* First live radio preset; the native GTK theme applies automatically. */
+    GtkWidget *radio_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_container_set_border_width(GTK_CONTAINER(radio_page), 16);
+    GtkWidget *radio_heading = gtk_label_new("Internet Radio");
+    gtk_style_context_add_class(gtk_widget_get_style_context(radio_heading),
+                                "module-title");
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_heading, FALSE, FALSE, 0);
+    GtkWidget *station = gtk_label_new("ERICADE Radio — Demoscene / Tracker Music");
+    gtk_label_set_line_wrap(GTK_LABEL(station), TRUE);
+    gtk_box_pack_start(GTK_BOX(radio_page), station, FALSE, FALSE, 0);
+    GtkWidget *radio_buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(radio_buttons, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(radio_buttons),
+                       make_button("▶ Play Radio", G_CALLBACK(on_radio_play)), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(radio_buttons),
+                       make_button("■ Stop Radio", G_CALLBACK(on_radio_stop)), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_buttons, FALSE, FALSE, 0);
+    radio_status_label = gtk_label_new("Stopped");
+    radio_title_label = gtk_label_new("—");
+    gtk_label_set_line_wrap(GTK_LABEL(radio_title_label), TRUE);
+    gtk_label_set_selectable(GTK_LABEL(radio_title_label), TRUE);
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_status_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_title_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(radio_page),
+        gtk_link_button_new_with_label("https://ericade.radio/", "Station website"), FALSE, FALSE, 0);
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), radio_page,
+        compact_tab_label("Radio", "Live chiptune and tracker music streaming"));
+
     /* Classic IRC chat, using the same GTK notebook and dark theme. */
     xmp_irc_add_notebook_page(GTK_NOTEBOOK(notebook));
 
@@ -6556,6 +6991,20 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_widget_set_size_request(tray_hint, 300, -1);
     gtk_box_pack_start(GTK_BOX(preferences_page), tray_hint,
                        FALSE, FALSE, 0);
+
+    GtkWidget *modern_check = gtk_check_button_new_with_label(
+        "Use modern rounded window (requires restart)");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(modern_check), modern_window);
+    g_signal_connect(modern_check, "toggled",
+                     G_CALLBACK(on_modern_window_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(preferences_page), modern_check, FALSE, FALSE, 0);
+    GtkWidget *modern_hint = gtk_label_new(
+        "Uncheck for the native desktop frame. Quit from the tray if necessary, "
+        "then reopen the player. The native frame is also used when desktop "
+        "compositing is unavailable.");
+    gtk_label_set_line_wrap(GTK_LABEL(modern_hint), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(modern_hint), 0);
+    gtk_box_pack_start(GTK_BOX(preferences_page), modern_hint, FALSE, FALSE, 0);
 
     GtkWidget *appearance_heading = gtk_label_new("Colors & Appearance");
     gtk_widget_set_halign(appearance_heading, GTK_ALIGN_START);
@@ -6705,8 +7154,22 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
 
     g_timeout_add(33, update_display, NULL);
 
+    ModulezSidebar *nav = sidebar_create(body, GTK_NOTEBOOK(notebook));
+    /* Contain the largest notebook page's size request within the body.
+     * Header and footer stay outside this scrollable area. */
+    GtkWidget *page_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(page_scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(page_scroll), FALSE);
+    gtk_scrolled_window_set_propagate_natural_width(GTK_SCROLLED_WINDOW(page_scroll), FALSE);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(page_scroll), 0);
+    gtk_scrolled_window_set_min_content_width(GTK_SCROLLED_WINDOW(page_scroll), 0);
+    gtk_container_add(GTK_CONTAINER(page_scroll), notebook);
+    gtk_box_pack_start(GTK_BOX(body), page_scroll, TRUE, TRUE, 0);
     gtk_widget_show_all(window);
+    sidebar_apply(nav);
     gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), 0);
+    sidebar_page_changed(GTK_NOTEBOOK(notebook), player_page, 0, nav);
     return 0;
 }
 
