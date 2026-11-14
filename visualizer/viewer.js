@@ -28,19 +28,19 @@ const N=2048,ring=new Float32Array(N),re=new Float64Array(N),im=new Float64Array
 const fft=new Uint8Array(N/2),wave=new Uint8Array(N),smoothed=new Float64Array(N/2);let write=0;
 function add(v){ring[write]=v;write=(write+1)%N;}
 function setToolbarTheme(colors){
- const paint=(element,properties)=>{
-  if(!element)return;
-  for(const [name,value] of Object.entries(properties))
-   element.style.setProperty(name,value,'important');
- };
- const header=document.querySelector('header');
- paint(header,{'background-color':colors.panel,'border-color':colors.selection,'color':'#e6e6e6'});
- for(const el of header.querySelectorAll('button,select,option,optgroup'))
-  paint(el,{'background-color':colors.panel,'border-color':colors.selection,'color':'#e6e6e6'});
- paint(header.querySelector('strong'),{'color':colors.accent});
- for(const el of header.querySelectorAll('.preset-links a'))
-  paint(el,{'color':colors.accent});
- paint(document.getElementById('presetMenu'),{'background-color':colors.panel,'border-color':colors.selection});
+ // Derive distinct control surfaces from the GTK theme, instead of painting
+ // every control the same color as the panel. CSS owns interaction states.
+ const root=document.documentElement.style;
+ const panel=colors.panel, accent=colors.accent, selection=colors.selection;
+ // Resolve any valid CSS color to RGB using a tiny offscreen canvas.
+ const sample=document.createElement('canvas');sample.width=sample.height=1;
+ const brush=sample.getContext('2d');
+ const rgb=color=>{brush.clearRect(0,0,1,1);brush.fillStyle='#000';brush.fillStyle=color;brush.fillRect(0,0,1,1);return Array.from(brush.getImageData(0,0,1,1).data).slice(0,3);};
+ const base=rgb(panel), light=(base[0]*.299+base[1]*.587+base[2]*.114)>150;
+ const edge=light?0:255;
+ const mix=amount=>`rgb(${base.map(v=>Math.round(v+(edge-v)*amount)).join(',')})`;
+ const values={panel,accent,selection,control:mix(.12),hover:mix(.22),border:mix(.38),text:light?'#171717':'#f2f2f2'};
+ for(const [name,value] of Object.entries(values))root.setProperty('--toolbar-'+name,value);
 }
 window.modulezBridge={setVisible(value){visible=!!value;if(!visible){ring.fill(0);window.modulezProjectM?.clearAudio();}},
  setToolbarTheme,

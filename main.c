@@ -6514,6 +6514,16 @@ static void sidebar_selected(GtkListBox *list, GtkListBoxRow *row, gpointer data
     if (page >= 0) gtk_notebook_set_current_page(nav->notebook, page);
 }
 
+/* The live canvas must use the viewport, not the notebook's tallest page. */
+static void visualizer_page_switch(GtkNotebook *notebook, GtkWidget *page,
+                                  guint index, gpointer data)
+{
+    (void)notebook; (void)index;
+    GtkStack *stack = GTK_STACK(data);
+    GtkWidget *placeholder = g_object_get_data(G_OBJECT(stack), "vis-placeholder");
+    gtk_stack_set_visible_child_name(stack, page == placeholder ? "visualizer" : "pages");
+}
+
 static void sidebar_page_changed(GtkNotebook *notebook, GtkWidget *page,
                                  guint index, gpointer data)
 {
@@ -7453,8 +7463,10 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     xmp_irc_add_notebook_page(GTK_NOTEBOOK(notebook));
 
     modulez_visualizer_set_track_navigation(playlist_skip_track);
+    GtkWidget *vis_page = modulez_visualizer_page_new();
+    GtkWidget *vis_placeholder = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook),
-        modulez_visualizer_page_new(),
+        vis_placeholder,
         compact_tab_label("Vis", "Wavescope visualization and projectM / MilkDrop"));
 
     /* General preferences. A missing preferences file defaults to hiding
@@ -7664,7 +7676,13 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(page_scroll), 0);
     gtk_scrolled_window_set_min_content_width(GTK_SCROLLED_WINDOW(page_scroll), 0);
     gtk_container_add(GTK_CONTAINER(page_scroll), notebook);
-    gtk_box_pack_start(GTK_BOX(body), page_scroll, TRUE, TRUE, 0);
+    GtkWidget *page_stack = gtk_stack_new();
+    gtk_stack_set_homogeneous(GTK_STACK(page_stack), FALSE);
+    gtk_stack_add_named(GTK_STACK(page_stack), page_scroll, "pages");
+    gtk_stack_add_named(GTK_STACK(page_stack), vis_page, "visualizer");
+    g_object_set_data(G_OBJECT(page_stack), "vis-placeholder", vis_placeholder);
+    g_signal_connect(notebook, "switch-page", G_CALLBACK(visualizer_page_switch), page_stack);
+    gtk_box_pack_start(GTK_BOX(body), page_stack, TRUE, TRUE, 0);
     gtk_widget_show_all(window);
     sidebar_apply(nav);
     gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), 0);
