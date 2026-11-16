@@ -174,6 +174,69 @@ See [all releases](../../releases) for earlier versions.
    ./Modulez-Player-v1.8.0-x86_64.AppImage
    ```
 
+### Running on Windows with WSL
+
+The Linux AppImage has been successfully tested using WSL with Ubuntu 24.04.
+No compiling is needed. This remains experimental; audio and visualizer
+behavior may vary between computers.
+
+Requires an Intel/AMD 64-bit PC with Windows 11 or Windows 10 build 19044
+or newer, using WSL 2 with WSLg.
+
+**1. Install Ubuntu**
+
+Open **PowerShell as Administrator** and run:
+
+```powershell
+wsl --install -d Ubuntu-24.04
+```
+
+Restart if requested. Open **Ubuntu 24.04** from the Start menu and create
+your Linux username and password.
+
+**2. Download Modulez Player**
+
+Download the **AppImage** from the
+[releases page](https://github.com/dasteele-ctrl/xmp-module-player/releases/latest).
+
+**3. Copy it into Ubuntu**
+
+In the Ubuntu terminal, run:
+
+```bash
+mkdir -p ~/Modulez
+cd ~/Modulez
+explorer.exe .
+```
+
+Copy the downloaded AppImage into the folder that opens.
+Keep only one Modulez Player AppImage in this folder.
+
+**4. Run the player**
+
+In the Ubuntu terminal, run:
+
+```bash
+cd ~/Modulez
+chmod +x Modulez-Player-*.AppImage
+SDL_AUDIODRIVER=pulseaudio PULSE_LATENCY_MSEC=200 ./Modulez-Player-*.AppImage --appimage-extract-and-run
+```
+
+The extraction option avoids needing FUSE.
+
+**To launch it again**, open Ubuntu and run:
+
+```bash
+cd ~/Modulez
+SDL_AUDIODRIVER=pulseaudio PULSE_LATENCY_MSEC=200 ./Modulez-Player-*.AppImage --appimage-extract-and-run
+```
+
+**Windows music files:** In the player's file picker, browse to
+`/mnt/c/Users/`, then your Windows username and music folder.
+
+See [Microsoft's WSL GUI guide](https://learn.microsoft.com/en-us/windows/wsl/tutorials/gui-apps)
+for WSL requirements and troubleshooting.
+
 ### Add the player to your application menu
 
 For a menu entry with the player icon, use **AppImageLauncher**, an
