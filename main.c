@@ -6188,7 +6188,7 @@ static void update_custom_theme(void)
         /* GTK still owns the main frame extents, resize handles and titlebar gestures. */
         "window#modulez-main-window.csd {"
         "background-color:@modulez_tribute_background;background-image:none;"
-        "border-radius:32px;}"
+        "border-radius:0 0 32px 32px;}"
         "window#modulez-main-window.csd decoration {"
         "border-radius:32px;box-shadow:0 6px 18px 2px rgba(0,0,0,0.55); }"
         "#modulez-window-titlebar {"
