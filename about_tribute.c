@@ -264,8 +264,14 @@ static void open_tribute(GtkWidget *target, Trigger *trigger)
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     gtk_box_pack_start(GTK_BOX(content), demo->area, TRUE, TRUE, 0);
     demo->pause = gtk_button_new_with_label(demo->paused ? "Play animation" : "Pause animation");
-    gtk_widget_set_halign(demo->pause, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(content), demo->pause, FALSE, FALSE, 6);
+    GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(content), controls, FALSE, FALSE, 6);
+    gtk_box_pack_start(GTK_BOX(controls), demo->pause, FALSE, FALSE, 0);
+    GtkWidget *archive = gtk_link_button_new_with_label(
+        "https://web.archive.org/web/20120312114623/http://metamacro.com/modulez/sections/music.php",
+        "Visit Modulez in 2012");
+    gtk_widget_set_tooltip_text(archive, "Open the archived music page in your default browser");
+    gtk_box_pack_start(GTK_BOX(controls), archive, FALSE, FALSE, 0);
     g_signal_connect(demo->area, "style-updated", G_CALLBACK(style_updated), NULL);
     g_signal_connect(demo->area, "draw", G_CALLBACK(draw_tribute), demo);
     g_signal_connect(demo->area, "map", G_CALLBACK(on_map), demo);

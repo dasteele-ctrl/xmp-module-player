@@ -1,6 +1,6 @@
 # Modulez Player
 
-**Formerly XMP Module Player.** Modulez Player **1.8.0 — The Streaming Update** introduces live internet radio, worldwide station discovery, persistent favorites and custom stations, automatic reconnection, and a modernized interface.
+**Formerly XMP Module Player.** Modulez Player **1.8.1** adds a music archive browser. Browse Modland, The Mod Archive, AMP, or a site of your own. Click a track download to play it, or drag its link onto the player to queue it.
 The built-in AppImage updater, introduced in 1.7.4, lets you update
 without interrupting playback.
 
@@ -17,6 +17,8 @@ Modulez Player brings classic tracker music and regular audio playback to the Li
 ![Modulez Player 1.8.0 playing Josss - Robotto on Nectarine in the Radio tab](modulez-player-1.8.0.png)
 
 ## Features
+
+See the [1.8.1 release notes](RELEASE_NOTES_1.8.1.md) for details about Browse Music.
 
 - **Live internet radio** — ten curated retro/demoscene stations, worldwide Radio Browser search, favorites and custom streams
 - **Automatic radio reconnection** — increasing retry delays and automatic playback recovery
@@ -165,13 +167,13 @@ See [all releases](../../releases) for earlier versions.
 
 ### Running the AppImage
 
-1. Download the versioned `Modulez-Player-v1.8.0-x86_64.AppImage` file from Release v1.8.0.
+1. Download the versioned `Modulez-Player-v1.8.1-x86_64.AppImage` file from Release v1.8.1.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x Modulez-Player-v1.8.0-x86_64.AppImage
-   ./Modulez-Player-v1.8.0-x86_64.AppImage
+   chmod +x Modulez-Player-v1.8.1-x86_64.AppImage
+   ./Modulez-Player-v1.8.1-x86_64.AppImage
    ```
 
 ### Running on Windows with WSL
@@ -403,7 +405,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.8.0**
+**Current source version: 1.8.1**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and

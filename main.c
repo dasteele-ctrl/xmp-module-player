@@ -1,6 +1,7 @@
 #include "player_config.h"
 #include "about_tribute.h"
 #include <gtk/gtk.h>
+#include <webkit2/webkit2.h>
 #include <gio/gio.h>
 #include <libsoup/soup.h>
 #include <json-glib/json-glib.h>
@@ -8,6 +9,7 @@
 #include <SDL.h>
 #include <xmp.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -31,7 +33,7 @@ static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event, gp
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.8.0"
+#define MODULEZ_VERSION "1.8.1"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
@@ -1383,7 +1385,7 @@ static void world_search_worker(GTask *task, gpointer source, gpointer data,
     g_resolver_free_targets(targets);
     if (!hosts->len) g_ptr_array_add(hosts, g_strdup("de1.api.radio-browser.info"));
     SoupSession *session = soup_session_new_with_options("timeout", 12u,
-        "user-agent", "ModulezPlayer/1.8.0", NULL);
+        "user-agent", "ModulezPlayer/" MODULEZ_VERSION, NULL);
     guint first = g_random_int_range(0, hosts->len);
     for (guint i = 0; i < hosts->len && !g_cancellable_is_cancelled(cancel); ++i) {
         const gchar *host = g_ptr_array_index(hosts, (first + i) % hosts->len);
@@ -3206,6 +3208,11 @@ static void open_playlist_file(const char *filename);
 
 typedef struct {
     gchar *url;
+    gboolean enqueue;
+    gchar *browser_dir;
+    gchar *browser_file;
+    gchar *browser_name;
+    GError *browser_error;
     GtkWidget *dialog;
     GCancellable *cancel;
 } UrlDownload;
@@ -3215,18 +3222,30 @@ static gboolean playlist_is_audio_filename(const gchar *filename);
 static void url_download_free(gpointer data)
 {
     UrlDownload *job = data;
+    if (job->browser_file) g_unlink(job->browser_file);
+    if (job->browser_dir) g_rmdir(job->browser_dir);
+    g_free(job->browser_dir);
+    g_free(job->browser_file);
+    g_free(job->browser_name);
+    g_clear_error(&job->browser_error);
     g_free(job->url);
     g_object_unref(job->cancel);
     g_free(job);
 }
 
-static gchar *url_audio_name(const gchar *candidate)
+static gchar *url_audio_name(const gchar *candidate, gboolean require_extension)
 {
     if (!candidate || !*candidate || !g_utf8_validate(candidate, -1, NULL))
         return NULL;
     gchar *name = g_path_get_basename(candidate);
+    /* AMP supplies tunes such as MOD.Title.gz and XM.Title.gz. */
+    gsize len = strlen(name);
+    if (len > 3 && !g_ascii_strcasecmp(name + len - 3, ".gz"))
+        name[len - 3] = '\0';
     if (strlen(name) > 240 || name[0] == '.' ||
-        strpbrk(name, "\\\r\n\t") || !playlist_is_audio_filename(name)) {
+        strpbrk(name, "\\\r\n\t") || (require_extension && !playlist_is_audio_filename(name) &&
+         g_ascii_strncasecmp(name, "XM.", 3) && g_ascii_strncasecmp(name, "S3M.", 4) &&
+         g_ascii_strncasecmp(name, "IT.", 3))) {
         g_free(name);
         return NULL;
     }
@@ -3241,7 +3260,7 @@ static gchar *url_audio_name(const gchar *candidate)
 
 /* URI paths may be encoded by libsoup. Decode only the final segment,
  * rejecting escaped path separators and embedded NULs. */
-static gchar *url_audio_uri_name(GUri *uri, gboolean fragment)
+static gchar *url_audio_uri_name(GUri *uri, gboolean fragment, gboolean require_extension)
 {
     const gchar *value = fragment ? g_uri_get_fragment(uri) : g_uri_get_path(uri);
     if (!value || !*value) return NULL;
@@ -3251,9 +3270,18 @@ static gchar *url_audio_uri_name(GUri *uri, gboolean fragment)
     gboolean encoded = (flags & G_URI_FLAGS_ENCODED) ||
         (flags & (fragment ? G_URI_FLAGS_ENCODED_FRAGMENT : G_URI_FLAGS_ENCODED_PATH));
     gchar *decoded = encoded ? g_uri_unescape_string(base, "/\\") : g_strdup(base);
-    gchar *name = decoded ? url_audio_name(decoded) : NULL;
+    gchar *name = decoded ? url_audio_name(decoded, require_extension) : NULL;
     g_free(decoded);
     return name;
+}
+
+static gboolean modland_file_uri(GUri *uri)
+{
+    if (!uri) return FALSE;
+    const gchar *host = g_uri_get_host(uri);
+    const gchar *path = g_uri_get_path(uri);
+    return host && !g_ascii_strcasecmp(host, "ftp.modland.com") &&
+           path && g_str_has_prefix(path, "/pub/modules/") && !g_str_has_suffix(path, "/");
 }
 
 static void url_download_worker(GTask *task, gpointer source,
@@ -3262,8 +3290,8 @@ static void url_download_worker(GTask *task, gpointer source,
     (void)source;
     UrlDownload *job = task_data;
     GError *error = NULL;
-    SoupSession *session = soup_session_new_with_options("timeout", 30u, NULL);
-    SoupMessage *message = soup_message_new("GET", job->url);
+    SoupSession *session = NULL;
+    SoupMessage *message = NULL;
     GInputStream *input = NULL;
     GFileOutputStream *output = NULL;
     GFile *file = NULL;
@@ -3273,46 +3301,78 @@ static void url_download_worker(GTask *task, gpointer source,
     gboolean success = FALSE;
     gsize total = 0;
 
-    if (!message) {
-        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
-                            "Invalid HTTP or HTTPS URL.");
-        goto done;
+    gboolean probe_module = FALSE;
+    if (job->browser_file) {
+        g_autoptr(GFile) staged = g_file_new_for_path(job->browser_file);
+        input = G_INPUT_STREAM(g_file_read(staged, cancel, &error));
+        if (!input) goto done;
+        name = url_audio_name(job->browser_name, TRUE);
+        if (!name) {
+            name = url_audio_name(job->browser_name, FALSE);
+            probe_module = TRUE;
+        }
+    } else {
+        session = soup_session_new_with_options("timeout", 30u, NULL);
+        message = soup_message_new("GET", job->url);
+        if (!message) {
+            g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                                "Invalid HTTP or HTTPS URL.");
+            goto done;
+        }
+        original = g_uri_parse(job->url, G_URI_FLAGS_ENCODED_PATH |
+                               G_URI_FLAGS_ENCODED_FRAGMENT, &error);
+        if (!original) goto done;
+        input = soup_session_send(session, message, cancel, &error);
+        if (!input) goto done;
+        guint status = soup_message_get_status(message);
+        if (status < 200 || status >= 300) {
+            g_set_error(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                        "Server returned HTTP %u.", status);
+            goto done;
+        }
+        SoupMessageHeaders *headers = soup_message_get_response_headers(message);
+        const gchar *type = soup_message_headers_get_content_type(headers, NULL);
+        if (type && (g_ascii_strcasecmp(type, "text/html") == 0 ||
+                     g_ascii_strcasecmp(type, "application/xhtml+xml") == 0)) {
+            g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                                "This URL returned a web page. Copy the actual download link.");
+            goto done;
+        }
+        if (soup_message_headers_get_content_length(headers) > URL_DOWNLOAD_LIMIT) {
+            g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                                "Download exceeds the 64 MiB limit.");
+            goto done;
+        }
+        /* Prefer the explicit URL filename when present; Content-Disposition
+         * remains a fallback for opaque download endpoints. */
+        name = url_audio_uri_name(original, TRUE, TRUE);
+        if (!name) name = url_audio_uri_name(soup_message_get_uri(message), FALSE, TRUE);
+        if (!name) name = url_audio_uri_name(original, FALSE, TRUE);
+        if (!name && soup_message_headers_get_content_disposition(headers, NULL, &params) && params)
+            name = url_audio_name(g_hash_table_lookup(params, "filename"), TRUE);
+        if (!name && modland_file_uri(original)) {
+            name = url_audio_uri_name(original, FALSE, FALSE);
+            probe_module = TRUE;
+        }
     }
-    original = g_uri_parse(job->url, G_URI_FLAGS_ENCODED_PATH |
-                           G_URI_FLAGS_ENCODED_FRAGMENT, &error);
-    if (!original) goto done;
-    input = soup_session_send(session, message, cancel, &error);
-    if (!input) goto done;
-    guint status = soup_message_get_status(message);
-    if (status < 200 || status >= 300) {
-        g_set_error(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                    "Server returned HTTP %u.", status);
-        goto done;
-    }
-    SoupMessageHeaders *headers = soup_message_get_response_headers(message);
-    const gchar *type = soup_message_headers_get_content_type(headers, NULL);
-    if (type && (g_ascii_strcasecmp(type, "text/html") == 0 ||
-                 g_ascii_strcasecmp(type, "application/xhtml+xml") == 0)) {
-        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                            "This URL returned a web page. Copy the actual download link.");
-        goto done;
-    }
-    if (soup_message_headers_get_content_length(headers) > URL_DOWNLOAD_LIMIT) {
-        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                            "Download exceeds the 64 MiB limit.");
-        goto done;
-    }
-    /* Prefer the explicit URL filename when present; Content-Disposition
-     * remains a fallback for opaque download endpoints. */
-    name = url_audio_uri_name(original, TRUE);
-    if (!name) name = url_audio_uri_name(soup_message_get_uri(message), FALSE);
-    if (!name) name = url_audio_uri_name(original, FALSE);
-    if (!name && soup_message_headers_get_content_disposition(headers, NULL, &params) && params)
-        name = url_audio_name(g_hash_table_lookup(params, "filename"));
     if (!name) {
         g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                             "No supported audio filename was found in the download link or response.");
         goto done;
+    }
+    GInputStream *buffered = g_buffered_input_stream_new(input);
+    g_object_unref(input);
+    input = buffered;
+    if (g_buffered_input_stream_fill(G_BUFFERED_INPUT_STREAM(input), 2, cancel, &error) < 0)
+        goto done;
+    gsize available;
+    const guint8 *bytes = g_buffered_input_stream_peek_buffer(G_BUFFERED_INPUT_STREAM(input),
+                                                              &available);
+    if (available >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b) {
+        GZlibDecompressor *gzip = g_zlib_decompressor_new(G_ZLIB_COMPRESSOR_FORMAT_GZIP);
+        input = g_converter_input_stream_new(buffered, G_CONVERTER(gzip));
+        g_object_unref(gzip);
+        g_object_unref(buffered);
     }
     root = g_build_filename(g_get_user_data_dir(), "modulez-player", "downloads", NULL);
     if (g_mkdir_with_parents(root, 0700) != 0) {
@@ -3352,6 +3412,11 @@ static void url_download_worker(GTask *task, gpointer source,
     }
     if (!g_output_stream_close(G_OUTPUT_STREAM(output), cancel, &error)) goto done;
     if (g_cancellable_set_error_if_cancelled(cancel, &error)) goto done;
+    if (probe_module && xmp_test_module(path, NULL) != 0) {
+        g_set_error(&error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                    "Downloaded %s, but the tracker decoder did not recognize its format.", name);
+        goto done;
+    }
     success = TRUE;
 
 done:
@@ -3367,7 +3432,7 @@ done:
     g_clear_pointer(&params, g_hash_table_unref);
     g_clear_pointer(&original, g_uri_unref);
     g_clear_object(&message);
-    g_object_unref(session);
+    g_clear_object(&session);
     if (!success) {
         if (path) g_unlink(path);
         if (directory) g_rmdir(directory);
@@ -3398,6 +3463,15 @@ static void url_download_response(GtkDialog *dialog, gint response, gpointer dat
     gtk_dialog_set_response_sensitive(dialog, GTK_RESPONSE_CANCEL, FALSE);
 }
 
+static void append_playlist_path(const gchar *path)
+{
+    gchar *base = g_path_get_basename(path);
+    GtkTreeIter iter;
+    gtk_list_store_insert_with_values(playlist_store, &iter, -1,
+                                      0, base, 1, path, -1);
+    g_free(base);
+}
+
 static void url_download_complete(GObject *source, GAsyncResult *result, gpointer data)
 {
     (void)source;
@@ -3413,7 +3487,12 @@ static void url_download_complete(GObject *source, GAsyncResult *result, gpointe
         gtk_widget_destroy(job->dialog);
         job->dialog = NULL;
         if (path && !cancelled) {
-            open_playlist_file(path);
+            if (job->enqueue) {
+                append_playlist_path(path);
+                set_status("Track added to playlist");
+            } else {
+                open_playlist_file(path);
+            }
         } else if (!cancelled && error) {
             GtkWidget *message = gtk_message_dialog_new(GTK_WINDOW(window),
                 GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
@@ -3427,13 +3506,64 @@ static void url_download_complete(GObject *source, GAsyncResult *result, gpointe
     g_clear_error(&error);
 }
 
+static GTask *new_download_task(gchar *url, gboolean enqueue)
+{
+    UrlDownload *job = g_new0(UrlDownload, 1);
+    job->url = url;
+    job->enqueue = enqueue;
+    job->cancel = g_cancellable_new();
+    job->dialog = gtk_dialog_new_with_buttons("Downloading audio", GTK_WINDOW(window),
+        GTK_DIALOG_DESTROY_WITH_PARENT | (enqueue ? 0 : GTK_DIALOG_MODAL),
+        "_Cancel", GTK_RESPONSE_CANCEL, NULL);
+    theme_dialog(job->dialog);
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(job->dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 16);
+    GtkWidget *spinner = gtk_spinner_new();
+    gtk_spinner_start(GTK_SPINNER(spinner));
+    gtk_box_pack_start(GTK_BOX(content), spinner, FALSE, FALSE, 8);
+    gtk_box_pack_start(GTK_BOX(content), gtk_label_new("Downloading audio file…"), FALSE, FALSE, 8);
+    g_signal_connect(job->dialog, "response", G_CALLBACK(url_download_response), job);
+    g_signal_connect(job->dialog, "destroy", G_CALLBACK(url_download_dialog_destroy), job);
+    gtk_widget_show_all(job->dialog);
+    GTask *task = g_task_new(NULL, job->cancel, url_download_complete, NULL);
+    g_task_set_task_data(task, job, url_download_free);
+    /* Worker handles cancellation explicitly, including partial-file cleanup. */
+    g_task_set_check_cancellable(task, FALSE);
+    return task;
+}
+
+static gboolean start_url_download(gchar *url, gboolean enqueue)
+{
+    g_strstrip(url);
+    GUri *uri = g_uri_parse(url, G_URI_FLAGS_NONE, NULL);
+    if (!uri || !g_uri_get_scheme(uri) || !g_uri_get_host(uri) || !*g_uri_get_host(uri) ||
+        g_uri_get_userinfo(uri) ||
+        (g_ascii_strcasecmp(g_uri_get_scheme(uri), "https") &&
+         g_ascii_strcasecmp(g_uri_get_scheme(uri), "http"))) {
+        if (uri) g_uri_unref(uri);
+        g_free(url);
+        GtkWidget *message = gtk_message_dialog_new(GTK_WINDOW(window),
+            GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+            "Enter a valid HTTP or HTTPS download URL without credentials.");
+        theme_dialog(message);
+        gtk_dialog_run(GTK_DIALOG(message));
+        gtk_widget_destroy(message);
+        return FALSE;
+    }
+    g_uri_unref(uri);
+    GTask *task = new_download_task(url, enqueue);
+    g_task_run_in_thread(task, url_download_worker);
+    g_object_unref(task);
+    return TRUE;
+}
+
 static void on_open_url(GtkButton *button, gpointer data)
 {
     (void)button;
-    (void)data;
-    GtkWidget *dialog = gtk_dialog_new_with_buttons("Open URL", GTK_WINDOW(window),
+    gboolean enqueue = GPOINTER_TO_INT(data);
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(enqueue ? "Add URL to playlist" : "Open URL", GTK_WINDOW(window),
         GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-        "_Cancel", GTK_RESPONSE_CANCEL, "_Open", GTK_RESPONSE_ACCEPT, NULL);
+        "_Cancel", GTK_RESPONSE_CANCEL, enqueue ? "_Add" : "_Open", GTK_RESPONSE_ACCEPT, NULL);
     theme_dialog(dialog);
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     gtk_container_set_border_width(GTK_CONTAINER(content), 12);
@@ -3450,45 +3580,7 @@ static void on_open_url(GtkButton *button, gpointer data)
         url = g_strdup(gtk_entry_get_text(GTK_ENTRY(entry)));
     gtk_widget_destroy(dialog);
     if (!url) return;
-    g_strstrip(url);
-    GUri *uri = g_uri_parse(url, G_URI_FLAGS_NONE, NULL);
-    if (!uri || !g_uri_get_scheme(uri) || !g_uri_get_host(uri) || !*g_uri_get_host(uri) ||
-        g_uri_get_userinfo(uri) ||
-        (g_ascii_strcasecmp(g_uri_get_scheme(uri), "https") &&
-         g_ascii_strcasecmp(g_uri_get_scheme(uri), "http"))) {
-        if (uri) g_uri_unref(uri);
-        g_free(url);
-        GtkWidget *message = gtk_message_dialog_new(GTK_WINDOW(window),
-            GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
-            "Enter a valid HTTP or HTTPS download URL without credentials.");
-        theme_dialog(message);
-        gtk_dialog_run(GTK_DIALOG(message));
-        gtk_widget_destroy(message);
-        return;
-    }
-    g_uri_unref(uri);
-    UrlDownload *job = g_new0(UrlDownload, 1);
-    job->url = url;
-    job->cancel = g_cancellable_new();
-    job->dialog = gtk_dialog_new_with_buttons("Downloading audio", GTK_WINDOW(window),
-        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-        "_Cancel", GTK_RESPONSE_CANCEL, NULL);
-    theme_dialog(job->dialog);
-    content = gtk_dialog_get_content_area(GTK_DIALOG(job->dialog));
-    gtk_container_set_border_width(GTK_CONTAINER(content), 16);
-    GtkWidget *spinner = gtk_spinner_new();
-    gtk_spinner_start(GTK_SPINNER(spinner));
-    gtk_box_pack_start(GTK_BOX(content), spinner, FALSE, FALSE, 8);
-    gtk_box_pack_start(GTK_BOX(content), gtk_label_new("Downloading audio file…"), FALSE, FALSE, 8);
-    g_signal_connect(job->dialog, "response", G_CALLBACK(url_download_response), job);
-    g_signal_connect(job->dialog, "destroy", G_CALLBACK(url_download_dialog_destroy), job);
-    gtk_widget_show_all(job->dialog);
-    GTask *task = g_task_new(NULL, job->cancel, url_download_complete, NULL);
-    g_task_set_task_data(task, job, url_download_free);
-    /* Worker handles cancellation explicitly, including partial-file cleanup. */
-    g_task_set_check_cancellable(task, FALSE);
-    g_task_run_in_thread(task, url_download_worker);
-    g_object_unref(task);
+    start_url_download(url, enqueue);
 }
 
 static void on_open(GtkButton *button, gpointer data)
@@ -4540,49 +4632,70 @@ static void on_file_drop(GtkWidget *widget,
                          guint info, guint time,
                          gpointer data)
 {
-    (void)widget;
     (void)x;
     (void)y;
     (void)info;
     (void)data;
 
+    if (gtk_selection_data_get_target(selection_data) !=
+        gdk_atom_intern_static_string("text/uri-list")) return;
+    g_signal_stop_emission_by_name(widget, "drag-data-received");
     gboolean success = FALSE;
     gchar **uris = gtk_selection_data_get_uris(selection_data);
-
-    if (uris) {
-        GPtrArray *files = g_ptr_array_new_with_free_func(g_free);
-
-        for (gint i = 0; uris[i] != NULL; i++) {
-            gchar *filename = g_filename_from_uri(uris[i], NULL, NULL);
-            if (filename)
-                g_ptr_array_add(files, filename);
+    for (guint i = 0; uris && uris[i]; ++i) {
+        const gchar *scheme = g_uri_peek_scheme(uris[i]);
+        if (scheme && (!g_ascii_strcasecmp(scheme, "https") ||
+                       !g_ascii_strcasecmp(scheme, "http"))) {
+            if (start_url_download(g_strdup(uris[i]), TRUE))
+                success = TRUE;
+            continue;
         }
-
-        if (files->len == 1) {
-            const gchar *filename = g_ptr_array_index(files, 0);
-            play_playlist_file(filename);
-            success = TRUE;
-        } else if (files->len > 1) {
-            for (guint i = 0; i < files->len; i++) {
-                const gchar *filename = g_ptr_array_index(files, i);
-                gchar *base = g_path_get_basename(filename);
-                GtkTreeIter iter;
-
-                gtk_list_store_append(playlist_store, &iter);
-                gtk_list_store_set(playlist_store, &iter,
-                                   0, base, 1, filename, -1);
-                g_free(base);
-            }
-
-            set_status("Files added to playlist");
-            success = TRUE;
-        }
-
-        g_ptr_array_free(files, TRUE);
-        g_strfreev(uris);
+        gchar *path = g_filename_from_uri(uris[i], NULL, NULL);
+        if (!path) continue;
+        append_playlist_path(path);
+        set_status("Files added to playlist");
+        g_free(path);
+        success = TRUE;
     }
-
+    g_strfreev(uris);
     gtk_drag_finish(context, success, FALSE, time);
+}
+
+static void enable_playlist_drops(GtkWidget *target)
+{
+    GtkTargetEntry drop_targets[] = {
+        { "text/uri-list", 0, 0 }
+    };
+    gtk_drag_dest_set(target, GTK_DEST_DEFAULT_ALL,
+                      drop_targets, G_N_ELEMENTS(drop_targets),
+                      GDK_ACTION_COPY);
+    g_signal_connect(target, "drag-data-received",
+                     G_CALLBACK(on_file_drop), NULL);
+}
+
+/* Web views consume drops internally. Let the window receive those drops.
+ * For text widgets, prefer URI lists while retaining ordinary text targets. */
+static void route_child_drops(GtkWidget *child, gpointer data)
+{
+    (void)data;
+    if (WEBKIT_IS_WEB_VIEW(child)) {
+        gtk_drag_dest_unset(child);
+        return;
+    }
+    GtkTargetList *existing = gtk_drag_dest_get_target_list(child);
+    if (existing) {
+        GtkTargetEntry uri = { "text/uri-list", 0, 0 };
+        GtkTargetList *targets = gtk_target_list_new(&uri, 1);
+        gint count = 0;
+        GtkTargetEntry *entries = gtk_target_table_new_from_list(existing, &count);
+        gtk_target_list_add_table(targets, entries, count);
+        gtk_target_table_free(entries, count);
+        gtk_drag_dest_set_target_list(child, targets);
+        gtk_target_list_unref(targets);
+        g_signal_connect(child, "drag-data-received", G_CALLBACK(on_file_drop), NULL);
+    }
+    if (GTK_IS_CONTAINER(child))
+        gtk_container_foreach(GTK_CONTAINER(child), route_child_drops, NULL);
 }
 
 static void play_playlist_file(const char *filename)
@@ -4826,7 +4939,7 @@ static void on_playlist_add(GtkButton *button, gpointer data)
 static gboolean playlist_is_audio_filename(const gchar *filename)
 {
     static const gchar *extensions[] = {
-        ".mod", ".xm", ".it", ".mid", ".midi", ".kar",
+        ".mod", ".musx", ".xm", ".it", ".mid", ".midi", ".kar",
         ".s3m", ".mptm", ".mtm", ".669", ".amf", ".med",
         ".okt", ".ult", ".sid", ".rsid", ".psid", ".mp3", ".wav", ".m4a",
         ".aac", ".ogg", ".oga", ".opus", ".flac", ".webm",
@@ -6823,6 +6936,390 @@ static gboolean about_update_link(GtkLabel *label, const gchar *uri, gpointer da
     return TRUE;
 }
 
+static GUri *archive_site_uri(const gchar *text)
+{
+    if (!text || strpbrk(text, " \t\r\n")) return NULL;
+    GUri *uri = g_uri_parse(text, G_URI_FLAGS_NONE, NULL);
+    if (uri) {
+        const gchar *scheme = g_uri_get_scheme(uri);
+        const gchar *host = g_uri_get_host(uri);
+        if (scheme && host && *host && !g_uri_get_userinfo(uri) &&
+            (!g_ascii_strcasecmp(scheme, "https") || !g_ascii_strcasecmp(scheme, "http")))
+            return uri;
+        g_uri_unref(uri);
+    }
+    return NULL;
+}
+
+static GKeyFile *read_archive_sites(const gchar *path, GError **error)
+{
+    GKeyFile *sites = g_key_file_new();
+    g_autoptr(GError) failure = NULL;
+    if (!g_key_file_load_from_file(sites, path, G_KEY_FILE_NONE, &failure) &&
+        !g_error_matches(failure, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
+        g_propagate_error(error, g_steal_pointer(&failure));
+        g_key_file_unref(sites);
+        return NULL;
+    }
+    return sites;
+}
+
+static void load_archive_sites(GtkComboBoxText *picker)
+{
+    g_autofree gchar *path = player_config_path("archive-sites.ini");
+    g_autoptr(GKeyFile) sites = read_archive_sites(path, NULL);
+    if (!sites) return;
+    g_auto(GStrv) groups = g_key_file_get_groups(sites, NULL);
+    for (guint i = 0; groups[i]; i++) {
+        g_autofree gchar *url = g_key_file_get_string(sites, groups[i], "url", NULL);
+        g_autofree gchar *name = g_key_file_get_string(sites, groups[i], "name", NULL);
+        g_autoptr(GUri) uri = archive_site_uri(url);
+        if (uri)
+            gtk_combo_box_text_append(picker, url, name && *name ? name : g_uri_get_host(uri));
+    }
+}
+
+static gboolean save_archive_site(const gchar *name, const gchar *url, GError **error)
+{
+    g_autofree gchar *path = player_config_path("archive-sites.ini");
+    g_autoptr(GKeyFile) sites = read_archive_sites(path, error);
+    if (!sites) return FALSE;
+    g_autofree gchar *group = g_uuid_string_random();
+    g_key_file_set_string(sites, group, "name", name);
+    g_key_file_set_string(sites, group, "url", url);
+    g_autofree gchar *dir = g_path_get_dirname(path);
+    if (g_mkdir_with_parents(dir, 0700) != 0) {
+        g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errno),
+                    "Could not create the settings folder: %s", g_strerror(errno));
+        return FALSE;
+    }
+    return g_key_file_save_to_file(sites, path, error);
+}
+
+static void add_archive_site(GtkButton *button, gpointer data)
+{
+    (void)button;
+    GtkComboBoxText *picker = GTK_COMBO_BOX_TEXT(data);
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Add music site", GTK_WINDOW(window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Add site", GTK_RESPONSE_ACCEPT, NULL);
+    theme_dialog(dialog);
+    GtkWidget *box = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(box), 12);
+    gtk_box_set_spacing(GTK_BOX(box), 6);
+    GtkWidget *address = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(address), "https://example.org/music/");
+    gtk_entry_set_width_chars(GTK_ENTRY(address), 40);
+    GtkWidget *label = gtk_label_new_with_mnemonic("Site _address");
+    gtk_label_set_mnemonic_widget(GTK_LABEL(label), address);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), address, FALSE, FALSE, 0);
+    GtkWidget *name = gtk_entry_new();
+    label = gtk_label_new_with_mnemonic("Display _name (optional)");
+    gtk_label_set_mnemonic_widget(GTK_LABEL(label), name);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), name, FALSE, FALSE, 0);
+    GtkWidget *message = gtk_label_new(NULL);
+    gtk_label_set_line_wrap(GTK_LABEL(message), TRUE);
+    gtk_box_pack_start(GTK_BOX(box), message, FALSE, FALSE, 0);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT);
+    gtk_entry_set_activates_default(GTK_ENTRY(address), TRUE);
+    gtk_entry_set_activates_default(GTK_ENTRY(name), TRUE);
+    gtk_widget_show_all(dialog);
+    gtk_widget_grab_focus(address);
+    while (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        g_autofree gchar *url = g_strdup(gtk_entry_get_text(GTK_ENTRY(address)));
+        g_strstrip(url);
+        g_autoptr(GUri) uri = archive_site_uri(url);
+        if (!uri) {
+            gtk_label_set_text(GTK_LABEL(message), "Enter an HTTP or HTTPS site address without credentials.");
+            continue;
+        }
+        if (gtk_combo_box_set_active_id(GTK_COMBO_BOX(picker), url)) break;
+        g_autofree gchar *title = g_strdup(gtk_entry_get_text(GTK_ENTRY(name)));
+        g_strstrip(title);
+        const gchar *display = *title ? title : g_uri_get_host(uri);
+        g_autoptr(GError) error = NULL;
+        if (!save_archive_site(display, url, &error)) {
+            gtk_label_set_text(GTK_LABEL(message), error->message);
+            continue;
+        }
+        gtk_combo_box_text_append(picker, url, display);
+        gtk_combo_box_set_active_id(GTK_COMBO_BOX(picker), url);
+        break;
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void archive_selected(GtkComboBox *picker, gpointer data)
+{
+    const gchar *url = gtk_combo_box_get_active_id(picker);
+    if (!url) return;
+    if (!g_str_equal(url, "modland")) {
+        webkit_web_view_load_uri(WEBKIT_WEB_VIEW(data), url);
+        return;
+    }
+
+    static const gchar formats[] =
+        "<!doctype html><html lang='en'><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Modland</title><style>"
+        ":root{color-scheme:dark;background:#242424;color:#e6e6e6;font:1rem sans-serif}"
+        "body{max-width:38rem;margin:2rem auto;padding:0 1rem}"
+        "h1{font-size:1.5rem} ul{list-style:none;padding:0}"
+        "li a{display:block;background:#303030;padding:.7rem 1rem;margin:.4rem 0;border-radius:.4rem}"
+        "a{color:#91cfff}a:focus-visible{outline:2px solid currentColor}"
+        "small{display:block;margin-top:.5rem;color:#ccc}</style>"
+        "<main><h1>Modland</h1><p>Browse music by tracker format.</p><ul>"
+        "<li><a href='Protracker/'>ProTracker (MOD)</a></li>"
+        "<li><a href='Fasttracker%202/'>FastTracker 2 (XM)</a></li>"
+        "<li><a href='Screamtracker%203/'>Scream Tracker 3 (S3M)</a></li>"
+        "<li><a href='Impulsetracker/'>Impulse Tracker (IT)</a></li></ul>"
+        "<a href='./'>Browse all formats</a>"
+        "<small>The full archive includes formats Modulez Player may be unable to play.</small></main></html>";
+    webkit_web_view_load_html(WEBKIT_WEB_VIEW(data), formats,
+                              "https://ftp.modland.com/pub/modules/modulez-formats.html");
+}
+
+static gboolean archive_track_link(GUri *uri)
+{
+    if (!uri) return FALSE;
+    const gchar *scheme = g_uri_get_scheme(uri);
+    const gchar *host = g_uri_get_host(uri);
+    if (!host || !scheme || (g_ascii_strcasecmp(scheme, "https") &&
+                             g_ascii_strcasecmp(scheme, "http"))) return FALSE;
+    const gchar *path = g_uri_get_path(uri);
+    if (!g_ascii_strcasecmp(host, "amp.dascene.net")) return FALSE;
+    if (modland_file_uri(uri) ||
+        (!g_ascii_strcasecmp(host, "api.modarchive.org") && g_strcmp0(path, "/downloads.php") == 0))
+        return TRUE;
+    g_autofree gchar *track = url_audio_uri_name(uri, FALSE, TRUE);
+    return track != NULL;
+}
+
+/* Preserve the browser's original response, including its suggested filename. */
+static gboolean browser_destination(WebKitDownload *download, const gchar *suggested,
+                                    gpointer data)
+{
+    UrlDownload *job = g_task_get_task_data(G_TASK(data));
+    WebKitURIResponse *response = webkit_download_get_response(download);
+    guint status = webkit_uri_response_get_status_code(response);
+    if (status >= 400) {
+        g_set_error(&job->browser_error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                    "Server returned HTTP %u.", status);
+    } else if (webkit_uri_response_get_content_length(response) > URL_DOWNLOAD_LIMIT) {
+        g_set_error_literal(&job->browser_error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                            "Download exceeds the 64 MiB limit.");
+    } else {
+        job->browser_dir = g_dir_make_tmp("modulez-download-XXXXXX", &job->browser_error);
+    }
+    if (job->browser_dir) {
+        job->browser_name = g_strdup(suggested);
+        job->browser_file = g_build_filename(job->browser_dir, "track", NULL);
+        g_autofree gchar *uri = g_filename_to_uri(job->browser_file, NULL, &job->browser_error);
+        if (uri) {
+            webkit_download_set_destination(download, uri);
+            return TRUE;
+        }
+    }
+    webkit_download_cancel(download);
+    return TRUE;
+}
+
+static void browser_received(WebKitDownload *download, guint64 length, gpointer data)
+{
+    (void)length;
+    UrlDownload *job = g_task_get_task_data(G_TASK(data));
+    if (!job->browser_error && webkit_download_get_received_data_length(download) > URL_DOWNLOAD_LIMIT) {
+        g_set_error_literal(&job->browser_error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                            "Download exceeds the 64 MiB limit.");
+        webkit_download_cancel(download);
+    }
+}
+
+static void browser_failed(WebKitDownload *download, GError *error, gpointer data)
+{
+    (void)download;
+    UrlDownload *job = g_task_get_task_data(G_TASK(data));
+    if (!job->browser_error) job->browser_error = g_error_copy(error);
+}
+
+static void browser_finished(WebKitDownload *download, gpointer data)
+{
+    GTask *task = G_TASK(data);
+    UrlDownload *job = g_task_get_task_data(task);
+    g_signal_handlers_disconnect_by_data(job->cancel, download);
+    if (job->browser_error)
+        g_task_return_error(task, g_steal_pointer(&job->browser_error));
+    else if (!job->browser_file)
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED, "No file was downloaded.");
+    else
+        g_task_run_in_thread(task, url_download_worker);
+}
+
+static void archive_download_started(WebKitWebContext *context, WebKitDownload *download,
+                                     gpointer data)
+{
+    (void)context;
+    (void)data;
+    const gchar *uri = webkit_uri_request_get_uri(webkit_download_get_request(download));
+    GTask *task = new_download_task(g_strdup(uri), FALSE);
+    UrlDownload *job = g_task_get_task_data(task);
+    g_object_set_data_full(G_OBJECT(download), "track-task", task, g_object_unref);
+    g_signal_connect_swapped(job->cancel, "cancelled", G_CALLBACK(webkit_download_cancel), download);
+    g_signal_connect(download, "decide-destination", G_CALLBACK(browser_destination), task);
+    g_signal_connect(download, "received-data", G_CALLBACK(browser_received), task);
+    g_signal_connect(download, "failed", G_CALLBACK(browser_failed), task);
+    g_signal_connect(download, "finished", G_CALLBACK(browser_finished), task);
+}
+
+static gboolean archive_navigation(WebKitWebView *web, WebKitPolicyDecision *decision,
+                                   WebKitPolicyDecisionType type, gpointer data)
+{
+    (void)web;
+    (void)data;
+    if (type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE) {
+        WebKitResponsePolicyDecision *policy = WEBKIT_RESPONSE_POLICY_DECISION(decision);
+        if (!webkit_response_policy_decision_is_main_frame_main_resource(policy)) return FALSE;
+        WebKitURIResponse *response = webkit_response_policy_decision_get_response(policy);
+        g_autoptr(GUri) target = g_uri_parse(webkit_uri_response_get_uri(response),
+                                            G_URI_FLAGS_ENCODED, NULL);
+        const gchar *host = target ? g_uri_get_host(target) : NULL;
+        const gchar *path = target ? g_uri_get_path(target) : NULL;
+        const gchar *mime = webkit_uri_response_get_mime_type(response);
+        guint status = webkit_uri_response_get_status_code(response);
+        if (host && !g_ascii_strcasecmp(host, "amp.dascene.net") && path &&
+            status >= 200 && status < 300 && mime &&
+            (!g_ascii_strcasecmp(mime, "application/octet-stream") ||
+             g_str_has_prefix(mime, "audio/") || g_str_has_suffix(mime, "gzip")) &&
+            (g_str_has_prefix(path, "/module/") || g_str_has_prefix(path, "/modules/") ||
+             !strcmp(path, "/downmod.php"))) {
+            webkit_policy_decision_download(decision);
+            return TRUE;
+        }
+        return FALSE;
+    }
+    WebKitNavigationAction *action = webkit_navigation_policy_decision_get_navigation_action(
+        WEBKIT_NAVIGATION_POLICY_DECISION(decision));
+    const gchar *uri = webkit_uri_request_get_uri(webkit_navigation_action_get_request(action));
+    const gchar *scheme = g_uri_peek_scheme(uri);
+    if (webkit_navigation_action_get_navigation_type(action) == WEBKIT_NAVIGATION_TYPE_LINK_CLICKED &&
+        webkit_navigation_action_is_user_gesture(action)) {
+        g_autoptr(GUri) target = g_uri_parse(uri, G_URI_FLAGS_ENCODED, NULL);
+        if (archive_track_link(target)) {
+            webkit_policy_decision_ignore(decision);
+            start_url_download(g_strdup(uri), FALSE);
+            return TRUE;
+        }
+    }
+    if (scheme && (!g_ascii_strcasecmp(scheme, "http") || !g_ascii_strcasecmp(scheme, "https")))
+        return FALSE;
+    webkit_policy_decision_ignore(decision);
+    return TRUE;
+}
+
+static void build_archive_browser(GtkWidget *page, gpointer data)
+{
+    (void)data;
+    g_signal_handlers_disconnect_by_func(page, build_archive_browser, NULL);
+    WebKitWebContext *context = webkit_web_context_new_ephemeral();
+    g_signal_connect(context, "download-started", G_CALLBACK(archive_download_started), NULL);
+    GtkWidget *web = webkit_web_view_new_with_context(context);
+    g_object_unref(context);
+    /* Paint the empty view before starting the first navigation. */
+    GdkRGBA background;
+    gdk_rgba_parse(&background, "#242424");
+    webkit_web_view_set_background_color(WEBKIT_WEB_VIEW(web), &background);
+    const gchar *modland_pages[] = { "https://ftp.modland.com/*", NULL };
+    WebKitUserStyleSheet *sheet = webkit_user_style_sheet_new(
+        ":root { color-scheme:dark !important; }"
+        "html,body { background:#242424 !important; color:#e6e6e6 !important; }"
+        "pre,table,thead,tbody,tr,th,td { background:transparent !important; color:inherit !important; }"
+        "#list,th { border-color:#484848 !important; }"
+        "#list th { background:#303030 !important; }"
+        "#list tr:nth-child(even) { background:#292929 !important; }"
+        "a:link { color:#91cfff !important; }"
+        "a:visited { color:#c5b1db !important; }"
+        "a:hover,a:focus { color:#fff !important; text-decoration:underline !important; }"
+        "a:focus-visible { outline:2px solid #91cfff !important; }",
+        WEBKIT_USER_CONTENT_INJECT_TOP_FRAME, WEBKIT_USER_STYLE_LEVEL_USER,
+        modland_pages, NULL);
+    webkit_user_content_manager_add_style_sheet(
+        webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(web)), sheet);
+    webkit_user_style_sheet_unref(sheet);
+    const gchar *archive_pages[] = {
+        "https://modarchive.org/*", "https://www.modarchive.org/*", NULL
+    };
+    sheet = webkit_user_style_sheet_new(
+        "html,body{color-scheme:dark;background:#232323!important;color:#dedede!important;"
+        "margin:0!important;font:18px/1.5 sans-serif!important}"
+        ".container,.supercontainer{box-sizing:border-box!important;width:100%!important;"
+        "max-width:none!important;min-width:0!important;margin:0!important;"
+        "padding:clamp(10px,2vw,32px)!important;background:#232323!important}"
+        ".minibox,.minibox-minimised,.sub-header{display:none!important}"
+        ".mainbg> .center:first-child{text-align:left!important;margin:0 0 .5rem!important}"
+        ".mainbg> .center:first-child>a[href='index.php'] img{display:none!important}"
+        ".mainbg> .center:first-child>a[href='index.php']::after{content:'The Mod Archive';"
+        "font-size:1.4rem;font-weight:bold;color:#ededed}"
+        ".mainbg :is(div,section,table,tr,th,td,p,ul,li,fieldset,pre){"
+        "background-color:transparent!important;background-image:none!important;"
+        "border-color:#505050!important;color:inherit!important}"
+        ".mainbg :is(p,li,td,th,span,small,font,label,pre,a){font-size:1rem!important;"
+        "line-height:1.5!important;color:inherit!important}"
+        ".mainbg :is(h1,h2,h3,h4,b,strong){color:#eee!important}"
+        ".mainbg h1{font-size:1.65rem!important}.mainbg h2{font-size:1.35rem!important}"
+        ".mainbg h3{font-size:1.15rem!important}"
+        ".mainbg :is(.bgmenu,.generic-box,.bgsegment2,th){background:#2d2d2d!important}"
+        ".mainbg .home-page-welcome,.mainbg .paragraph{max-width:78ch!important}"
+        ".mainbg img,.mainbg input,.mainbg textarea{max-width:100%!important}"
+        ".mainbg a:link{color:#9dd3ef!important}.mainbg a:visited{color:#c9b4df!important}"
+        ".mainbg a:focus-visible{outline:2px solid #9dd3ef!important;outline-offset:1px}"
+        ".mainbg :is(input,button,select,textarea){background:#333!important;color:#eee!important;"
+        "border:1px solid #646464!important;font:inherit!important;box-sizing:border-box!important}"
+        "#treemenu1{display:flex;flex-wrap:wrap}#treemenu1>li{float:none!important}"
+        "#treemenu1 a{background:#303030!important;width:auto!important;height:auto!important;"
+        "white-space:nowrap!important;padding:.3em .75em!important}"
+        "#treemenu1 a:hover,#treemenu1 a:focus{background:#434343!important}"
+        "#treemenu1 ul li{float:none!important}#treemenu1 ul li ul{left:100%!important}"
+        "#treemenu1 ul{width:max-content!important}"
+        ".mainbg .treemenu{position:relative;z-index:2}",
+        WEBKIT_USER_CONTENT_INJECT_TOP_FRAME, WEBKIT_USER_STYLE_LEVEL_USER,
+        archive_pages, NULL);
+    webkit_user_content_manager_add_style_sheet(
+        webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(web)), sheet);
+    webkit_user_style_sheet_unref(sheet);
+    g_signal_connect(web, "decide-policy", G_CALLBACK(archive_navigation), NULL);
+    GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *back = gtk_button_new_from_icon_name("go-previous-symbolic", GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(back, "Back");
+    g_signal_connect_swapped(back, "clicked", G_CALLBACK(webkit_web_view_go_back), web);
+    gtk_box_pack_start(GTK_BOX(bar), back, FALSE, FALSE, 0);
+    GtkWidget *picker = gtk_combo_box_text_new();
+    GtkComboBoxText *sites = GTK_COMBO_BOX_TEXT(picker);
+    gtk_combo_box_text_append(sites, "modland", "Modland");
+    gtk_combo_box_text_append(sites, "https://modarchive.org/", "The Mod Archive");
+    gtk_combo_box_text_append(sites, "https://amp.dascene.net/modules", "Amiga Music Preservation");
+    load_archive_sites(sites);
+    g_signal_connect(picker, "changed", G_CALLBACK(archive_selected), web);
+    gtk_box_pack_start(GTK_BOX(bar), picker, FALSE, FALSE, 0);
+    GtkWidget *add = gtk_button_new_with_label("Add site…");
+    g_signal_connect(add, "clicked", G_CALLBACK(add_archive_site), picker);
+    gtk_box_pack_start(GTK_BOX(bar), add, FALSE, FALSE, 0);
+    GtkWidget *drop = gtk_button_new_with_label("Paste track URL…");
+    gtk_drag_dest_unset(web);
+    g_signal_connect(drop, "clicked", G_CALLBACK(on_open_url), GINT_TO_POINTER(TRUE));
+    gtk_widget_set_tooltip_text(drop, "Add a track to the playlist");
+    gtk_box_pack_start(GTK_BOX(bar), drop, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(page), bar, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(page), gtk_label_new("Click a track download link to play it, or drag it onto the player to queue it."), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(page), web, TRUE, TRUE, 0);
+    gtk_widget_set_tooltip_text(web, "Drag a track download link anywhere on the player to queue it");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(picker), 0);
+    gtk_widget_show_all(page);
+}
+
 /* Keep the existing notebook pages and use a separate navigation list. */
 typedef struct {
     GtkNotebook *notebook;
@@ -6869,7 +7366,10 @@ static void visualizer_page_switch(GtkNotebook *notebook, GtkWidget *page,
     (void)notebook; (void)index;
     GtkStack *stack = GTK_STACK(data);
     GtkWidget *placeholder = g_object_get_data(G_OBJECT(stack), "vis-placeholder");
-    gtk_stack_set_visible_child_name(stack, page == placeholder ? "visualizer" : "pages");
+    const gchar *name = "pages";
+    if (page == placeholder) name = "visualizer";
+    if (page == g_object_get_data(G_OBJECT(stack), "archive-placeholder")) name = "archives";
+    gtk_stack_set_visible_child_name(stack, name);
 }
 
 static void sidebar_page_changed(GtkNotebook *notebook, GtkWidget *page,
@@ -6897,6 +7397,7 @@ static ModulezSidebar *sidebar_create(GtkWidget *container, GtkNotebook *noteboo
         {"Samples", "media-record-symbolic", 1},
         {"Patterns", "view-grid-symbolic", 2},
         {"DISCOVER", NULL, -1},
+        {"Browse Music", "web-browser-symbolic", 11},
         {"Radio", "network-wireless-symbolic", 6},
         {"HVSC", "folder-music-symbolic", 5},
         {"IRC", "mail-message-new-symbolic", 7},
@@ -7067,14 +7568,7 @@ static int create_player(void)
         initial_height = MIN(initial_height, MAX(480, workarea.height - 48));
     }
 
-    GtkTargetEntry drop_targets[] = {
-        { "text/uri-list", 0, 0 }
-    };
-    gtk_drag_dest_set(window, GTK_DEST_DEFAULT_ALL,
-                      drop_targets, G_N_ELEMENTS(drop_targets),
-                      GDK_ACTION_COPY);
-    g_signal_connect(window, "drag-data-received",
-                     G_CALLBACK(on_file_drop), NULL);
+    enable_playlist_drops(window);
     if (app_icon)
         gtk_window_set_icon(GTK_WINDOW(window), app_icon);
     gtk_window_set_default_size(GTK_WINDOW(window), initial_width, initial_height);
@@ -8019,6 +8513,10 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         GTK_NOTEBOOK(notebook), about_scroll,
         gtk_label_new("About"));
 
+    GtkWidget *archive_placeholder = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), archive_placeholder,
+                             gtk_label_new("Browse Music"));
+
     g_timeout_add(33, update_display, NULL);
 
     ModulezSidebar *nav = sidebar_create(body, GTK_NOTEBOOK(notebook));
@@ -8036,9 +8534,14 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_stack_set_homogeneous(GTK_STACK(page_stack), FALSE);
     gtk_stack_add_named(GTK_STACK(page_stack), page_scroll, "pages");
     gtk_stack_add_named(GTK_STACK(page_stack), vis_page, "visualizer");
+    GtkWidget *archives = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_stack_add_named(GTK_STACK(page_stack), archives, "archives");
+    g_signal_connect(archives, "map", G_CALLBACK(build_archive_browser), NULL);
+    g_object_set_data(G_OBJECT(page_stack), "archive-placeholder", archive_placeholder);
     g_object_set_data(G_OBJECT(page_stack), "vis-placeholder", vis_placeholder);
     g_signal_connect(notebook, "switch-page", G_CALLBACK(visualizer_page_switch), page_stack);
     gtk_box_pack_start(GTK_BOX(body), page_stack, TRUE, TRUE, 0);
+    gtk_container_foreach(GTK_CONTAINER(window), route_child_drops, NULL);
     gtk_widget_show_all(window);
     sidebar_apply(nav);
     gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), 0);
