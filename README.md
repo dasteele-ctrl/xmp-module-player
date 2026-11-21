@@ -2,7 +2,9 @@
 
 On the **Radio** tab, play a station and choose **Record WAV…**. **Stop Recording** saves a 44.1 kHz stereo WAV while playback continues. Stopping radio, switching stations, or quitting also finishes the file. Reconnection gaps are omitted.
 
-**Formerly XMP Module Player.** Modulez Player **1.8.2** adds batch audio export from the playlist. Select tunes with Ctrl-click, Shift-click, or Ctrl+A, choose **Export selected…**, then pick a destination folder and format. Each tune becomes a separate file.
+**Formerly XMP Module Player.** In **1.8.3**, the main Play button stops a live station. Local tracks have separate Pause and Stop controls. Right-click the playlist to export the current tune to WAV or export selected tracks.
+
+Modulez Player **1.8.2** adds batch audio export from the playlist. Select tunes with Ctrl-click, Shift-click, or Ctrl+A, choose **Export selected tracks…**, then pick a destination folder and format. Each tune becomes a separate file.
 
 The music archive browser arrived in 1.8.1. Browse Modland, The Mod Archive, AMP, or a site of your own. Click a track download to play it, or drag its link onto the player to queue it.
 The built-in AppImage updater, introduced in 1.7.4, lets you update
@@ -173,13 +175,13 @@ See [all releases](../../releases) for earlier versions.
 
 ### Running the AppImage
 
-1. Download the versioned `Modulez-Player-v1.8.2-x86_64.AppImage` file from Release v1.8.2.
+1. Download the versioned `Modulez-Player-v1.8.3-x86_64.AppImage` file from Release v1.8.3.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x Modulez-Player-v1.8.2-x86_64.AppImage
-   ./Modulez-Player-v1.8.2-x86_64.AppImage
+   chmod +x Modulez-Player-v1.8.3-x86_64.AppImage
+   ./Modulez-Player-v1.8.3-x86_64.AppImage
    ```
 
 ### Running on Windows with WSL
@@ -411,7 +413,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.8.2**
+**Current source version: 1.8.3**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and

@@ -35,7 +35,7 @@ static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event, gp
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.8.2"
+#define MODULEZ_VERSION "1.8.3"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
@@ -93,7 +93,7 @@ static GtkWidget *status_label;
 static GtkWidget *time_label;
 static GtkWidget *seek_scale;
 static GtkWidget *volume_scale;
-static GtkWidget *play_button;
+static GtkWidget *play_button, *stop_button;
 static XmpTrayIcon *tray_icon;
 static gboolean minimize_to_tray = TRUE;
 static gboolean sidebar_collapsed = FALSE;
@@ -861,6 +861,7 @@ static void on_volume_changed(GtkRange *range, gpointer user_data)
 
 static void update_play_button(void)
 {
+    gtk_widget_set_visible(stop_button, playback_mode != PLAYBACK_RADIO);
     gtk_button_set_label(GTK_BUTTON(play_button),
                          playing ? (playback_mode == PLAYBACK_RADIO ? "■  Stop" : "❚❚  Pause") : "▶  Play");
     if (title_label)
@@ -1925,13 +1926,6 @@ static void on_radio_category_changed(GtkComboBox *combo, gpointer data)
         (const char *[]) {"retro", "world", "favorites", "custom"}[
             CLAMP(gtk_combo_box_get_active(combo), 0, 3)]);
 }
-
-static void on_radio_stop(GtkButton *button, gpointer data)
-{
-    (void)button; (void)data;
-    if (playback_mode == PLAYBACK_RADIO) on_stop(NULL, NULL);
-}
-
 
 static void zx_apply_labels(void)
 {
@@ -3943,20 +3937,16 @@ static void on_record_radio(GtkButton *button, gpointer data)
     gtk_label_set_text(GTK_LABEL(record_label), "Recording WAV…");
 }
 
-static void on_export_wav(GtkButton *button, gpointer data)
+static void on_export_wav(GtkMenuItem *item, gpointer data)
 {
-    (void)button;
+    (void)item;
     (void)data;
 
     if (active_wav_export) {
         set_status("A WAV export is already running");
         return;
     }
-    if (playback_mode == PLAYBACK_RADIO) {
-        on_record_radio(button, data);
-        return;
-    }
-    if (playback_mode == PLAYBACK_NONE || !current_file[0]) {
+    if (playback_mode == PLAYBACK_RADIO || playback_mode == PLAYBACK_NONE || !current_file[0]) {
         set_status("Open a music file before exporting it");
         return;
     }
@@ -7086,6 +7076,11 @@ static gboolean on_playlist_button_press(GtkWidget *widget,
     gtk_widget_set_sensitive(export_item, gtk_tree_selection_count_selected_rows(selection) > 0);
     g_signal_connect(export_item, "activate", G_CALLBACK(on_batch_export), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), export_item);
+    if (playback_mode != PLAYBACK_NONE && playback_mode != PLAYBACK_RADIO) {
+        GtkWidget *current = gtk_menu_item_new_with_label("Export current tune to WAV…");
+        g_signal_connect(current, "activate", G_CALLBACK(on_export_wav), NULL);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), current);
+    }
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 #endif
     GtkWidget *heading = gtk_menu_item_new_with_label("Playlist repeat");
@@ -8097,11 +8092,6 @@ static int create_player(void)
         make_button("Open File", G_CALLBACK(on_open)), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(file_controls),
         make_button("Open URL", G_CALLBACK(on_open_url)), FALSE, FALSE, 0);
-#ifdef ENABLE_WAV_EXPORT
-    gtk_box_pack_start(GTK_BOX(file_controls),
-        make_button("Export WAV", G_CALLBACK(on_export_wav)), FALSE, FALSE, 0);
-#endif
-
     GtkWidget *file_spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_size_request(file_spacer, 12, -1);
     gtk_box_pack_start(GTK_BOX(file_controls), file_spacer, FALSE, FALSE, 0);
@@ -8125,8 +8115,10 @@ static int create_player(void)
     g_signal_connect(play_button, "clicked", G_CALLBACK(on_play), NULL);
     gtk_box_pack_start(GTK_BOX(controls), play_button, TRUE, TRUE, 0);
 
-    gtk_box_pack_start(GTK_BOX(controls),
-        make_button("■  Stop", G_CALLBACK(on_stop)), TRUE, TRUE, 0);
+    stop_button = make_button("■  Stop", G_CALLBACK(on_stop));
+    gtk_widget_set_no_show_all(stop_button, TRUE);
+    gtk_widget_show(stop_button);
+    gtk_box_pack_start(GTK_BOX(controls), stop_button, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(controls),
         make_button("▶|", G_CALLBACK(on_next)), TRUE, TRUE, 0);
 
@@ -8731,12 +8723,9 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_box_pack_start(GTK_BOX(radio_buttons), retro_favorite, FALSE, FALSE, 0);
     g_signal_connect(retro_favorite, "clicked", G_CALLBACK(on_save_favorite), GINT_TO_POINTER(0));
     gtk_box_pack_start(GTK_BOX(radio_retro), radio_buttons, FALSE, FALSE, 0);
-    GtkWidget *radio_stop_button = make_button("■ Stop Radio", G_CALLBACK(on_radio_stop));
-    gtk_widget_set_halign(radio_stop_button, GTK_ALIGN_START);
+#ifdef ENABLE_WAV_EXPORT
     GtkWidget *radio_transport = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(radio_page), radio_transport, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(radio_transport), radio_stop_button, FALSE, FALSE, 0);
-#ifdef ENABLE_WAV_EXPORT
     record_button = make_button("Record WAV…", G_CALLBACK(on_record_radio));
     gtk_widget_set_sensitive(record_button, FALSE);
     gtk_box_pack_start(GTK_BOX(radio_transport), record_button, FALSE, FALSE, 0);
