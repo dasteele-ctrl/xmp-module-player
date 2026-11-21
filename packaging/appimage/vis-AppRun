@@ -8,6 +8,12 @@ if [[ "${APPDIR:-}" == "$appdir" && -f "${APPIMAGE:-}" ]]; then
 fi
 launch_player() (
     set -e
+    # A desktop opener needs the session environment from before the GTK hooks.
+    export MODULEZ_HOST_VARS="PATH LD_LIBRARY_PATH GTK_DATA_PREFIX GTK_THEME GDK_BACKEND XDG_DATA_DIRS GSETTINGS_SCHEMA_DIR GI_TYPELIB_PATH GTK_EXE_PREFIX GTK_PATH GTK_IM_MODULE_FILE GDK_PIXBUF_MODULE_FILE WEBKIT_EXEC_PATH WEBKIT_INJECTED_BUNDLE_PATH"
+    for name in $MODULEZ_HOST_VARS; do
+        unset "MODULEZ_HOST_$name"
+        if [[ -v $name ]]; then export "MODULEZ_HOST_$name=${!name}"; fi
+    done
     export APPDIR="$appdir"
     # Keep relative song/folder arguments valid after changing to WebKit's base dir.
     original_dir="$PWD"
