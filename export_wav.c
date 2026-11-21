@@ -103,13 +103,26 @@ int export_wav_render(const ExportWavRequest *request,
     FILE *wav = NULL;
     int success = 0;
     gchar *temporary = NULL;
+    ExportEncoder *encoder = NULL;
+    g_autoptr(GError) encode_error = NULL;
 
     if (cancel && g_atomic_int_get(cancel)) {
         set_error(error, error_size, "Export cancelled");
         goto cleanup;
     }
 
-    switch (request->format) {
+    ExportWavFormat format = request->format;
+    if (format == EXPORT_WAV_AUTO) {
+        if (xmp_test_module(request->source, NULL) == 0)
+            format = EXPORT_WAV_XMP;
+        else if ((sid = sid_audio_open(request->source, error, error_size)))
+            format = EXPORT_WAV_SID;
+        else if ((uade = uade_audio_open(request->source, error, error_size)))
+            format = EXPORT_WAV_UADE;
+        else
+            format = EXPORT_WAV_FFMPEG;
+    }
+    switch (format) {
     case EXPORT_WAV_XMP: {
         xmp = xmp_create_context();
         if (!xmp || xmp_load_module(xmp, request->source) < 0) {
@@ -141,7 +154,7 @@ int export_wav_render(const ExportWavRequest *request,
             set_error(error, error_size, "Please choose a SID export length of 1–3600 seconds");
             goto cleanup;
         }
-        sid = sid_audio_open(request->source, error, error_size);
+        if (!sid) sid = sid_audio_open(request->source, error, error_size);
         if (!sid) goto cleanup;
         if (request->sid_subtune &&
             sid_audio_select_song(sid, request->sid_subtune) <= 0) {
@@ -170,7 +183,7 @@ int export_wav_render(const ExportWavRequest *request,
             goto cleanup;
         }
         /* An independent UADE state, owned entirely by this export worker. */
-        uade = uade_audio_open(request->source, error, error_size);
+        if (!uade) uade = uade_audio_open(request->source, error, error_size);
         if (!uade) goto cleanup;
         frame_limit = (uint64_t)request->uade_seconds * EXPORT_RATE;
         break;
@@ -179,24 +192,45 @@ int export_wav_render(const ExportWavRequest *request,
         goto cleanup;
     }
 
-    /* Create output alongside the destination and replace it only after a
-     * successful export; a failed/cancelled render preserves prior files. */
-    temporary = g_strdup_printf("%s.tmp.XXXXXX", request->destination);
-    int temporary_fd = g_mkstemp(temporary);
-    if (temporary_fd < 0) {
-        set_errno_error(error, error_size, "Could not create temporary WAV");
-        goto cleanup;
-    }
-    wav = fdopen(temporary_fd, "wb+");
-    if (!wav) {
-        set_errno_error(error, error_size, "Could not open temporary WAV");
-        close(temporary_fd);
-        goto cleanup;
-    }
+    if (request->output) {
+        const char *title = NULL, *artist = NULL;
+        if (xmp) {
+            struct xmp_module_info info;
+            xmp_get_module_info(xmp, &info);
+            title = info.mod->name;
+        } else if (sid) {
+            title = sid_audio_title(sid);
+            artist = sid_audio_author(sid);
+        } else if (uade) {
+            title = uade_audio_title(uade);
+        } else if (ffmpeg) {
+            title = ffmpeg_audio_tag(ffmpeg, "title");
+            artist = ffmpeg_audio_tag(ffmpeg, "artist");
+        }
+        g_autofree char *valid_title = g_utf8_make_valid(title && *title ? title : request->fallback_title, -1);
+        g_autofree char *valid_artist = artist && *artist ? g_utf8_make_valid(artist, -1) : NULL;
+        encoder = export_encoder_open(request->destination, request->output, valid_title, valid_artist, &encode_error);
+        if (!encoder) goto cleanup;
+    } else {
+        /* Create output alongside the destination and replace it only after a
+         * successful export; a failed/cancelled render preserves prior files. */
+        temporary = g_strdup_printf("%s.tmp.XXXXXX", request->destination);
+        int temporary_fd = g_mkstemp(temporary);
+        if (temporary_fd < 0) {
+            set_errno_error(error, error_size, "Could not create temporary WAV");
+            goto cleanup;
+        }
+        wav = fdopen(temporary_fd, "wb+");
+        if (!wav) {
+            set_errno_error(error, error_size, "Could not open temporary WAV");
+            close(temporary_fd);
+            goto cleanup;
+        }
 
-    if (!write_wav_header(wav, 0)) {
-        set_errno_error(error, error_size, "Could not write WAV header");
-        goto cleanup;
+        if (!write_wav_header(wav, 0)) {
+            set_errno_error(error, error_size, "Could not write WAV header");
+            goto cleanup;
+        }
     }
 
     update_progress(progress, 0, frame_limit);
@@ -240,12 +274,14 @@ int export_wav_render(const ExportWavRequest *request,
             break;
 
         /* Regular RIFF/WAV uses 32-bit chunk lengths. */
-        if (frames_written + (uint64_t)got > (UINT32_MAX - 36u) / EXPORT_BYTES_PER_FRAME) {
+        if (!encoder && frames_written + (uint64_t)got > (UINT32_MAX - 36u) / EXPORT_BYTES_PER_FRAME) {
             set_error(error, error_size, "WAV would exceed the 4 GB RIFF limit");
             goto cleanup;
         }
 
-        if (fwrite(pcm, EXPORT_BYTES_PER_FRAME, (size_t)got, wav) != (size_t)got) {
+        if (encoder) {
+            if (!export_encoder_write(encoder, pcm, got, &encode_error)) goto cleanup;
+        } else if (fwrite(pcm, EXPORT_BYTES_PER_FRAME, (size_t)got, wav) != (size_t)got) {
             set_errno_error(error, error_size, "Could not write WAV audio");
             goto cleanup;
         }
@@ -257,32 +293,38 @@ int export_wav_render(const ExportWavRequest *request,
         set_error(error, error_size, "The decoder produced no audio");
         goto cleanup;
     }
-    if (fseek(wav, 0, SEEK_SET) != 0 ||
-        !write_wav_header(wav, (uint32_t)(frames_written * EXPORT_BYTES_PER_FRAME)) ||
-        fflush(wav) != 0) {
-        set_errno_error(error, error_size, "Could not finalize WAV header");
-        goto cleanup;
-    }
-    if (fclose(wav) != 0) {
+    if (encoder) {
+        if (!export_encoder_finish(encoder, &encode_error)) goto cleanup;
+    } else {
+        if (fseek(wav, 0, SEEK_SET) != 0 ||
+            !write_wav_header(wav, (uint32_t)(frames_written * EXPORT_BYTES_PER_FRAME)) ||
+            fflush(wav) != 0) {
+            set_errno_error(error, error_size, "Could not finalize WAV header");
+            goto cleanup;
+        }
+        if (fclose(wav) != 0) {
+            wav = NULL;
+            set_errno_error(error, error_size, "Could not finish writing WAV");
+            goto cleanup;
+        }
         wav = NULL;
-        set_errno_error(error, error_size, "Could not finish writing WAV");
-        goto cleanup;
-    }
-    wav = NULL;
 
-    if (cancel && g_atomic_int_get(cancel)) {
-        set_error(error, error_size, "Export cancelled");
-        goto cleanup;
-    }
-    if (g_rename(temporary, request->destination) != 0) {
-        set_errno_error(error, error_size, "Could not save the exported WAV");
-        goto cleanup;
+        if (cancel && g_atomic_int_get(cancel)) {
+            set_error(error, error_size, "Export cancelled");
+            goto cleanup;
+        }
+        if (g_rename(temporary, request->destination) != 0) {
+            set_errno_error(error, error_size, "Could not save the exported WAV");
+            goto cleanup;
+        }
     }
     success = 1;
     if (progress) g_atomic_int_set(progress, 100);
     set_error(error, error_size, "");
 
 cleanup:
+    if (encode_error) set_error(error, error_size, encode_error->message);
+    export_encoder_free(encoder);
     if (wav) fclose(wav);
     if (!success && temporary) g_unlink(temporary);
     g_free(temporary);

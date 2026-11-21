@@ -5,6 +5,13 @@
 #include <string.h>
 #include <math.h>
 
+const char *const uade_name_tags[] = {
+    "mod", "mdat", "tfmx", "tfx", "cust", "custom", "dl", "dw", "hip", "hipc",
+    "bp", "bp3", "sfx", "smus", "jpn", "jpo", "jmf", "rjp", "rh",
+    "sid1", "sid2", "soc", "sog", "sun", "mon", "mosh", "fc", "fc13",
+    "fc14", "fred", "dm", "dm2", "dmu", "dss", "ahx", "thx", "hvl", "rmc", NULL
+};
+
 struct UadeAudio {
     struct uade_state *state;
     char title[256];

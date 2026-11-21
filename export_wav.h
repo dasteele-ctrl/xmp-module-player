@@ -3,6 +3,7 @@
 
 #include <glib.h>
 #include <stdint.h>
+#include "export_encoder.h"
 
 typedef enum {
     EXPORT_WAV_XMP,
@@ -10,7 +11,8 @@ typedef enum {
     EXPORT_WAV_SID,
     EXPORT_WAV_ZXTUNE,
     EXPORT_WAV_MIDI,
-    EXPORT_WAV_UADE
+    EXPORT_WAV_UADE,
+    EXPORT_WAV_AUTO
 } ExportWavFormat;
 
 typedef struct {
@@ -21,6 +23,8 @@ typedef struct {
     unsigned int sid_subtune; /* Export the currently selected SID subtune. */
     const char *soundfont;    /* MIDI export uses the currently selected font. */
     unsigned int uade_seconds; /* 0 = natural end; otherwise upper limit in seconds. */
+    const char *fallback_title; /* Display name for batch exports without tags. */
+    const BatchFormat *output; /* NULL uses the original WAV writer. */
 } ExportWavRequest;
 
 /* Runs off the GTK thread, with independent decoder instances.

@@ -10,6 +10,7 @@
 #include <xmp.h>
 #include <stdio.h>
 #include <errno.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -28,12 +29,13 @@
 static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event, gpointer data);
 #ifdef ENABLE_WAV_EXPORT
 #include "export_wav.h"
+#include "batch_export.h"
 #endif
 #ifdef ENABLE_ZXTUNE_NATIVE
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.8.1"
+#define MODULEZ_VERSION "1.8.2"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
@@ -425,6 +427,49 @@ static int radio_interrupt(void *opaque)
     return SDL_AtomicGet(&decoder_stop);
 }
 
+#ifdef ENABLE_WAV_EXPORT
+/* Only the radio decoder and GTK thread use this mutex. SDL's audio callback
+ * never waits for file I/O. GTK owns the filenames and widgets. */
+static GMutex recording_mutex;
+static ExportEncoder *radio_encoder;
+static GError *recording_error;
+static guint64 recorded_frames;
+static gchar *recording_destination, *recording_temp;
+static GtkWidget *record_button, *record_label;
+static guint radio_session;
+
+static void finish_radio_recording(void)
+{
+    if (!recording_temp) return;
+    g_mutex_lock(&recording_mutex);
+    if (!recording_error)
+        export_encoder_finish(radio_encoder, &recording_error);
+    export_encoder_free(radio_encoder);
+    radio_encoder = NULL;
+    guint64 frames = recorded_frames;
+    g_mutex_unlock(&recording_mutex);
+
+    g_autofree gchar *message = NULL;
+    if (recording_error) {
+        message = g_strdup_printf("Recording failed: %s", recording_error->message);
+        g_clear_error(&recording_error);
+        g_unlink(recording_temp);
+    } else if (!frames) {
+        message = g_strdup("Recording stopped before audio arrived.");
+        g_unlink(recording_temp);
+    } else if (g_rename(recording_temp, recording_destination) < 0) {
+        message = g_strdup_printf("Could not save the chosen filename. Recording kept at %s", recording_temp);
+    } else {
+        g_autofree char *name = g_filename_display_basename(recording_destination);
+        message = g_strdup_printf("Saved %s", name);
+    }
+    g_clear_pointer(&recording_temp, g_free);
+    g_clear_pointer(&recording_destination, g_free);
+    gtk_button_set_label(GTK_BUTTON(record_button), "Record WAV…");
+    gtk_label_set_text(GTK_LABEL(record_label), message);
+}
+#endif
+
 static int radio_worker(void *unused)
 {
     const RadioStation *station = unused;
@@ -450,6 +495,13 @@ static int radio_worker(void *unused)
                     break;
                 }
                 if (SDL_AtomicGet(&decoder_stop)) break;
+#ifdef ENABLE_WAV_EXPORT
+                g_mutex_lock(&recording_mutex);
+                if (radio_encoder && !recording_error &&
+                    export_encoder_write(radio_encoder, chunk, got, &recording_error))
+                    recorded_frames += got;
+                g_mutex_unlock(&recording_mutex);
+#endif
                 ffmpeg_audio_stream_title(audio, title, sizeof(title));
                 if (title[0]) {
                     g_mutex_lock(&radio_mutex);
@@ -509,6 +561,12 @@ static void stop_ffmpeg_decoder(void)
         SDL_WaitThread(decoder_thread, NULL);
         decoder_thread = NULL;
     }
+
+#ifdef ENABLE_WAV_EXPORT
+    ++radio_session;
+    finish_radio_recording();
+    if (record_button) gtk_widget_set_sensitive(record_button, FALSE);
+#endif
 
     if (uade_audio) {
         uade_audio_close(uade_audio);
@@ -606,16 +664,9 @@ static gboolean zx_is_music_path(const char *filename)
     return FALSE;
 }
 
-static const char *uade_name_tags[] = {
-    "mod", "mdat", "tfmx", "tfx", "cust", "custom", "dl", "dw", "hip", "hipc",
-    "bp", "bp3", "sfx", "smus", "jpn", "jpo", "jmf", "rjp", "rh",
-    "sid1", "sid2", "soc", "sog", "sun", "mon", "mosh", "fc", "fc13",
-    "fc14", "fred", "dm", "dm2", "dmu", "dss", "ahx", "thx", "hvl", "rmc"
-};
-
 static gboolean uade_is_music_name(const char *name)
 {
-    for (guint i = 0; i < G_N_ELEMENTS(uade_name_tags); ++i) {
+    for (guint i = 0; uade_name_tags[i]; ++i) {
         gsize n = strlen(uade_name_tags[i]), len = strlen(name);
         if ((len > n && name[n] == '.' &&
              g_ascii_strncasecmp(name, uade_name_tags[i], n) == 0) ||
@@ -628,7 +679,7 @@ static gboolean uade_is_music_name(const char *name)
 
 static void uade_add_file_patterns(GtkFileFilter *filter)
 {
-    for (guint i = 0; i < G_N_ELEMENTS(uade_name_tags); ++i) {
+    for (guint i = 0; uade_name_tags[i]; ++i) {
         gchar *upper = g_ascii_strup(uade_name_tags[i], -1);
         gchar *patterns[] = {g_strdup_printf("%s.*", uade_name_tags[i]),
             g_strdup_printf("*.%s", uade_name_tags[i]),
@@ -1267,6 +1318,9 @@ static void start_radio_source(guint id, const char *name, const char *url,
         update_play_button();
         return;
     }
+#ifdef ENABLE_WAV_EXPORT
+    gtk_widget_set_sensitive(record_button, TRUE);
+#endif
     SDL_LockAudioDevice(audio_device);
     playing = 1;
     SDL_UnlockAudioDevice(audio_device);
@@ -2428,6 +2482,40 @@ static void remember_last_folder(GtkWidget *dialog)
         g_free(folder);
     }
 }
+
+#ifdef ENABLE_WAV_EXPORT
+static gboolean writable_output_folder(const char *path)
+{
+    return path && g_path_is_absolute(path) && g_file_test(path, G_FILE_TEST_IS_DIR)
+        && g_access(path, W_OK | X_OK) == 0;
+}
+
+static void restore_output_folder(GtkWidget *chooser)
+{
+    g_autofree char *settings = player_config_path("last-output-folder");
+    g_autofree char *saved = NULL;
+    if (g_file_get_contents(settings, &saved, NULL, NULL) && writable_output_folder(saved)) {
+        gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(chooser), saved);
+        return;
+    }
+    const char *music = g_get_user_special_dir(G_USER_DIRECTORY_MUSIC);
+    g_autofree char *home_music = g_build_filename(g_get_home_dir(), "Music", NULL);
+    g_autofree char *folder = g_build_filename(music ? music : home_music, "Modulez Exports", NULL);
+    const char *start = g_get_home_dir();
+    if (g_mkdir_with_parents(folder, 0700) == 0 && writable_output_folder(folder))
+        start = folder;
+    gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(chooser), start);
+}
+
+static void remember_output_folder(const char *path)
+{
+    if (!writable_output_folder(path)) return;
+    g_autofree char *settings = player_config_path("last-output-folder");
+    g_autofree char *dir = g_path_get_dirname(settings);
+    if (g_mkdir_with_parents(dir, 0700) == 0)
+        g_file_set_contents(settings, path, -1, NULL);
+}
+#endif
 
 static char *get_soundfont_settings_file(void)
 {
@@ -3683,6 +3771,69 @@ static gboolean on_wav_export_delete(GtkWidget *dialog, GdkEvent *event,
     return TRUE; /* Keep the dialog alive until the worker has exited. */
 }
 
+static void export_folder_opened(GObject *source, GAsyncResult *result, gpointer data)
+{
+    GtkWidget *dialog = GTK_WIDGET(data);
+    g_autoptr(GError) error = NULL;
+    gboolean opened = g_subprocess_wait_check_finish(G_SUBPROCESS(source), result, &error);
+    if (gtk_widget_get_visible(dialog)) {
+        if (opened) {
+            gtk_widget_destroy(dialog);
+        } else {
+            gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog),
+                "Could not open %s: %s",
+                (const char *)g_object_get_data(G_OBJECT(dialog), "output-folder"), error->message);
+            gtk_dialog_set_response_sensitive(GTK_DIALOG(dialog), GTK_RESPONSE_APPLY, TRUE);
+        }
+    }
+    g_object_unref(dialog);
+}
+
+static void on_export_result_response(GtkDialog *dialog, gint response, gpointer data)
+{
+    (void)data;
+    if (response != GTK_RESPONSE_APPLY) {
+        gtk_widget_destroy(GTK_WIDGET(dialog));
+        return;
+    }
+    const char *folder = g_object_get_data(G_OBJECT(dialog), "output-folder");
+    g_autoptr(GSubprocessLauncher) launcher = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_SEARCH_PATH_FROM_ENVP);
+    const char *vars = g_getenv("MODULEZ_HOST_VARS");
+    if (vars) {
+        g_auto(GStrv) names = g_strsplit(vars, " ", -1);
+        for (char **name = names; *name; ++name) {
+            g_autofree char *key = g_strconcat("MODULEZ_HOST_", *name, NULL);
+            const char *value = g_getenv(key);
+            if (value)
+                g_subprocess_launcher_setenv(launcher, *name, value, TRUE);
+            else
+                g_subprocess_launcher_unsetenv(launcher, *name);
+        }
+    }
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GSubprocess) process = g_subprocess_launcher_spawn(
+        launcher, &error, "xdg-open", folder, NULL);
+    if (!process) {
+        gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog),
+            "Could not open %s: %s", folder, error->message);
+        return;
+    }
+    gtk_dialog_set_response_sensitive(dialog, GTK_RESPONSE_APPLY, FALSE);
+    g_subprocess_wait_check_async(process, NULL, export_folder_opened, g_object_ref(dialog));
+}
+
+static void show_export_result(GtkWidget *message, const char *folder)
+{
+    if (folder) {
+        g_object_set_data_full(G_OBJECT(message), "output-folder", g_strdup(folder), g_free);
+        gtk_dialog_add_button(GTK_DIALOG(message), "_Open Folder", GTK_RESPONSE_APPLY);
+    }
+    gtk_dialog_set_default_response(GTK_DIALOG(message), GTK_RESPONSE_CLOSE);
+    theme_dialog(message);
+    g_signal_connect(message, "response", G_CALLBACK(on_export_result_response), NULL);
+    gtk_widget_show(message);
+}
+
 static gboolean update_wav_export_dialog(gpointer data)
 {
     WavExportTask *task = data;
@@ -3696,12 +3847,11 @@ static gboolean update_wav_export_dialog(gpointer data)
         if (task->succeeded) {
             set_status("WAV export completed successfully");
             GtkWidget *message = gtk_message_dialog_new(
-                GTK_WINDOW(window), GTK_DIALOG_MODAL,
+                GTK_WINDOW(window), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
                 GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE,
                 "WAV exported successfully:\n%s", task->destination);
-            theme_dialog(message);
-            gtk_dialog_run(GTK_DIALOG(message));
-            gtk_widget_destroy(message);
+            g_autofree char *folder = g_path_get_dirname(task->destination);
+            show_export_result(message, folder);
         } else if (!g_atomic_int_get(&task->cancel)) {
             set_status(task->error[0] ? task->error : "WAV export failed");
             GtkWidget *message = gtk_message_dialog_new(
@@ -3735,6 +3885,64 @@ static gboolean update_wav_export_dialog(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
+static void on_record_radio(GtkButton *button, gpointer data)
+{
+    (void)button;
+    (void)data;
+    if (recording_temp) {
+        finish_radio_recording();
+        return;
+    }
+    if (playback_mode != PLAYBACK_RADIO || !decoder_thread || stopped) {
+        set_status("Play a radio station before recording");
+        return;
+    }
+    guint session = radio_session;
+    GtkWidget *chooser = gtk_file_chooser_dialog_new("Record radio to WAV", GTK_WINDOW(window),
+        GTK_FILE_CHOOSER_ACTION_SAVE, "_Cancel", GTK_RESPONSE_CANCEL, "_Record", GTK_RESPONSE_ACCEPT, NULL);
+    theme_dialog(chooser);
+    restore_output_folder(chooser);
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(chooser), TRUE);
+    g_autoptr(GDateTime) now = g_date_time_new_now_local();
+    g_autofree char *name = g_date_time_format(now, "Radio %Y-%m-%d %H-%M-%S.wav");
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(chooser), name);
+    g_autofree char *dest = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(chooser)) == GTK_RESPONSE_ACCEPT)
+        dest = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+    gtk_widget_destroy(chooser);
+    if (!dest || session != radio_session) return;
+    g_autofree char *directory = g_path_get_dirname(dest);
+    g_autofree char *temp = g_build_filename(directory, ".modulez-radio-XXXXXX", NULL);
+    int fd = g_mkstemp(temp);
+    g_autoptr(GError) error = NULL;
+    ExportEncoder *encoder = NULL;
+    if (fd < 0) {
+        g_set_error_literal(&error, G_FILE_ERROR, g_file_error_from_errno(errno), g_strerror(errno));
+    } else {
+        close(fd);
+        const BatchFormat wav = {"WAV", "wav", "pcm_s16le", "wav", AUDIO_RATE, 0};
+        encoder = export_encoder_open(temp, &wav, radio_name, NULL, &error);
+        if (!encoder) g_unlink(temp);
+    }
+    if (!encoder) {
+        GtkWidget *message = gtk_message_dialog_new(GTK_WINDOW(window), GTK_DIALOG_MODAL,
+            GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE, "Could not start recording: %s", error->message);
+        theme_dialog(message);
+        gtk_dialog_run(GTK_DIALOG(message));
+        gtk_widget_destroy(message);
+        return;
+    }
+    remember_output_folder(directory);
+    recording_temp = g_steal_pointer(&temp);
+    recording_destination = g_steal_pointer(&dest);
+    g_mutex_lock(&recording_mutex);
+    recorded_frames = 0;
+    radio_encoder = encoder;
+    g_mutex_unlock(&recording_mutex);
+    gtk_button_set_label(GTK_BUTTON(record_button), "Stop Recording");
+    gtk_label_set_text(GTK_LABEL(record_label), "Recording WAV…");
+}
+
 static void on_export_wav(GtkButton *button, gpointer data)
 {
     (void)button;
@@ -3745,7 +3953,7 @@ static void on_export_wav(GtkButton *button, gpointer data)
         return;
     }
     if (playback_mode == PLAYBACK_RADIO) {
-        set_status("WAV export is not available for live radio");
+        on_record_radio(button, data);
         return;
     }
     if (playback_mode == PLAYBACK_NONE || !current_file[0]) {
@@ -3784,6 +3992,7 @@ static void on_export_wav(GtkButton *button, gpointer data)
         "_Cancel", GTK_RESPONSE_CANCEL,
         "_Export", GTK_RESPONSE_ACCEPT, NULL);
     theme_dialog(chooser);
+    restore_output_folder(chooser);
 
     GtkWidget *uade_limit_toggle = NULL;
     GtkWidget *uade_limit_seconds = NULL;
@@ -3885,6 +4094,8 @@ static void on_export_wav(GtkButton *button, gpointer data)
         }
     }
 
+    g_autofree char *output_dir = g_path_get_dirname(destination);
+    remember_output_folder(output_dir);
     WavExportTask *task = g_new0(WavExportTask, 1);
     task->source = g_strdup(source);
     task->destination = destination;
@@ -5072,6 +5283,188 @@ static void on_playlist_search_changed(GtkSearchEntry *entry, gpointer data)
     gtk_tree_model_filter_refilter(playlist_filter);
 }
 
+#ifdef ENABLE_WAV_EXPORT
+typedef struct {
+    GPtrArray *files;
+    char *folder, *soundfont;
+    const BatchFormat *format;
+    unsigned int seconds;
+    guint exported, failed;
+    GString *errors;
+    gint index, progress, cancel, done;
+    GThread *thread;
+    GtkWidget *dialog, *bar;
+    guint timer;
+} BatchJob;
+
+static BatchJob *active_batch;
+
+static gpointer batch_worker(gpointer data)
+{
+    BatchJob *job = data;
+    for (guint i = 0; i < job->files->len && !g_atomic_int_get(&job->cancel); ++i) {
+        g_atomic_int_set(&job->progress, 0);
+        g_atomic_int_set(&job->index, i);
+        const char *path = g_ptr_array_index(job->files, i);
+        ExportWavRequest request = {
+            .source = path, .format = EXPORT_WAV_AUTO,
+            .sid_seconds = job->seconds, .uade_seconds = job->seconds,
+            .soundfont = job->soundfont
+        };
+        if (is_midi_path(path)) request.format = EXPORT_WAV_MIDI;
+        else if (zx_is_music_path(path)) request.format = EXPORT_WAV_ZXTUNE;
+        g_autoptr(GError) error = NULL;
+        if (batch_export_track(request, job->format, job->folder, &job->progress,
+                               &job->cancel, &error)) {
+            ++job->exported;
+        } else if (!g_atomic_int_get(&job->cancel)) {
+            if (++job->failed <= 5) {
+                g_autofree char *name = g_filename_display_basename(path);
+                g_autofree char *detail = g_utf8_make_valid(error->message, -1);
+                g_string_append_printf(job->errors, "\n%s: %s", name, detail);
+            }
+        }
+    }
+    g_atomic_int_set(&job->done, 1);
+    return NULL;
+}
+
+static void cancel_batch(BatchJob *job)
+{
+    g_atomic_int_set(&job->cancel, 1);
+}
+
+static void batch_response(GtkDialog *dialog, gint response, gpointer data)
+{
+    (void)response;
+    cancel_batch(data);
+    gtk_dialog_set_response_sensitive(dialog, GTK_RESPONSE_CANCEL, FALSE);
+}
+
+static gboolean batch_delete(GtkWidget *widget, GdkEvent *event, gpointer data)
+{
+    (void)event;
+    batch_response(GTK_DIALOG(widget), GTK_RESPONSE_CANCEL, data);
+    return TRUE;
+}
+
+static void free_batch(BatchJob *job)
+{
+    g_thread_join(job->thread);
+    gtk_widget_destroy(job->dialog);
+    g_ptr_array_unref(job->files);
+    g_string_free(job->errors, TRUE);
+    g_free(job->folder);
+    g_free(job->soundfont);
+    g_free(job);
+    active_batch = NULL;
+}
+
+static gboolean update_batch(gpointer data)
+{
+    BatchJob *job = data;
+    if (g_atomic_int_get(&job->done)) {
+        g_autofree char *summary = g_strdup_printf("%s — %u exported, %u failed, %u remaining",
+            g_atomic_int_get(&job->cancel) ? "Export stopped" : "Export finished",
+            job->exported, job->failed, job->files->len - job->exported - job->failed);
+        GtkWidget *message = gtk_message_dialog_new(GTK_WINDOW(window),
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+            job->failed ? GTK_MESSAGE_WARNING : GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE, "%s", summary);
+        if (job->errors->len)
+            gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(message), "%s", job->errors->str);
+        set_status(summary);
+        show_export_result(message, job->exported ? job->folder : NULL);
+        free_batch(job);
+        return G_SOURCE_REMOVE;
+    }
+    guint index = g_atomic_int_get(&job->index);
+    g_autofree char *name = g_filename_display_basename(g_ptr_array_index(job->files, index));
+    g_autofree char *text = g_strdup_printf("%u of %u — %s", index + 1, job->files->len, name);
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(job->bar), text);
+    double track_fraction = MAX(0, g_atomic_int_get(&job->progress)) / 100.0;
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(job->bar), (index + track_fraction) / job->files->len);
+    return G_SOURCE_CONTINUE;
+}
+
+static void on_batch_export(GtkWidget *widget, gpointer data)
+{
+    (void)widget;
+    (void)data;
+    if (active_batch) return;
+    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view));
+    GtkTreeModel *model;
+    GList *rows = gtk_tree_selection_get_selected_rows(selection, &model);
+    g_autoptr(GPtrArray) files = g_ptr_array_new_with_free_func(g_free);
+    for (GList *row = rows; row; row = row->next) {
+        GtkTreeIter iter;
+        if (gtk_tree_model_get_iter(model, &iter, row->data)) {
+            char *path = NULL;
+            gtk_tree_model_get(model, &iter, 1, &path, -1);
+            if (path) g_ptr_array_add(files, path);
+        }
+    }
+    g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
+    if (!files->len) {
+        set_status("Select playlist tracks to export (Ctrl+A selects all visible tracks)");
+        return;
+    }
+    GtkWidget *chooser = gtk_file_chooser_dialog_new("Export selected tracks to folder",
+        GTK_WINDOW(window), GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Export", GTK_RESPONSE_ACCEPT, NULL);
+    theme_dialog(chooser);
+    restore_output_folder(chooser);
+    GtkWidget *options = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *combo = gtk_combo_box_text_new();
+    g_autofree char *settings = player_config_path("batch-export-format");
+    g_autofree char *saved = NULL;
+    g_file_get_contents(settings, &saved, NULL, NULL);
+    for (guint i = 0; i < batch_format_count; ++i)
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo), batch_formats[i].extension,
+                                  batch_formats[i].label);
+    if (!saved || !gtk_combo_box_set_active_id(GTK_COMBO_BOX(combo), saved))
+        gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
+    gtk_box_pack_start(GTK_BOX(options), gtk_label_new("Format"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(options), combo, FALSE, FALSE, 0);
+    GtkWidget *seconds = gtk_spin_button_new_with_range(1, 3600, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(seconds), 180);
+    gtk_box_pack_start(GTK_BOX(options), gtk_label_new("SID / UADE limit (seconds)"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(options), seconds, FALSE, FALSE, 0);
+    gtk_widget_show_all(options);
+    gtk_file_chooser_set_extra_widget(GTK_FILE_CHOOSER(chooser), options);
+    if (gtk_dialog_run(GTK_DIALOG(chooser)) != GTK_RESPONSE_ACCEPT) {
+        gtk_widget_destroy(chooser);
+        return;
+    }
+    BatchJob *job = g_new0(BatchJob, 1);
+    job->folder = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+    remember_output_folder(job->folder);
+    job->format = &batch_formats[gtk_combo_box_get_active(GTK_COMBO_BOX(combo))];
+    job->seconds = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(seconds));
+    job->soundfont = g_strdup(selected_soundfont);
+    job->files = g_steal_pointer(&files);
+    g_autofree char *dir = g_path_get_dirname(settings);
+    g_mkdir_with_parents(dir, 0700);
+    g_file_set_contents(settings, job->format->extension, -1, NULL);
+    gtk_widget_destroy(chooser);
+    job->errors = g_string_new(NULL);
+    job->dialog = gtk_dialog_new_with_buttons("Exporting selected tracks", GTK_WINDOW(window),
+        GTK_DIALOG_MODAL, "_Cancel", GTK_RESPONSE_CANCEL, NULL);
+    theme_dialog(job->dialog);
+    job->bar = gtk_progress_bar_new();
+    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(job->bar), TRUE);
+    gtk_progress_bar_set_ellipsize(GTK_PROGRESS_BAR(job->bar), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_widget_set_size_request(job->bar, 320, -1);
+    gtk_box_pack_start(GTK_BOX(gtk_dialog_get_content_area(GTK_DIALOG(job->dialog))),
+                       job->bar, TRUE, TRUE, 12);
+    g_signal_connect(job->dialog, "response", G_CALLBACK(batch_response), job);
+    g_signal_connect(job->dialog, "delete-event", G_CALLBACK(batch_delete), job);
+    active_batch = job;
+    job->thread = g_thread_new("batch-export", batch_worker, job);
+    job->timer = g_timeout_add(100, update_batch, job);
+    gtk_widget_show_all(job->dialog);
+}
+#endif
+
 static void on_playlist_remove(GtkButton *button, gpointer data)
 {
     (void)button;
@@ -5079,12 +5472,17 @@ static void on_playlist_remove(GtkButton *button, gpointer data)
 
     GtkTreeSelection *selection =
         gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view));
-    GtkTreeIter iter;
-    if (gtk_tree_selection_get_selected(selection, NULL, &iter)) {
-        GtkTreeIter child;
-        gtk_tree_model_filter_convert_iter_to_child_iter(playlist_filter, &child, &iter);
-        gtk_list_store_remove(playlist_store, &child);
+    GtkTreeModel *model;
+    GList *rows = gtk_tree_selection_get_selected_rows(selection, &model);
+    rows = g_list_reverse(rows);
+    for (GList *row = rows; row; row = row->next) {
+        GtkTreeIter iter, child;
+        if (gtk_tree_model_get_iter(model, &iter, row->data)) {
+            gtk_tree_model_filter_convert_iter_to_child_iter(playlist_filter, &child, &iter);
+            gtk_list_store_remove(playlist_store, &child);
+        }
     }
+    g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
 }
 
 static void on_playlist_clear(GtkButton *button, gpointer data)
@@ -5194,6 +5592,7 @@ static gboolean playlist_play_index(gint index)
     GtkTreeIter visible;
     if (gtk_tree_model_filter_convert_child_iter_to_iter(playlist_filter, &visible, &iter)) {
         GtkTreePath *target_path = gtk_tree_model_get_path(GTK_TREE_MODEL(playlist_filter), &visible);
+        gtk_tree_selection_unselect_all(selection);
         gtk_tree_selection_select_iter(selection, &visible);
         gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(playlist_view),
                                      target_path, NULL, TRUE, 0.5, 0.0);
@@ -5255,8 +5654,9 @@ static gboolean playlist_skip_track(gint direction)
 
     GtkTreeSelection *selection = gtk_tree_view_get_selection(
         GTK_TREE_VIEW(playlist_view));
-    if (current_index < 0 &&
-        gtk_tree_selection_get_selected(selection, NULL, &iter)) {
+    GtkTreeModel *visible_model;
+    GList *rows = gtk_tree_selection_get_selected_rows(selection, &visible_model);
+    if (current_index < 0 && rows && gtk_tree_model_get_iter(visible_model, &iter, rows->data)) {
         GtkTreeIter child;
         gtk_tree_model_filter_convert_iter_to_child_iter(playlist_filter, &child, &iter);
         GtkTreePath *selected_path = gtk_tree_model_get_path(model, &child);
@@ -5268,6 +5668,7 @@ static gboolean playlist_skip_track(gint direction)
         }
     }
 
+    g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
     gint target_index = current_index < 0
         ? (direction > 0 ? 0 : count - 1)
         : (current_index + (direction > 0 ? 1 : count - 1)) % count;
@@ -5629,6 +6030,20 @@ static gboolean update_display(gpointer data)
         g_strlcpy(title, radio_title, sizeof(title));
         g_strlcpy(error, radio_error, sizeof(error));
         g_mutex_unlock(&radio_mutex);
+#ifdef ENABLE_WAV_EXPORT
+        if (recording_temp) {
+            g_mutex_lock(&recording_mutex);
+            guint64 seconds = recorded_frames / AUDIO_RATE;
+            gboolean failed = recording_error != NULL;
+            g_mutex_unlock(&recording_mutex);
+            if (failed) finish_radio_recording();
+            else {
+                g_autofree char *elapsed = g_strdup_printf("Recording %02" G_GUINT64_FORMAT
+                    ":%02" G_GUINT64_FORMAT, seconds / 60, seconds % 60);
+                gtk_label_set_text(GTK_LABEL(record_label), elapsed);
+            }
+        }
+#endif
         if (!stopped) {
             gchar *valid = g_utf8_make_valid(title[0] ? title : radio_name, -1);
             gtk_label_set_text(GTK_LABEL(title_label), valid);
@@ -6656,6 +7071,23 @@ static gboolean on_playlist_button_press(GtkWidget *widget,
         return FALSE;
 
     GtkWidget *menu = gtk_menu_new();
+#ifdef ENABLE_WAV_EXPORT
+    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(widget));
+    GtkTreePath *hit = NULL;
+    if (gtk_tree_view_get_path_at_pos(GTK_TREE_VIEW(widget), event->x, event->y,
+                                     &hit, NULL, NULL, NULL)) {
+        if (!gtk_tree_selection_path_is_selected(selection, hit)) {
+            gtk_tree_selection_unselect_all(selection);
+            gtk_tree_selection_select_path(selection, hit);
+        }
+        gtk_tree_path_free(hit);
+    }
+    GtkWidget *export_item = gtk_menu_item_new_with_label("Export selected tracks…");
+    gtk_widget_set_sensitive(export_item, gtk_tree_selection_count_selected_rows(selection) > 0);
+    g_signal_connect(export_item, "activate", G_CALLBACK(on_batch_export), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), export_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+#endif
     GtkWidget *heading = gtk_menu_item_new_with_label("Playlist repeat");
     gtk_widget_set_sensitive(heading, FALSE);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), heading);
@@ -6769,6 +7201,11 @@ static void on_destroy(GtkWidget *widget, gpointer data)
     eq_save_settings();
 
 #ifdef ENABLE_WAV_EXPORT
+    if (active_batch) {
+        cancel_batch(active_batch);
+        g_source_remove(active_batch->timer);
+        free_batch(active_batch);
+    }
     if (active_wav_export) {
         WavExportTask *task = active_wav_export;
         g_atomic_int_set(&task->cancel, 1);
@@ -7735,11 +8172,17 @@ static int create_player(void)
         make_button("Clear", G_CALLBACK(on_playlist_clear)),
         FALSE, FALSE, 0);
 
+#ifdef ENABLE_WAV_EXPORT
+    gtk_box_pack_start(GTK_BOX(playlist_actions),
+        make_button("Export selected…", G_CALLBACK(on_batch_export)), FALSE, FALSE, 0);
+#endif
     playlist_store = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_STRING);
     playlist_filter = GTK_TREE_MODEL_FILTER(
         gtk_tree_model_filter_new(GTK_TREE_MODEL(playlist_store), NULL));
     gtk_tree_model_filter_set_visible_func(playlist_filter, playlist_row_matches, NULL, NULL);
     playlist_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(playlist_filter));
+    gtk_tree_selection_set_mode(gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view)),
+                                GTK_SELECTION_MULTIPLE);
     g_signal_connect(playlist_view, "button-press-event",
                      G_CALLBACK(on_playlist_button_press), NULL);
     g_object_unref(playlist_filter); /* The view now owns the model. */
@@ -8290,7 +8733,17 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_box_pack_start(GTK_BOX(radio_retro), radio_buttons, FALSE, FALSE, 0);
     GtkWidget *radio_stop_button = make_button("■ Stop Radio", G_CALLBACK(on_radio_stop));
     gtk_widget_set_halign(radio_stop_button, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(radio_page), radio_stop_button, FALSE, FALSE, 0);
+    GtkWidget *radio_transport = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(radio_page), radio_transport, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(radio_transport), radio_stop_button, FALSE, FALSE, 0);
+#ifdef ENABLE_WAV_EXPORT
+    record_button = make_button("Record WAV…", G_CALLBACK(on_record_radio));
+    gtk_widget_set_sensitive(record_button, FALSE);
+    gtk_box_pack_start(GTK_BOX(radio_transport), record_button, FALSE, FALSE, 0);
+    record_label = gtk_label_new("");
+    gtk_label_set_ellipsize(GTK_LABEL(record_label), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_box_pack_start(GTK_BOX(radio_transport), record_label, FALSE, TRUE, 0);
+#endif
     radio_status_label = gtk_label_new("Stopped");
     radio_title_label = gtk_label_new("—");
     gtk_label_set_ellipsize(GTK_LABEL(radio_status_label), PANGO_ELLIPSIZE_END);
@@ -8464,7 +8917,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         "MIDI powered by FluidSynth with a SoundFont library\n"
         "Built-in 10-band equalizer with presets and live spectrum\n"
         "MP3, WAV, M4A/AAC, Ogg Vorbis, Opus, FLAC and more\n"
-        "WAV export for all supported playback engines\n"
+        "WAV export and five-format playlist batch conversion\n"
         "Wavescope: 34 visualization modes (Signal Ridge Labs, MIT)\n"
         "MilkDrop presets rendered by projectM (LGPL-2.1)\n"
         "Fullscreen visualizers with playback and preset controls\n"

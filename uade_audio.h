@@ -2,6 +2,7 @@
 #define XMP_UADE_AUDIO_H
 #include <stdint.h>
 #include <stddef.h>
+extern const char *const uade_name_tags[];
 typedef struct UadeAudio UadeAudio;
 /* Calls on one instance must be serialized; close only after joining decoder. */
 UadeAudio *uade_audio_open(const char *path, char *error, size_t error_size);

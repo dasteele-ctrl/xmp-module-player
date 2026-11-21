@@ -32,6 +32,8 @@ int ffmpeg_audio_seek(FfmpegAudio *audio, int64_t position_ms);
 int64_t ffmpeg_audio_duration_ms(const FfmpegAudio *audio);
 
 
+const char *ffmpeg_audio_tag(const FfmpegAudio *audio, const char *key);
+
 /* Release all decoder resources. */
 void ffmpeg_audio_close(FfmpegAudio *audio);
 

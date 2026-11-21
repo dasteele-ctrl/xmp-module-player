@@ -38,6 +38,14 @@ struct FfmpegAudio {
     int pcm_position;
 };
 
+const char *ffmpeg_audio_tag(const FfmpegAudio *audio, const char *key)
+{
+    AVDictionaryEntry *tag = av_dict_get(audio->format->metadata, key, NULL, 0);
+    if (!tag)
+        tag = av_dict_get(audio->format->streams[audio->stream_index]->metadata, key, NULL, 0);
+    return tag ? tag->value : NULL;
+}
+
 static void set_error(char *dst, unsigned long size, const char *message)
 {
     if (dst && size)
