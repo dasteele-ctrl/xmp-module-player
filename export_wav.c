@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "export_wav.h"
 #include "ffmpeg_audio.h"
+#include "adlib_audio.h"
 #include "sid_audio.h"
 #include "midi_audio.h"
 #include "zx_audio.h"
@@ -92,6 +93,7 @@ int export_wav_render(const ExportWavRequest *request,
     xmp_context xmp = NULL;
     int xmp_loaded = 0;
     int xmp_started = 0;
+    AdlibAudio *adlib = NULL;
     FfmpegAudio *ffmpeg = NULL;
     SidAudio *sid = NULL;
     ZxAudio *zx = NULL;
@@ -113,12 +115,16 @@ int export_wav_render(const ExportWavRequest *request,
 
     ExportWavFormat format = request->format;
     if (format == EXPORT_WAV_AUTO) {
-        if (xmp_test_module(request->source, NULL) == 0)
+        if (adlib_is_fm_s3m(request->source) && (adlib = adlib_audio_open(request->source)))
+            format = EXPORT_WAV_ADLIB;
+        else if (xmp_test_module(request->source, NULL) == 0)
             format = EXPORT_WAV_XMP;
         else if ((sid = sid_audio_open(request->source, error, error_size)))
             format = EXPORT_WAV_SID;
         else if ((uade = uade_audio_open(request->source, error, error_size)))
             format = EXPORT_WAV_UADE;
+        else if (adlib_is_path(request->source) && (adlib = adlib_audio_open(request->source)))
+            format = EXPORT_WAV_ADLIB;
         else
             format = EXPORT_WAV_FFMPEG;
     }
@@ -143,6 +149,14 @@ int export_wav_render(const ExportWavRequest *request,
         frame_limit = module_ms * EXPORT_RATE / 1000u;
         break;
     }
+    case EXPORT_WAV_ADLIB:
+        if (!adlib) adlib = adlib_audio_open(request->source);
+        if (!adlib) {
+            set_error(error, error_size, "Could not open AdLib song for export");
+            goto cleanup;
+        }
+        frame_limit = (uint64_t)adlib_audio_duration_ms(adlib) * EXPORT_RATE / 1000u;
+        break;
     case EXPORT_WAV_FFMPEG:
         ffmpeg = ffmpeg_audio_open(request->source, error, error_size);
         if (!ffmpeg) goto cleanup;
@@ -254,6 +268,8 @@ int export_wav_render(const ExportWavRequest *request,
                 break;
             if (result >= 0)
                 got = frames;
+        } else if (adlib) {
+            got = adlib_audio_read(adlib, pcm, frames);
         } else if (ffmpeg) {
             got = ffmpeg_audio_read(ffmpeg, pcm, frames);
         } else if (sid) {
@@ -324,7 +340,7 @@ int export_wav_render(const ExportWavRequest *request,
 
 cleanup:
     if (encode_error) set_error(error, error_size, encode_error->message);
-    export_encoder_free(encoder);
+    if (encoder) export_encoder_free(encoder);
     if (wav) fclose(wav);
     if (!success && temporary) g_unlink(temporary);
     g_free(temporary);
@@ -332,6 +348,7 @@ cleanup:
     if (zx) zx_audio_close(zx);
     if (midi) midi_audio_close(midi);
     if (sid) sid_audio_close(sid);
+    adlib_audio_close(adlib);
     if (ffmpeg) ffmpeg_audio_close(ffmpeg);
     if (xmp_started) xmp_end_player(xmp);
     if (xmp_loaded) xmp_release_module(xmp);

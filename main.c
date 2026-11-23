@@ -17,6 +17,7 @@
 #include <limits.h>
 #include <math.h>
 #include "ffmpeg_audio.h"
+#include "adlib_audio.h"
 #include "sid_audio.h"
 #include "uade_audio.h"
 #include <signal.h>
@@ -35,7 +36,7 @@ static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event, gp
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.8.3"
+#define MODULEZ_VERSION "1.8.4"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
@@ -48,6 +49,7 @@ typedef enum {
     PLAYBACK_NONE,
     PLAYBACK_MODULE,
     PLAYBACK_FFMPEG,
+    PLAYBACK_ADLIB,
     PLAYBACK_SID,
     PLAYBACK_MIDI,
     PLAYBACK_ZX,
@@ -56,6 +58,11 @@ typedef enum {
 } PlaybackMode;
 
 static PlaybackMode playback_mode = PLAYBACK_NONE;
+
+static gboolean file_audio_mode(void)
+{
+    return playback_mode == PLAYBACK_FFMPEG || playback_mode == PLAYBACK_ADLIB;
+}
 static xmp_context ctx;
 static SDL_AudioDeviceID audio_device;
 static int module_loaded = 0;
@@ -139,6 +146,7 @@ static unsigned int audio_ring_write_pos;
 static SDL_Thread *decoder_thread;
 static SDL_atomic_t decoder_stop;
 static FfmpegAudio *ffmpeg_audio;
+static AdlibAudio *adlib_audio;
 /* Radio worker owns its FFmpeg context. Shared text is protected by a mutex. */
 static GMutex radio_mutex;
 static char radio_title[1024], radio_error[512];
@@ -332,6 +340,8 @@ static int decoder_thread_fn(void *unused)
 #endif
             if (uade_audio)
                 seek_result = uade_audio_seek(uade_audio, target_ms);
+            else if (adlib_audio)
+                seek_result = adlib_audio_seek(adlib_audio, target_ms);
             else
                 seek_result = ffmpeg_audio_seek(ffmpeg_audio, target_ms);
             if (seek_result < 0) {
@@ -354,7 +364,7 @@ static int decoder_thread_fn(void *unused)
 
         /* UADE's worker stays alive at EOF so a paused/finished song can
          * still accept a new seek. Stop joins it via decoder_stop. */
-        if (uade_audio && SDL_AtomicGet(&ffmpeg_decode_finished)) {
+        if ((uade_audio || adlib_audio) && SDL_AtomicGet(&ffmpeg_decode_finished)) {
             SDL_Delay(5);
             continue;
         }
@@ -385,6 +395,8 @@ static int decoder_thread_fn(void *unused)
 #endif
         if (uade_audio)
             got = uade_audio_read(uade_audio, chunk, request);
+        else if (adlib_audio)
+            got = adlib_audio_read(adlib_audio, chunk, request);
         else
             got = ffmpeg_audio_read(ffmpeg_audio, chunk, request);
 
@@ -399,7 +411,7 @@ static int decoder_thread_fn(void *unused)
 
         if (got == 0) {
             SDL_AtomicSet(&ffmpeg_decode_finished, 1);
-            if (uade_audio) continue;
+            if (uade_audio || adlib_audio) continue;
             break;
         }
 
@@ -572,6 +584,8 @@ static void stop_ffmpeg_decoder(void)
         uade_audio_close(uade_audio);
         uade_audio = NULL;
     }
+    adlib_audio_close(adlib_audio);
+    adlib_audio = NULL;
     if (ffmpeg_audio) {
         ffmpeg_audio_close(ffmpeg_audio);
         ffmpeg_audio = NULL;
@@ -653,7 +667,8 @@ static gboolean zx_is_music_path(const char *filename)
         ".ay", ".ayc", ".asc", ".chi", ".dmm", ".dst", ".ftc",
         ".gtr", ".psc", ".psg", ".pt1", ".pt2", ".pt3",
         ".sqt", ".st1", ".st3", ".stc", ".stp", ".str",
-        ".tfc", ".tfd", ".tfe", ".vtx", ".ym", NULL
+        ".tfc", ".tfd", ".tfe", ".vtx", ".ym",
+        ".spc", ".s98", ".sap", ".emul", NULL
     };
     const char *extension = strrchr(filename, '.');
     if (!extension)
@@ -777,7 +792,7 @@ static void audio_callback(void *userdata, Uint8 *stream, int len)
             playing = 0;
         }
     } else if (playback_mode == PLAYBACK_RADIO ||
-               playback_mode == PLAYBACK_FFMPEG ||
+               file_audio_mode() ||
                playback_mode == PLAYBACK_ZX ||
                playback_mode == PLAYBACK_UADE) {
         int16_t *out = (int16_t *)stream;
@@ -1168,7 +1183,7 @@ static void populate_sample_browser(void)
     }
 }
 
-static int open_ffmpeg_audio(const char *filename)
+static int open_file_audio(const char *filename)
 {
     char error_text[512] = "";
 
@@ -1204,16 +1219,19 @@ static int open_ffmpeg_audio(const char *filename)
 
     SDL_UnlockAudioDevice(audio_device);
 
-    ffmpeg_audio = ffmpeg_audio_open(filename, error_text,
-                                     sizeof(error_text));
-    if (!ffmpeg_audio) {
+    if (adlib_is_path(filename) || adlib_is_fm_s3m(filename))
+        adlib_audio = adlib_audio_open(filename);
+    if (!adlib_audio)
+        ffmpeg_audio = ffmpeg_audio_open(filename, error_text, sizeof(error_text));
+    if (!ffmpeg_audio && !adlib_audio) {
         set_status(error_text[0] ? error_text : "Unsupported audio file.");
         gtk_label_set_text(GTK_LABEL(title_label), "Unable to open audio");
         update_play_button();
         return 0;
     }
 
-    ffmpeg_duration_ms = ffmpeg_audio_duration_ms(ffmpeg_audio);
+    ffmpeg_duration_ms = adlib_audio ? adlib_audio_duration_ms(adlib_audio)
+                                    : ffmpeg_audio_duration_ms(ffmpeg_audio);
     ffmpeg_position_frames = 0;
     SDL_AtomicSet(&decoder_stop, 0);
     SDL_AtomicSet(&ffmpeg_decode_finished, 0);
@@ -1224,18 +1242,20 @@ static int open_ffmpeg_audio(const char *filename)
     if (!decoder_thread) {
         snprintf(error_text, sizeof(error_text),
                  "Could not start decoder thread: %s", SDL_GetError());
-        ffmpeg_audio_close(ffmpeg_audio);
+        adlib_audio_close(adlib_audio);
+        adlib_audio = NULL;
+        if (ffmpeg_audio) ffmpeg_audio_close(ffmpeg_audio);
         ffmpeg_audio = NULL;
         set_status(error_text);
         return 0;
     }
 
-    playback_mode = PLAYBACK_FFMPEG;
+    playback_mode = adlib_audio ? PLAYBACK_ADLIB : PLAYBACK_FFMPEG;
     g_strlcpy(current_file, filename, sizeof(current_file));
 
     char *base = g_path_get_basename(filename);
     gtk_label_set_text(GTK_LABEL(title_label), base ? base : "Audio file");
-    gtk_label_set_text(GTK_LABEL(format_label), "Audio file (FFmpeg)");
+    gtk_label_set_text(GTK_LABEL(format_label), adlib_audio ? "AdLib (AdPlug OPL3)" : "Audio file (FFmpeg)");
     gtk_label_set_text(GTK_LABEL(channels_label), "Stereo    44100 Hz");
     gtk_label_set_text(GTK_LABEL(details_label), filename);
     gtk_label_set_text(GTK_LABEL(time_label), "00:00");
@@ -1937,8 +1957,8 @@ static void zx_apply_labels(void)
     gtk_label_set_text(GTK_LABEL(title_label), base);
     gtk_label_set_text(GTK_LABEL(format_label),
                        playback_mode == PLAYBACK_ZX ?
-                       "ZX Spectrum / AY-YM (ZXTune native)" :
-                       "ZX Spectrum / AY-YM (ZXTune)");
+                       "Chiptune (ZXTune native)" :
+                       "Chiptune (ZXTune)");
     gtk_label_set_text(GTK_LABEL(channels_label),
                        "Stereo mixed output    44100 Hz");
     gtk_label_set_text(GTK_LABEL(details_label), zx_active_source);
@@ -1966,13 +1986,13 @@ static void zx_conversion_complete(GObject *object, GAsyncResult *result,
 
     if (current && waited && g_subprocess_get_successful(job->process) &&
         g_file_test(job->wav_path, G_FILE_TEST_IS_REGULAR) &&
-        open_ffmpeg_audio(job->wav_path)) {
+        open_file_audio(job->wav_path)) {
         /* FFmpeg owns an open handle; preserve the WAV for Stop/Play restart. */
         zx_active_directory = g_steal_pointer(&job->directory);
         zx_active_wav = g_steal_pointer(&job->wav_path);
         zx_active_source = g_strdup(job->source_path);
         zx_apply_labels();
-        set_status("ZX Spectrum tune loaded");
+        set_status("Chiptune loaded");
         if (job->autoplay)
             on_play(NULL, NULL);
     } else if (current) {
@@ -2033,7 +2053,7 @@ static void zx_start_conversion(const char *filename)
     }
 
     zx_pending = job;
-    gtk_label_set_text(GTK_LABEL(title_label), "Rendering ZX Spectrum tune…");
+    gtk_label_set_text(GTK_LABEL(title_label), "Rendering chiptune…");
     gtk_label_set_text(GTK_LABEL(format_label), "ZXTune");
     gtk_label_set_text(GTK_LABEL(channels_label), "");
     gtk_label_set_text(GTK_LABEL(time_label), "00:00 / 00:00");
@@ -2091,7 +2111,7 @@ static int open_zx_native(const char *filename)
     gtk_label_set_text(GTK_LABEL(time_label), "00:00");
     zx_apply_labels();
     update_play_button();
-    set_status("ZX Spectrum tune loaded (native audio)");
+    set_status("Chiptune loaded (native audio)");
     return 1;
 }
 #endif
@@ -3665,6 +3685,16 @@ static void on_open_url(GtkButton *button, gpointer data)
     start_url_download(url, enqueue);
 }
 
+static void adlib_add_file_patterns(GtkFileFilter *filter)
+{
+    for (const char *const *ext = adlib_extensions; *ext; ++ext) {
+        g_autofree char *lower = g_strconcat("*", *ext, NULL);
+        g_autofree char *upper = g_ascii_strup(lower, -1);
+        gtk_file_filter_add_pattern(filter, lower);
+        gtk_file_filter_add_pattern(filter, upper);
+    }
+}
+
 static void on_open(GtkButton *button, gpointer data)
 {
     (void)button;
@@ -3693,12 +3723,14 @@ static void on_open(GtkButton *button, gpointer data)
         "*.aiff", "*.aif", "*.wma", "*.mp4", "*.MP4",
         "*.pt3", "*.PT3", "*.pt2", "*.PT2", "*.ay", "*.AY",
         "*.vtx", "*.VTX", "*.ym", "*.YM", "*.stc", "*.STC",
+        "*.spc", "*.SPC", "*.s98", "*.S98", "*.sap", "*.SAP", "*.emul", "*.EMUL",
         "*.sqt", "*.SQT", "*.psg", "*.PSG", "*.asc", "*.ASC"
     };
 
     for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
         gtk_file_filter_add_pattern(filter, patterns[i]);
 
+    adlib_add_file_patterns(filter);
     uade_add_file_patterns(filter);
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
 
@@ -3951,7 +3983,7 @@ static void on_export_wav(GtkMenuItem *item, gpointer data)
         return;
     }
 
-    ExportWavFormat format = EXPORT_WAV_FFMPEG;
+    ExportWavFormat format = playback_mode == PLAYBACK_ADLIB ? EXPORT_WAV_ADLIB : EXPORT_WAV_FFMPEG;
     unsigned int sid_subtune = 0;
     const char *source = current_file;
     if (playback_mode == PLAYBACK_MODULE) {
@@ -3966,7 +3998,7 @@ static void on_export_wav(GtkMenuItem *item, gpointer data)
     } else if (playback_mode == PLAYBACK_MIDI) {
         format = EXPORT_WAV_MIDI;
     } else if (playback_mode == PLAYBACK_ZX ||
-               (playback_mode == PLAYBACK_FFMPEG && zx_active_wav)) {
+               (file_audio_mode() && zx_active_wav)) {
         format = EXPORT_WAV_ZXTUNE;
         if (zx_active_source) source = zx_active_source;
     }
@@ -4152,12 +4184,12 @@ static void on_play(GtkButton *button, gpointer data)
         return;
     }
 
-    if (playback_mode == PLAYBACK_FFMPEG &&
-        (stopped || audio_ended || !ffmpeg_audio)) {
+    if (file_audio_mode() &&
+        (stopped || audio_ended || (!ffmpeg_audio && !adlib_audio))) {
         char filename[sizeof(current_file)];
         g_strlcpy(filename, zx_active_wav ? zx_active_wav : current_file,
                   sizeof(filename));
-        if (!filename[0] || !open_ffmpeg_audio(filename))
+        if (!filename[0] || !open_file_audio(filename))
             return;
         if (zx_active_wav)
             zx_apply_labels();
@@ -4230,7 +4262,7 @@ static void on_play(GtkButton *button, gpointer data)
         SDL_UnlockAudioDevice(audio_device);
         SDL_PauseAudioDevice(audio_device, 0);
         set_status("Playing MIDI file");
-    } else if (playback_mode == PLAYBACK_FFMPEG) {
+    } else if (file_audio_mode()) {
         stopped = 0;
         audio_ended = 0;
         playing = 1;
@@ -4243,7 +4275,7 @@ static void on_play(GtkButton *button, gpointer data)
         playing = 1;
         SDL_PauseAudioDevice(audio_device, 0);
         set_status(playback_mode == PLAYBACK_UADE ?
-                   "Playing Amiga tune (UADE)" : "Playing ZX Spectrum tune");
+                   "Playing Amiga tune (UADE)" : "Playing chiptune");
     }
 
     update_play_button();
@@ -4276,7 +4308,7 @@ static void on_stop(GtkButton *button, gpointer data)
         xmp_stop_module(ctx);
         SDL_UnlockAudioDevice(audio_device);
     } else if (playback_mode == PLAYBACK_RADIO ||
-               playback_mode == PLAYBACK_FFMPEG ||
+               file_audio_mode() ||
                playback_mode == PLAYBACK_ZX ||
                playback_mode == PLAYBACK_UADE) {
         stop_ffmpeg_decoder();
@@ -4373,7 +4405,7 @@ static void on_seek(GtkRange *range, gpointer data)
             stopped = 0;
         }
         SDL_UnlockAudioDevice(audio_device);
-    } else if ((playback_mode == PLAYBACK_FFMPEG && ffmpeg_audio)
+    } else if ((file_audio_mode() && (ffmpeg_audio || adlib_audio))
 #ifdef ENABLE_ZXTUNE_NATIVE
                || (playback_mode == PLAYBACK_ZX && zx_audio)
 #endif
@@ -4492,7 +4524,7 @@ static void update_visualizer_spectrum(void)
     /* Let the bars and peak markers settle while playback is stopped. */
     if ((playback_mode != PLAYBACK_ZX &&
          playback_mode != PLAYBACK_MODULE &&
-         playback_mode != PLAYBACK_FFMPEG &&
+         !file_audio_mode() &&
          playback_mode != PLAYBACK_RADIO &&
          playback_mode != PLAYBACK_MIDI &&
          playback_mode != PLAYBACK_SID &&
@@ -4604,7 +4636,8 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
     cairo_paint(cr);
 
     if ((playback_mode == PLAYBACK_RADIO ||
-         (zx_active_wav && playback_mode == PLAYBACK_FFMPEG) ||
+         playback_mode == PLAYBACK_ADLIB ||
+         (zx_active_wav && file_audio_mode()) ||
          playback_mode == PLAYBACK_ZX || playback_mode == PLAYBACK_MIDI ||
          playback_mode == PLAYBACK_UADE) &&
         width >= 80 && height >= 20) {
@@ -4622,11 +4655,13 @@ static gboolean draw_scopes(GtkWidget *widget, cairo_t *cr,
         cairo_move_to(cr, 12, 17);
         cairo_show_text(cr, playback_mode == PLAYBACK_MIDI
                               ? "MIDI - mixed audio waveform"
+                              : playback_mode == PLAYBACK_ADLIB
+                              ? "AdLib - mixed audio waveform"
                               : playback_mode == PLAYBACK_UADE
                               ? "Amiga (UADE) - mixed audio waveform"
                               : playback_mode == PLAYBACK_RADIO
                               ? "Radio - mixed audio waveform"
-                              : "ZX Spectrum - mixed audio waveform");
+                              : "ZXTune - mixed audio waveform");
         cairo_set_source_rgb(cr, 0.35, 0.90, 0.65);
         cairo_set_line_width(cr, 1.0);
         for (int x = 0; x < width; ++x) {
@@ -4910,6 +4945,16 @@ static void play_playlist_file(const char *filename)
         return;
     }
 
+    if (adlib_is_fm_s3m(filename)) {
+        zx_cancel_pending();
+        stop_ffmpeg_decoder();
+        zx_remove_active();
+        if (open_file_audio(filename)) {
+            on_play(NULL, NULL);
+            return;
+        }
+    }
+
     zx_autoplay_request = 1;
     open_module(filename);
     zx_autoplay_request = 0;
@@ -4927,7 +4972,7 @@ static void play_playlist_file(const char *filename)
         return;
     }
 
-    if (open_uade(filename) || open_ffmpeg_audio(filename))
+    if (open_uade(filename) || open_file_audio(filename))
         on_play(NULL, NULL);
 }
 
@@ -5100,12 +5145,14 @@ static void on_playlist_add(GtkButton *button, gpointer data)
         "*.aiff", "*.aif", "*.wma", "*.mp4", "*.MP4",
         "*.pt3", "*.PT3", "*.pt2", "*.PT2", "*.ay", "*.AY",
         "*.vtx", "*.VTX", "*.ym", "*.YM", "*.stc", "*.STC",
+        "*.spc", "*.SPC", "*.s98", "*.S98", "*.sap", "*.SAP", "*.emul", "*.EMUL",
         "*.sqt", "*.SQT", "*.psg", "*.PSG", "*.asc", "*.ASC"
     };
 
     for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
         gtk_file_filter_add_pattern(filter, patterns[i]);
 
+    adlib_add_file_patterns(filter);
     uade_add_file_patterns(filter);
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
 
@@ -5149,7 +5196,7 @@ static gboolean playlist_is_audio_filename(const gchar *filename)
         ".psg", ".asc"
     };
 
-    if (uade_is_music_name(filename))
+    if (zx_is_music_path(filename) || adlib_is_path(filename) || uade_is_music_name(filename))
         return TRUE;
     const gchar *dot = strrchr(filename, '.');
     if (!dot)
@@ -5691,7 +5738,7 @@ static gboolean draw_pattern(GtkWidget *widget, cairo_t *cr,
         cairo_set_source_rgb(cr, 0.70, 0.73, 0.78);
         cairo_move_to(cr, 12, 24);
         cairo_show_text(cr, zx_active_source ?
-                        "ZX tunes do not expose XMP pattern data." :
+                        "ZXTune tracks do not expose XMP pattern data." :
                         "Load a module to view its pattern.");
         return FALSE;
     }
@@ -6058,7 +6105,7 @@ static gboolean update_display(gpointer data)
             set_status(status);
         }
         update_play_button();
-    } else if (playback_mode == PLAYBACK_FFMPEG ||
+    } else if (file_audio_mode() ||
         playback_mode == PLAYBACK_ZX ||
         playback_mode == PLAYBACK_UADE) {
         SDL_LockAudioDevice(audio_device);
@@ -6098,7 +6145,7 @@ static gboolean update_display(gpointer data)
         if (is_playing && playback_mode == PLAYBACK_UADE)
             set_status("Playing Amiga tune (UADE)");
         else if (is_playing)
-            set_status(zx_active_source ? "Playing ZX Spectrum tune" :
+            set_status(zx_active_source ? "Playing chiptune" :
                        "Playing audio file");
         else if (ended)
             set_status(playback_mode == PLAYBACK_UADE &&
@@ -8901,7 +8948,8 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
         "libxmp takes priority for shared formats\n"
         "UADE playback seeking\n"
         "Commodore 64 SID music powered by libsidplayfp\n"
-        "ZX Spectrum music powered by ZXTune\n"
+        "Chiptune playback powered by ZXTune\n"
+        "AdLib music powered by AdPlug\n"
         "Digital audio powered by FFmpeg\n"
         "MIDI powered by FluidSynth with a SoundFont library\n"
         "Built-in 10-band equalizer with presets and live spectrum\n"

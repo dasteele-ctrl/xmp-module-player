@@ -12,6 +12,7 @@ typedef enum {
     EXPORT_WAV_ZXTUNE,
     EXPORT_WAV_MIDI,
     EXPORT_WAV_UADE,
+    EXPORT_WAV_ADLIB,
     EXPORT_WAV_AUTO
 } ExportWavFormat;
 

@@ -2,7 +2,7 @@
 
 On the **Radio** tab, play a station and choose **Record WAV…**. **Stop Recording** saves a 44.1 kHz stereo WAV while playback continues. Stopping radio, switching stations, or quitting also finishes the file. Reconnection gaps are omitted.
 
-**Formerly XMP Module Player.** In **1.8.3**, the main Play button stops a live station. Local tracks have separate Pause and Stop controls. Right-click the playlist to export the current tune to WAV or export selected tracks.
+**Formerly XMP Module Player.** Version **1.8.4** adds AdLib playback and export through AdPlug and expands Modland filename recognition, including Art & Magic, Nintendo SPC, S98, Atari SAP, and AY Emul.
 
 Modulez Player **1.8.2** adds batch audio export from the playlist. Select tunes with Ctrl-click, Shift-click, or Ctrl+A, choose **Export selected tracks…**, then pick a destination folder and format. Each tune becomes a separate file.
 
@@ -175,13 +175,13 @@ See [all releases](../../releases) for earlier versions.
 
 ### Running the AppImage
 
-1. Download the versioned `Modulez-Player-v1.8.3-x86_64.AppImage` file from Release v1.8.3.
+1. Download the versioned `Modulez-Player-v1.8.4-x86_64.AppImage` file from Release v1.8.4.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x Modulez-Player-v1.8.3-x86_64.AppImage
-   ./Modulez-Player-v1.8.3-x86_64.AppImage
+   chmod +x Modulez-Player-v1.8.4-x86_64.AppImage
+   ./Modulez-Player-v1.8.4-x86_64.AppImage
    ```
 
 ### Running on Windows with WSL
@@ -303,6 +303,13 @@ bundled default. Packaging details are in the
 
 MIDI playback and the SoundFont Manager were introduced in **version 1.2**.
 
+### AdLib playback
+
+Build with AdPlug 2.4 and libbinio development headers. AdPlug renders DOS FM
+music through an emulated OPL3 chip. Supported examples include RAD, HSC,
+CMF, D00, A2M, A2T and DOSBox DRO. Open a file locally or from Modland.
+The same decoder supports playlist playback and audio export.
+
 ### Amiga playback with UADE (introduced in version 1.4.3)
 
 **UADE** adds Amiga music formats that libxmp cannot play. libxmp retains
@@ -413,7 +420,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.8.3**
+**Current source version: 1.8.4**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and
