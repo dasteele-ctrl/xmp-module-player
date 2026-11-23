@@ -1,8 +1,8 @@
-# Modulez Player
+# Modulez Player 1.8.4
+
+**Formerly XMP Module Player.** Version **1.8.4** adds AdLib playback and export through AdPlug. Modulez now recognizes 360 additional filename extensions and aliases. You can open Art & Magic, Nintendo SPC, S98, Atari SAP, and AY Emul tracks directly from Modland.
 
 On the **Radio** tab, play a station and choose **Record WAV…**. **Stop Recording** saves a 44.1 kHz stereo WAV while playback continues. Stopping radio, switching stations, or quitting also finishes the file. Reconnection gaps are omitted.
-
-**Formerly XMP Module Player.** Version **1.8.4** adds AdLib playback and export through AdPlug and expands Modland filename recognition, including Art & Magic, Nintendo SPC, S98, Atari SAP, and AY Emul.
 
 Modulez Player **1.8.2** adds batch audio export from the playlist. Select tunes with Ctrl-click, Shift-click, or Ctrl+A, choose **Export selected tracks…**, then pick a destination folder and format. Each tune becomes a separate file.
 
@@ -16,13 +16,15 @@ Version 1.5 introduced the Modulez Player name and icon.
 **In memory of modulez.org (2000-2013)**  
 [http://misc.yero.org/modulez/](http://misc.yero.org/modulez/)
 
-A native Linux music player built with **GTK3 and SDL2**, with playback powered by **libxmp, UADE, ZXTune, libsidplayfp, FluidSynth, and FFmpeg**.
+A native Linux music player built with **GTK3 and SDL2**, with playback powered by **libxmp, UADE, AdPlug, ZXTune, libsidplayfp, FluidSynth, and FFmpeg**.
 
 Modulez Player brings classic tracker music and regular audio playback to the Linux desktop, with a graphical interface, real-time audio visualization, and detailed module and sample information.
 
 ![Modulez Player 1.8.0 playing Josss - Robotto on Nectarine in the Radio tab](modulez-player-1.8.0.png)
 
 ## Features
+
+Download the [1.8.4 Linux AppImage](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.8.4) or read the [1.8.4 release notes](RELEASE_NOTES_1.8.4.md).
 
 See the [1.8.2 release notes](RELEASE_NOTES_1.8.2.md) for batch export settings and supported formats.
 
@@ -47,13 +49,14 @@ See the [1.8.1 release notes](RELEASE_NOTES_1.8.1.md) for details about Browse M
 - **Theme-aware IRC interface** with colors that follow the selected player theme
 - **Theme-aware equalizer graph** with matching backgrounds, curves, and frequency bars
 - 🎵 **Tracker module playback** powered by libxmp
+- **AdLib playback and export** through AdPlug’s OPL3 emulator, including Reality AdLib Tracker (`.rad`), HSC (`.hsc`), Creative Music File (`.cmf`), EdLib (`.d00`), and AdLib Tracker II (`.a2m` and `.a2t`)
 - 🎵 **Additional Amiga music formats** powered by UADE, with libxmp retaining priority for formats supported by both engines
 - 🎧 **Regular audio playback** powered by FFmpeg: MP3, WAV, M4A/AAC, Ogg Vorbis, Opus, and FLAC
 - 🎵 **Commodore 64 SID playback** powered by libsidplayfp
 - 🎹 **MIDI playback** powered by FluidSynth, with user-selectable SF2/SF3 SoundFonts
 - 🎼 **SoundFont manager** with multi-file import, folder scanning, live switching, and a startup default
 - 🎵 **ZX Spectrum AY/YM playback** through bundled ZXTune, including PT3, AY, VTX, YM, STC, and SQT
-- 💾 **Offline WAV export** for all six playback engines, with cancellation and overwrite confirmation; UADE exports until song end by default, with an optional time limit
+- 💾 **Offline WAV export** for all seven playback engines, with cancellation and overwrite confirmation; UADE exports until song end by default, with an optional time limit
 - 🎚️ **Playback controls** with seeking and track timing
 - 📃 **Playlist management** with add, remove, clear, drag-and-drop support, and recursive music-folder importing
 - 📃 **High Voltage SID Collection (HVSC) browsing and integrated downloader**
@@ -303,9 +306,9 @@ bundled default. Packaging details are in the
 
 MIDI playback and the SoundFont Manager were introduced in **version 1.2**.
 
-### AdLib playback
+### AdLib playback (new in 1.8.4)
 
-Build with AdPlug 2.4 and libbinio development headers. AdPlug renders DOS FM
+The 1.8.4 Linux AppImage bundles AdPlug and libbinio. For a source build, install AdPlug 2.4 and the libbinio development headers, then check that `pkg-config --modversion adplug` reports 2.4. AdPlug renders DOS FM
 music through an emulated OPL3 chip. Supported examples include RAD, HSC,
 CMF, D00, A2M, A2T and DOSBox DRO. Open a file locally or from Modland.
 The same decoder supports playlist playback and audio export.
@@ -413,6 +416,7 @@ in the distributed AppImage.
 - [libxmp](https://github.com/libxmp/libxmp) — tracker module playback
 - [UADE](https://zakalwe.fi/uade/) — additional Amiga music formats
 - [libsidplayfp](https://github.com/libsidplayfp/libsidplayfp) — Commodore 64 SID playback
+- [AdPlug](https://adplug.github.io/) — AdLib OPL2/OPL3 music playback and rendering for export
 - [FFmpeg](https://ffmpeg.org/) — decoding regular audio formats and live radio
 - [libsoup](https://libsoup.gnome.org/) and [JSON-GLib](https://gnome.pages.gitlab.gnome.org/json-glib/) — worldwide radio discovery
 - [ZXTune](https://github.com/vitamin-caig/zxtune) — native ZX Spectrum and chiptune playback
