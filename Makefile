@@ -1,8 +1,8 @@
 CC ?= cc
 CXX ?= c++
-CFLAGS += -O2 -Wall -Wextra $(shell pkg-config --cflags gtk+-3.0 webkit2gtk-4.1 gio-2.0 libsoup-3.0 json-glib-1.0 sdl2 libxmp libuade libavformat libavcodec libavutil libswresample fluidsynth)
+CFLAGS += -O2 -Wall -Wextra $(shell pkg-config --cflags gtk+-3.0 webkit2gtk-4.1 gio-2.0 libsoup-3.0 json-glib-1.0 sdl2 libxmp libuade libavformat libavcodec libavutil libswresample fluidsynth mpv)
 CXXFLAGS += -O2 -Wall -Wextra -std=c++11 $(shell pkg-config --cflags libsidplayfp)
-LDLIBS += $(shell pkg-config --libs gtk+-3.0 gio-2.0 sdl2 libxmp libuade libavformat libavcodec libavutil libswresample fluidsynth) $(shell pkg-config --libs libsidplayfp) -lm $(shell pkg-config --libs webkit2gtk-4.1 libsoup-3.0 json-glib-1.0)
+LDLIBS += $(shell pkg-config --libs gtk+-3.0 gio-2.0 sdl2 libxmp libuade libavformat libavcodec libavutil libswresample fluidsynth mpv) $(shell pkg-config --libs libsidplayfp) -lm $(shell pkg-config --libs webkit2gtk-4.1 libsoup-3.0 json-glib-1.0)
 
 all: modulez-player
 
@@ -14,11 +14,11 @@ ZX_INCLUDE = -I$(ZX_ROOT) -I$(ZX_ROOT)/include -I$(ZX_ROOT)/src
 ZX_LIBRARIES = $(wildcard $(ZX_ROOT)/lib/linux/release/*.a)
 VIS_OBJECTS = visualizer.o visualizer_pcm.o visualizer-resources.o
 IRC_OBJECTS = xmp_irc_widget.o irc_client.o irc_protocol.o
-ZX_NATIVE_OBJECTS = about_tribute.o player_config.o main_zx_native.o zx_audio.o xmp-resources.o adlib_audio.o ffmpeg_audio.o sid_audio.o midi_audio.o uade_audio.o equalizer.o hvsc_download.o tray_icon.o $(IRC_OBJECTS) $(VIS_OBJECTS)
+ZX_NATIVE_OBJECTS = about_tribute.o player_config.o main_zx_native.o zx_audio.o xmp-resources.o adlib_audio.o video_window.o ffmpeg_audio.o sid_audio.o midi_audio.o uade_audio.o equalizer.o hvsc_download.o tray_icon.o $(IRC_OBJECTS) $(VIS_OBJECTS)
 ZX_ISOLATED_OBJECTS = $(filter-out zx_audio.o main_zx_native.o,$(ZX_NATIVE_OBJECTS)) zx_audio_proxy.o main_export.o export_encoder.o batch_export.o export_wav.o
 EXPORT_TEST_OBJECTS = $(ZX_ISOLATED_OBJECTS)
 ZX_SID_TEST_OBJECTS = $(filter-out sid_audio.o,$(ZX_NATIVE_OBJECTS)) sid_audio_zx.o
-ZX_WAV_OBJECTS = about_tribute.o player_config.o main.o xmp-resources.o adlib_audio.o ffmpeg_audio.o sid_audio.o midi_audio.o uade_audio.o equalizer.o hvsc_download.o tray_icon.o $(IRC_OBJECTS) $(VIS_OBJECTS)
+ZX_WAV_OBJECTS = about_tribute.o player_config.o main.o xmp-resources.o adlib_audio.o video_window.o ffmpeg_audio.o sid_audio.o midi_audio.o uade_audio.o equalizer.o hvsc_download.o tray_icon.o $(IRC_OBJECTS) $(VIS_OBJECTS)
 
 # The tested default isolates libsidplayfp and ZXTune in different processes.
 # Both render PCM directly, without a temporary WAV or conflicting SID symbols.
@@ -29,7 +29,7 @@ modulez-player xmp-linux xmp-zx-native xmp-zx-isolated-test: $(ZX_ISOLATED_OBJEC
 xmp-export-test: $(EXPORT_TEST_OBJECTS) xmp-zx-helper Makefile
 	$(CXX) -o $@ $(EXPORT_TEST_OBJECTS) $(LDLIBS) -ldl -lpthread -lz
 
-main_export.o: main.c about_tribute.h player_config.h uade_audio.h adlib_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h zx_audio.h batch_export.h export_encoder.h export_wav.h xmp_irc_widget.h tray_icon.h visualizer.h visualizer_pcm.h
+main_export.o: main.c video_window.h about_tribute.h player_config.h uade_audio.h adlib_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h zx_audio.h batch_export.h export_encoder.h export_wav.h xmp_irc_widget.h tray_icon.h visualizer.h visualizer_pcm.h
 	$(CC) $(CFLAGS) -DENABLE_ZXTUNE_NATIVE -DENABLE_WAV_EXPORT -c -o $@ main.c
 
 export_encoder.o: export_encoder.c export_encoder.h
@@ -63,7 +63,7 @@ sid_audio_zx.o: sid_audio.cpp sid_audio.h
 	$(CXX) $(CXXFLAGS) -std=c++20 -DXMP_USE_ZXTUNE_SID_HEADERS \
 	    -I$(ZX_ROOT)/3rdparty/sidplayfp/src -c -o $@ sid_audio.cpp
 
-main_zx_native.o: main.c about_tribute.h player_config.h uade_audio.h adlib_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h zx_audio.h xmp_irc_widget.h tray_icon.h visualizer.h visualizer_pcm.h
+main_zx_native.o: main.c video_window.h about_tribute.h player_config.h uade_audio.h adlib_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h zx_audio.h xmp_irc_widget.h tray_icon.h visualizer.h visualizer_pcm.h
 	$(CC) $(CFLAGS) -DENABLE_ZXTUNE_NATIVE -c -o $@ main.c
 
 zx_audio.o: zx_audio.cpp zx_audio.h
@@ -72,7 +72,7 @@ zx_audio.o: zx_audio.cpp zx_audio.h
 xmp-zx-wav: $(ZX_WAV_OBJECTS) Makefile
 	$(CXX) -o $@ $(ZX_WAV_OBJECTS) $(LDLIBS)
 
-main.o: main.c about_tribute.h player_config.h uade_audio.h adlib_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h xmp_irc_widget.h tray_icon.h visualizer.h visualizer_pcm.h
+main.o: main.c video_window.h about_tribute.h player_config.h uade_audio.h adlib_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h xmp_irc_widget.h tray_icon.h visualizer.h visualizer_pcm.h
 	$(CC) $(CFLAGS) -c -o $@ main.c
 
 tray_icon.o: tray_icon.c tray_icon.h
@@ -89,6 +89,8 @@ irc_protocol.o: irc_protocol.c irc_protocol.h
 
 adlib_audio.o: adlib_audio.cpp adlib_audio.h
 	$(CXX) -std=c++11 -O2 -Wall -Wextra $(shell pkg-config --cflags adplug) -c -o $@ $<
+
+video_window.o: video_window.c video_window.h
 
 ffmpeg_audio.o: ffmpeg_audio.c ffmpeg_audio.h
 	$(CC) $(CFLAGS) -c -o $@ ffmpeg_audio.c

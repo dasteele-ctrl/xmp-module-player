@@ -10,6 +10,11 @@ FfmpegAudio *ffmpeg_audio_open(const char *filename,
                                char *error_text,
                                unsigned long error_text_size);
 
+/* For player playback, return NULL and set has_video when a genuine video
+   track is present. The audio-only API above also serves export callers. */
+FfmpegAudio *ffmpeg_open_playback(const char *filename, int *has_video,
+                                 char *error_text, unsigned long error_text_size);
+
 /* The interrupt callback may run during open/read; opaque must remain valid
    until close. Return nonzero to cancel. Call from a worker thread. */
 typedef int (*FfmpegAudioInterrupt)(void *opaque);
