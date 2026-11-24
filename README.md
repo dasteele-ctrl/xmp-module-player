@@ -22,7 +22,7 @@ A native Linux music and video player built with **GTK3 and SDL2**, with playbac
 
 Modulez Player brings classic tracker music and regular audio playback to the Linux desktop, with a graphical interface, real-time audio visualization, and detailed module and sample information.
 
-![Modulez Player 1.8.0 playing Josss - Robotto on Nectarine in the Radio tab](modulez-player-1.8.0.png)
+![Modulez Player 1.8.5 playing Some Chords with a mixed audio and video playlist](modulez-player-1.8.5.png)
 
 ## Local video playback (new in 1.8.5)
 
