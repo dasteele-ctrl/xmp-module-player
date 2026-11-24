@@ -1,6 +1,8 @@
-# Modulez Player 1.8.5
+# Modulez Player 1.8.6
 
-**Formerly XMP Module Player.** Version **1.8.5 — The Video Playback Update** introduces integrated local video playback, a dedicated themed video window, fullscreen viewing, shared playback controls, and mixed music/video playlists.
+**Formerly XMP Module Player.** Version **1.8.6** improves keyboard control and fullscreen viewing for local video.
+
+Version **1.8.5 — The Video Playback Update** introduces integrated local video playback, a dedicated themed video window, fullscreen viewing, shared playback controls, and mixed music/video playlists.
 
 Version **1.8.4** adds AdLib playback and export through AdPlug. Modulez now recognizes 360 additional filename extensions and aliases. You can open Art & Magic, Nintendo SPC, S98, Atari SAP, and AY Emul tracks directly from Modland.
 
@@ -28,11 +30,11 @@ Modulez Player brings classic tracker music and regular audio playback to the Li
 
 Open a local video or add it to a playlist alongside music. The video window uses the active Modulez theme. On X11 it docks to the right of the player when there is room. Drag its title bar away to detach it, or drag its upper-left corner back to the player’s upper-right corner to snap it into place. On Wayland the compositor controls window placement.
 
-The video window shares play/pause, stop, seek, and volume with the main player. Double-click the picture or press F11 to toggle fullscreen. Escape returns to the window. Video playback uses libmpv for synchronized sound and picture. Video audio bypasses the Modulez equalizer and visualizer. Source builds on Linux Mint 22 need the additional package `libmpv-dev`.
+The video window shares play/pause, stop, seek, and volume with the main player. Double-click the picture or press F11 to toggle fullscreen. Escape returns to the window. With the video window focused, Space pauses or resumes playback and the left and right arrows seek five seconds backward or forward. In fullscreen, the toolbar fades after five seconds of inactivity and reappears when you move the pointer. Video playback uses libmpv for synchronized sound and picture. Video audio bypasses the Modulez equalizer and visualizer. Source builds on Linux Mint 22 need the additional package `libmpv-dev`.
 
 ## Features
 
-Download the [1.8.5 Linux AppImage](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.8.5) or read the [1.8.4 release notes](RELEASE_NOTES_1.8.4.md).
+Download the [1.8.6 Linux AppImage](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.8.6) or read the [1.8.6 release notes](RELEASE_NOTES_1.8.6.md).
 
 See the [1.8.2 release notes](RELEASE_NOTES_1.8.2.md) for batch export settings and supported formats.
 
@@ -187,13 +189,13 @@ See [all releases](../../releases) for earlier versions.
 
 ### Running the AppImage
 
-1. Download the versioned `Modulez-Player-v1.8.5-x86_64.AppImage` file from Release v1.8.5.
+1. Download the versioned `Modulez-Player-v1.8.6-x86_64.AppImage` file from Release v1.8.6.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x Modulez-Player-v1.8.5-x86_64.AppImage
-   ./Modulez-Player-v1.8.5-x86_64.AppImage
+   chmod +x Modulez-Player-v1.8.6-x86_64.AppImage
+   ./Modulez-Player-v1.8.6-x86_64.AppImage
    ```
 
 ### Running on Windows with WSL
@@ -433,7 +435,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.8.5**
+**Current source version: 1.8.6**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and

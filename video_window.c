@@ -9,6 +9,11 @@
 struct VideoWindow {
     GtkWindow *parent;
     GtkWidget *window, *area, *layout, *fullscreen_button;
+    GtkWidget *overlay, *controls;
+    GtkEventController *motion;
+    gint64 last_activity;
+    GtkButton *play_button;
+    GtkRange *timeline;
     gboolean fullscreen, maximized;
     mpv_handle *mpv;
     mpv_render_context *renderer;
@@ -177,10 +182,53 @@ static void subtitles_off(GtkMenuItem *item, gpointer data)
     if (rc < 0) subtitle_error(v, "Could not turn subtitles off", rc);
 }
 
+static void show_controls(VideoWindow *v)
+{
+    v->last_activity = g_get_monotonic_time();
+    gtk_widget_set_opacity(v->controls, 1.0);
+    gtk_widget_show(v->controls);
+}
+
+static void pointer_moved(GtkEventControllerMotion *motion, double x, double y, gpointer data)
+{
+    VideoWindow *v = data;
+    (void)motion;
+    (void)x;
+    (void)y;
+    if (v->fullscreen)
+        show_controls(v);
+}
+
+static void place_controls(VideoWindow *v)
+{
+    /* The fullscreen toolbar floats over the picture so fading never resizes it. */
+    g_object_ref(v->controls);
+    gtk_container_remove(GTK_CONTAINER(gtk_widget_get_parent(v->controls)), v->controls);
+    if (v->fullscreen) {
+        gtk_widget_set_valign(v->controls, GTK_ALIGN_END);
+        gtk_overlay_add_overlay(GTK_OVERLAY(v->overlay), v->controls);
+    } else {
+        gtk_widget_set_valign(v->controls, GTK_ALIGN_FILL);
+        gtk_box_pack_end(GTK_BOX(v->layout), v->controls, FALSE, FALSE, 0);
+    }
+    g_object_unref(v->controls);
+    show_controls(v);
+}
+
 static gboolean tick_picture(GtkWidget *area, GdkFrameClock *clock, gpointer data)
 {
     VideoWindow *v = data;
-    (void)clock;
+    if (v->fullscreen && v->controls && gtk_widget_get_visible(v->controls)) {
+        gint64 now = gdk_frame_clock_get_frame_time(clock);
+        /* Keep the toolbar available during a slider drag or popup interaction. */
+        if (gtk_window_group_get_current_grab(gtk_window_get_group(GTK_WINDOW(v->window))))
+            v->last_activity = now;
+        gint64 fade_elapsed = now - v->last_activity - 5 * G_USEC_PER_SEC;
+        if (fade_elapsed >= 250000)
+            gtk_widget_hide(v->controls);
+        else if (fade_elapsed > 0)
+            gtk_widget_set_opacity(v->controls, 1.0 - fade_elapsed / 250000.0);
+    }
     if (mpv_render_context_update(v->renderer) & MPV_RENDER_UPDATE_FRAME)
         gtk_widget_queue_draw(area);
     return G_SOURCE_CONTINUE;
@@ -201,6 +249,8 @@ static gboolean window_state(GtkWidget *widget, GdkEventWindowState *event, gpoi
     v->maximized = (event->new_window_state & GDK_WINDOW_STATE_MAXIMIZED) != 0;
     if (event->changed_mask & GDK_WINDOW_STATE_FULLSCREEN) {
         v->fullscreen = (event->new_window_state & GDK_WINDOW_STATE_FULLSCREEN) != 0;
+        if (v->controls)
+            place_controls(v);
         if (v->fullscreen_button) {
             gtk_button_set_image(GTK_BUTTON(v->fullscreen_button), gtk_image_new_from_icon_name(
                 v->fullscreen ? "view-restore-symbolic" : "view-fullscreen-symbolic", GTK_ICON_SIZE_BUTTON));
@@ -224,6 +274,23 @@ static gboolean video_key(GtkWidget *widget, GdkEventKey *event, gpointer data)
 {
     VideoWindow *v = data;
     (void)widget;
+    if (v->fullscreen)
+        show_controls(v);
+    if (!(event->state & gtk_accelerator_get_default_mod_mask())) {
+        switch (event->keyval) {
+        case GDK_KEY_space:
+            gtk_button_clicked(v->play_button);
+            return TRUE;
+        case GDK_KEY_Left:
+        case GDK_KEY_Right:
+            if (gtk_widget_is_sensitive(GTK_WIDGET(v->timeline))) {
+                double position_ms = gtk_range_get_value(v->timeline);
+                double offset_ms = event->keyval == GDK_KEY_Left ? -5000.0 : 5000.0;
+                gtk_range_set_value(v->timeline, position_ms + offset_ms);
+            }
+            return TRUE;
+        }
+    }
     if (event->keyval != GDK_KEY_F11 && !(event->keyval == GDK_KEY_Escape && v->fullscreen))
         return FALSE;
     toggle_fullscreen(v);
@@ -255,6 +322,9 @@ void video_add_controls(VideoWindow *v, GtkButton *play, GtkButton *stop,
     gtk_box_pack_start(GTK_BOX(bar), stop_button, FALSE, FALSE, 0);
 
     GtkWidget *timeline = gtk_scale_new(GTK_ORIENTATION_HORIZONTAL, gtk_range_get_adjustment(seek));
+    v->play_button = play;
+    v->timeline = GTK_RANGE(timeline);
+    g_signal_connect(v->window, "key-press-event", G_CALLBACK(video_key), v);
     gtk_scale_set_draw_value(GTK_SCALE(timeline), FALSE);
     gtk_widget_set_tooltip_text(timeline, "Seek");
     g_object_bind_property(seek, "sensitive", timeline, "sensitive", G_BINDING_SYNC_CREATE);
@@ -283,12 +353,19 @@ void video_add_controls(VideoWindow *v, GtkButton *play, GtkButton *stop,
     g_signal_connect_swapped(v->fullscreen_button, "clicked", G_CALLBACK(toggle_fullscreen), v);
     gtk_box_pack_start(GTK_BOX(bar), v->fullscreen_button, FALSE, FALSE, 0);
     gtk_box_pack_end(GTK_BOX(v->layout), bar, FALSE, FALSE, 0);
+    v->controls = bar;
+    v->motion = gtk_event_controller_motion_new(v->window);
+    gtk_event_controller_set_propagation_phase(v->motion, GTK_PHASE_CAPTURE);
+    g_signal_connect(v->motion, "motion", G_CALLBACK(pointer_moved), v);
     gtk_widget_show_all(bar);
+    if (v->fullscreen)
+        place_controls(v);
 }
 
 void video_close(VideoWindow *v)
 {
     if (!v) return;
+    g_clear_object(&v->motion);
     if (v->parent_configure) g_signal_handler_disconnect(v->parent, v->parent_configure);
     if (v->window) gtk_widget_destroy(v->window);
     if (v->renderer) mpv_render_context_free(v->renderer);
@@ -338,10 +415,11 @@ VideoWindow *video_open(GtkWindow *parent, const char *path, int volume, GError 
     v->area = gtk_drawing_area_new();
     v->layout = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(v->window), v->layout);
-    gtk_box_pack_start(GTK_BOX(v->layout), v->area, TRUE, TRUE, 0);
+    v->overlay = gtk_overlay_new();
+    gtk_container_add(GTK_CONTAINER(v->overlay), v->area);
+    gtk_box_pack_start(GTK_BOX(v->layout), v->overlay, TRUE, TRUE, 0);
     gtk_widget_add_events(v->area, GDK_BUTTON_PRESS_MASK);
     g_signal_connect(v->area, "button-press-event", G_CALLBACK(picture_click), v);
-    g_signal_connect(v->window, "key-press-event", G_CALLBACK(video_key), v);
     g_signal_connect(v->window, "window-state-event", G_CALLBACK(window_state), v);
     g_signal_connect(v->area, "draw", G_CALLBACK(draw_picture), v);
     gtk_widget_add_tick_callback(v->area, tick_picture, v, NULL);
