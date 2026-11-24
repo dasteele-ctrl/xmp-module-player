@@ -15,8 +15,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
+#include <locale.h>
 #include <math.h>
 #include "ffmpeg_audio.h"
+#include "video_window.h"
 #include "adlib_audio.h"
 #include "sid_audio.h"
 #include "uade_audio.h"
@@ -36,7 +38,7 @@ static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event, gp
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.8.4"
+#define MODULEZ_VERSION "1.8.5"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
@@ -49,6 +51,7 @@ typedef enum {
     PLAYBACK_NONE,
     PLAYBACK_MODULE,
     PLAYBACK_FFMPEG,
+    PLAYBACK_VIDEO,
     PLAYBACK_ADLIB,
     PLAYBACK_SID,
     PLAYBACK_MIDI,
@@ -146,6 +149,7 @@ static unsigned int audio_ring_write_pos;
 static SDL_Thread *decoder_thread;
 static SDL_atomic_t decoder_stop;
 static FfmpegAudio *ffmpeg_audio;
+static VideoWindow *video;
 static AdlibAudio *adlib_audio;
 /* Radio worker owns its FFmpeg context. Shared text is protected by a mutex. */
 static GMutex radio_mutex;
@@ -563,6 +567,7 @@ static int radio_worker(void *unused)
 
 static void stop_ffmpeg_decoder(void)
 {
+    g_clear_pointer(&video, video_close);
     if (audio_device) close_pattern_preview();
     pattern_choices_dirty = TRUE;
     /* Stop shared PCM playback before joining and freeing any renderer. */
@@ -872,6 +877,7 @@ static void on_volume_changed(GtkRange *range, gpointer user_data)
     if (audio_device) SDL_LockAudioDevice(audio_device);
     master_volume = volume;
     if (audio_device) SDL_UnlockAudioDevice(audio_device);
+    if (video) video_volume(video, volume);
 }
 
 static void update_play_button(void)
@@ -1219,10 +1225,35 @@ static int open_file_audio(const char *filename)
 
     SDL_UnlockAudioDevice(audio_device);
 
+    int has_video = 0;
     if (adlib_is_path(filename) || adlib_is_fm_s3m(filename))
         adlib_audio = adlib_audio_open(filename);
     if (!adlib_audio)
-        ffmpeg_audio = ffmpeg_audio_open(filename, error_text, sizeof(error_text));
+        ffmpeg_audio = ffmpeg_open_playback(filename, &has_video, error_text, sizeof(error_text));
+    if (has_video) {
+        GError *error = NULL;
+        video = video_open(GTK_WINDOW(window), filename, master_volume, &error);
+        if (!video) {
+            set_status(error->message);
+            g_error_free(error);
+            update_play_button();
+            return 0;
+        }
+        video_add_controls(video, GTK_BUTTON(play_button), GTK_BUTTON(stop_button),
+                           GTK_RANGE(seek_scale), GTK_RANGE(volume_scale));
+        playback_mode = PLAYBACK_VIDEO;
+        g_strlcpy(current_file, filename, sizeof(current_file));
+        g_autofree char *name = g_filename_display_basename(filename);
+        gtk_label_set_text(GTK_LABEL(title_label), name);
+        gtk_label_set_text(GTK_LABEL(format_label), "Video");
+        gtk_label_set_text(GTK_LABEL(channels_label), "");
+        gtk_label_set_text(GTK_LABEL(details_label), filename);
+        gtk_label_set_text(GTK_LABEL(time_label), "00:00");
+        gtk_widget_set_sensitive(seek_scale, FALSE);
+        update_play_button();
+        return 1;
+    }
+
     if (!ffmpeg_audio && !adlib_audio) {
         set_status(error_text[0] ? error_text : "Unsupported audio file.");
         gtk_label_set_text(GTK_LABEL(title_label), "Unable to open audio");
@@ -3709,7 +3740,7 @@ static void on_open(GtkButton *button, gpointer data)
     restore_last_folder(dialog);
 
     GtkFileFilter *filter = gtk_file_filter_new();
-    gtk_file_filter_set_name(filter, "Audio and tracker files");
+    gtk_file_filter_set_name(filter, "Audio, video and tracker files");
 
     const char *patterns[] = {
         "*.mod", "*.MOD", "*.xm", "*.XM", "*.it", "*.IT",
@@ -3730,6 +3761,7 @@ static void on_open(GtkButton *button, gpointer data)
     for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
         gtk_file_filter_add_pattern(filter, patterns[i]);
 
+    video_add_patterns(filter);
     adlib_add_file_patterns(filter);
     uade_add_file_patterns(filter);
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
@@ -4184,6 +4216,20 @@ static void on_play(GtkButton *button, gpointer data)
         return;
     }
 
+    if (playback_mode == PLAYBACK_VIDEO) {
+        if (!video) {
+            char filename[sizeof(current_file)];
+            g_strlcpy(filename, current_file, sizeof(filename));
+            if (!open_file_audio(filename) || !video) return;
+        }
+        playing = !playing;
+        stopped = audio_ended = 0;
+        video_pause(video, !playing);
+        set_status(playing ? "Playing video" : "Paused");
+        update_play_button();
+        return;
+    }
+
     if (file_audio_mode() &&
         (stopped || audio_ended || (!ffmpeg_audio && !adlib_audio))) {
         char filename[sizeof(current_file)];
@@ -4308,7 +4354,7 @@ static void on_stop(GtkButton *button, gpointer data)
         xmp_stop_module(ctx);
         SDL_UnlockAudioDevice(audio_device);
     } else if (playback_mode == PLAYBACK_RADIO ||
-               file_audio_mode() ||
+               playback_mode == PLAYBACK_VIDEO || file_audio_mode() ||
                playback_mode == PLAYBACK_ZX ||
                playback_mode == PLAYBACK_UADE) {
         stop_ffmpeg_decoder();
@@ -4359,6 +4405,10 @@ static void on_seek(GtkRange *range, gpointer data)
 
     close_pattern_preview();
     int ms = (int)gtk_range_get_value(range);
+    if (playback_mode == PLAYBACK_VIDEO) {
+        if (video) video_seek(video, ms / 1000.0);
+        return;
+    }
 
     if (playback_mode == PLAYBACK_UADE) {
         /* Stop destroys the state. Reopen it before queueing a seek. */
@@ -4939,6 +4989,13 @@ static void play_playlist_file(const char *filename)
     if (!filename || !*filename)
         return;
 
+    if (video_filename(filename)) {
+        zx_cancel_pending();
+        zx_remove_active();
+        if (open_file_audio(filename)) on_play(NULL, NULL);
+        return;
+    }
+
     if (is_midi_path(filename)) {
         if (open_midi(filename))
             on_play(NULL, NULL);
@@ -5131,7 +5188,7 @@ static void on_playlist_add(GtkButton *button, gpointer data)
     gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(dialog), TRUE);
 
     GtkFileFilter *filter = gtk_file_filter_new();
-    gtk_file_filter_set_name(filter, "Audio and tracker files");
+    gtk_file_filter_set_name(filter, "Audio, video and tracker files");
 
     const char *patterns[] = {
         "*.mod", "*.MOD", "*.xm", "*.XM", "*.it", "*.IT",
@@ -5152,6 +5209,7 @@ static void on_playlist_add(GtkButton *button, gpointer data)
     for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
         gtk_file_filter_add_pattern(filter, patterns[i]);
 
+    video_add_patterns(filter);
     adlib_add_file_patterns(filter);
     uade_add_file_patterns(filter);
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
@@ -5196,7 +5254,7 @@ static gboolean playlist_is_audio_filename(const gchar *filename)
         ".psg", ".asc"
     };
 
-    if (zx_is_music_path(filename) || adlib_is_path(filename) || uade_is_music_name(filename))
+    if (video_filename(filename) || zx_is_music_path(filename) || adlib_is_path(filename) || uade_is_music_name(filename))
         return TRUE;
     const gchar *dot = strrchr(filename, '.');
     if (!dot)
@@ -5501,6 +5559,49 @@ static void on_batch_export(GtkWidget *widget, gpointer data)
     gtk_widget_show_all(job->dialog);
 }
 #endif
+
+static void move_playlist_selection(GtkButton *button, gpointer data)
+{
+    (void)button;
+    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view));
+    GList *rows = gtk_tree_selection_get_selected_rows(selection, NULL);
+    if (!rows) return;
+
+    GtkTreeModel *visible = GTK_TREE_MODEL(playlist_filter);
+    int count = gtk_tree_model_iter_n_children(visible, NULL);
+    int total = gtk_tree_model_iter_n_children(GTK_TREE_MODEL(playlist_store), NULL);
+    g_autofree int *order = g_new(int, total);
+    g_autofree int *slots = g_new(int, count);
+    g_autofree gboolean *selected = g_new0(gboolean, count);
+    for (int i = 0; i < total; i++) order[i] = i;
+    for (GList *item = rows; item; item = item->next)
+        selected[gtk_tree_path_get_indices(item->data)[0]] = TRUE;
+    g_list_free_full(rows, (GDestroyNotify)gtk_tree_path_free);
+
+    /* Leave hidden rows in their original slots while a search is active. */
+    for (int i = 0; i < count; i++) {
+        GtkTreePath *path = gtk_tree_path_new_from_indices(i, -1);
+        GtkTreePath *child = gtk_tree_model_filter_convert_path_to_child_path(playlist_filter, path);
+        slots[i] = gtk_tree_path_get_indices(child)[0];
+        gtk_tree_path_free(child);
+        gtk_tree_path_free(path);
+    }
+
+    int direction = GPOINTER_TO_INT(data);
+    int start = direction < 0 ? 1 : count - 2;
+    gboolean moved = FALSE;
+    for (int i = start; i >= 0 && i < count; i -= direction) {
+        int neighbor = i + direction;
+        if (!selected[i] || selected[neighbor]) continue;
+        int old = order[slots[i]];
+        order[slots[i]] = order[slots[neighbor]];
+        order[slots[neighbor]] = old;
+        selected[i] = FALSE;
+        selected[neighbor] = TRUE;
+        moved = TRUE;
+    }
+    if (moved) gtk_list_store_reorder(playlist_store, order);
+}
 
 static void on_playlist_remove(GtkButton *button, gpointer data)
 {
@@ -6056,6 +6157,33 @@ static gboolean update_display(gpointer data)
     int is_playing;
     int current;
     int total;
+
+    if (playback_mode == PLAYBACK_VIDEO) {
+        if (!video) return G_SOURCE_CONTINUE;
+        double seconds = 0, duration = 0;
+        const char *error = NULL;
+        if (video_position(video, &seconds, &duration, &error)) {
+            playing = 0;
+            audio_ended = 1;
+            g_clear_pointer(&video, video_close);
+            if (error) set_status(error);
+            else if (playlist_advance()) return G_SOURCE_CONTINUE;
+            else set_status("Playback finished");
+            update_play_button();
+        } else {
+            int pos = (int)seconds, length = (int)duration;
+            char label[64];
+            g_snprintf(label, sizeof(label), "%02d:%02d / %02d:%02d",
+                       pos / 60, pos % 60, length / 60, length % 60);
+            gtk_label_set_text(GTK_LABEL(time_label), label);
+            updating_seek = 1;
+            gtk_range_set_range(GTK_RANGE(seek_scale), 0, MAX(1, duration * 1000));
+            gtk_range_set_value(GTK_RANGE(seek_scale), seconds * 1000);
+            updating_seek = 0;
+            gtk_widget_set_sensitive(seek_scale, duration > 0);
+        }
+        return G_SOURCE_CONTINUE;
+    }
 
     if (playback_mode == PLAYBACK_RADIO) {
         SDL_LockAudioDevice(audio_device);
@@ -8142,14 +8270,14 @@ static int create_player(void)
     GtkWidget *file_spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_size_request(file_spacer, 12, -1);
     gtk_box_pack_start(GTK_BOX(file_controls), file_spacer, FALSE, FALSE, 0);
-    GtkWidget *volume_label = gtk_label_new("Volume");
-    gtk_box_pack_start(GTK_BOX(file_controls), volume_label, FALSE, FALSE, 0);
     volume_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 100, 1);
     gtk_scale_set_draw_value(GTK_SCALE(volume_scale), TRUE);
     gtk_scale_set_value_pos(GTK_SCALE(volume_scale), GTK_POS_RIGHT);
     gtk_widget_set_size_request(volume_scale, compact_ui ? 100 : 140, -1);
     gtk_range_set_value(GTK_RANGE(volume_scale), master_volume);
     g_signal_connect(volume_scale, "value-changed", G_CALLBACK(on_volume_changed), NULL);
+    gtk_widget_set_tooltip_text(volume_scale, "Volume");
+    gtk_box_pack_start(GTK_BOX(file_controls), player_mute_button_new(GTK_RANGE(volume_scale)), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(file_controls), volume_scale, TRUE, TRUE, 0);
 
     GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
@@ -8204,6 +8332,16 @@ static int create_player(void)
         FALSE, FALSE, 0);
     GtkWidget *playlist_actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_box_pack_start(GTK_BOX(outer), playlist_actions, FALSE, FALSE, 0);
+    for (int direction = -1; direction <= 1; direction += 2) {
+        const char *label = direction < 0 ? "Move up" : "Move down";
+        GtkWidget *move = gtk_button_new_from_icon_name(
+            direction < 0 ? "go-up-symbolic" : "go-down-symbolic", GTK_ICON_SIZE_BUTTON);
+        gtk_widget_set_tooltip_text(move, label);
+        atk_object_set_name(gtk_widget_get_accessible(move), label);
+        g_signal_connect(move, "clicked", G_CALLBACK(move_playlist_selection),
+                         GINT_TO_POINTER(direction));
+        gtk_box_pack_start(GTK_BOX(playlist_actions), move, FALSE, FALSE, 0);
+    }
     gtk_box_pack_start(GTK_BOX(playlist_actions),
         make_button("Remove", G_CALLBACK(on_playlist_remove)),
         FALSE, FALSE, 0);
@@ -9083,6 +9221,8 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
     g_set_application_name("Modulez Player");
     gtk_init(&argc, &argv);
+    /* GTK adopts the desktop locale. libmpv requires C numeric formatting. */
+    setlocale(LC_NUMERIC, "C");
 
     GApplication *app = g_application_new("org.modulez.Player",
                                           G_APPLICATION_HANDLES_COMMAND_LINE);

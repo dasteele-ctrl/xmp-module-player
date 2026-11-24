@@ -257,9 +257,10 @@ static int produce_pcm(FfmpegAudio *audio)
 
 static FfmpegAudio *open_input(const char *filename, int live_stream,
                                FfmpegAudioInterrupt interrupt, void *opaque,
-                               char *error_text,
+                               int *has_video, char *error_text,
                                unsigned long error_text_size)
 {
+    if (has_video) *has_video = 0;
     FfmpegAudio *audio = calloc(1, sizeof(*audio));
     if (!audio) {
         set_error(error_text, error_text_size, "Out of memory");
@@ -297,6 +298,18 @@ static FfmpegAudio *open_input(const char *filename, int live_stream,
                      "Cannot read media information", result);
         ffmpeg_audio_close(audio);
         return NULL;
+    }
+
+    if (has_video) {
+        for (unsigned i = 0; i < audio->format->nb_streams; ++i) {
+            AVStream *stream = audio->format->streams[i];
+            if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                !(stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+                *has_video = 1;
+                ffmpeg_audio_close(audio);
+                return NULL;
+            }
+        }
     }
 
     result = av_find_best_stream(audio->format, AVMEDIA_TYPE_AUDIO,
@@ -370,7 +383,13 @@ static FfmpegAudio *open_input(const char *filename, int live_stream,
 FfmpegAudio *ffmpeg_audio_open(const char *filename, char *error_text,
                                unsigned long error_text_size)
 {
-    return open_input(filename, 0, NULL, NULL, error_text, error_text_size);
+    return open_input(filename, 0, NULL, NULL, NULL, error_text, error_text_size);
+}
+
+FfmpegAudio *ffmpeg_open_playback(const char *filename, int *has_video,
+                                  char *error_text, unsigned long error_text_size)
+{
+    return open_input(filename, 0, NULL, NULL, has_video, error_text, error_text_size);
 }
 
 FfmpegAudio *ffmpeg_audio_open_stream(const char *url,
@@ -382,7 +401,7 @@ FfmpegAudio *ffmpeg_audio_open_stream(const char *url,
         set_error(error_text, error_text_size, "Expected an HTTP or HTTPS radio URL");
         return NULL;
     }
-    return open_input(url, 1, interrupt, opaque, error_text, error_text_size);
+    return open_input(url, 1, interrupt, opaque, NULL, error_text, error_text_size);
 }
 
 void ffmpeg_audio_stream_title(FfmpegAudio *audio, char *title,

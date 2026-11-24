@@ -22,6 +22,12 @@ Modulez Player brings classic tracker music and regular audio playback to the Li
 
 ![Modulez Player 1.8.0 playing Josss - Robotto on Nectarine in the Radio tab](modulez-player-1.8.0.png)
 
+## Local video playback (development branch)
+
+Open a local video or add it to a playlist alongside music. The video window uses the active Modulez theme. On X11 it docks to the right of the player when there is room. Drag its title bar away to detach it, or drag its upper-left corner back to the player’s upper-right corner to snap it into place. On Wayland the compositor controls window placement.
+
+The video window shares play/pause, stop, seek, and volume with the main player. Double-click the picture or press F11 to toggle fullscreen. Escape returns to the window. Video playback uses libmpv for synchronized sound and picture. Video audio bypasses the Modulez equalizer and visualizer. Source builds on Linux Mint 22 need the additional package `libmpv-dev`.
+
 ## Features
 
 Download the [1.8.4 Linux AppImage](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.8.4) or read the [1.8.4 release notes](RELEASE_NOTES_1.8.4.md).
