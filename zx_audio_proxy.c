@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -60,7 +61,7 @@ static int write_exact(int fd, const void *data, size_t bytes)
     return 1;
 }
 
-static int helper_path(char *output, size_t output_size)
+static int helper_path(char *output, size_t output_size, const char *helper)
 {
     char executable[PATH_MAX];
     ssize_t length = readlink("/proc/self/exe", executable,
@@ -70,7 +71,7 @@ static int helper_path(char *output, size_t output_size)
     char *slash = strrchr(executable, '/');
     if (!slash) return 0;
     slash[1] = '\0';
-    int n = snprintf(output, output_size, "%sxmp-zx-helper", executable);
+    int n = snprintf(output, output_size, "%s%s", executable, helper);
     return n > 0 && (size_t)n < output_size;
 }
 
@@ -107,12 +108,14 @@ void zx_audio_close(ZxAudio *audio)
 ZxAudio *zx_audio_open(const char *filename, char *error,
                        unsigned long error_size)
 {
-    copy_error(error, error_size, "Could not start the ZXTune helper");
+    copy_error(error, error_size, "Could not start the audio helper");
     if (!filename || !*filename || strlen(filename) >= ZX_MAX_FILENAME_BYTES)
         return NULL;
 
     char executable[PATH_MAX];
-    if (!helper_path(executable, sizeof(executable))) return NULL;
+    const char *ext = strrchr(filename, '.');
+    const char *helper = ext && !strcasecmp(ext, ".rmf") ? "modulez-rmf-helper" : "xmp-zx-helper";
+    if (!helper_path(executable, sizeof(executable), helper)) return NULL;
 
     int channel[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, channel) < 0) return NULL;
@@ -154,14 +157,14 @@ ZxAudio *zx_audio_open(const char *filename, char *error,
         !read_exact(audio->fd, &response, sizeof(response)) ||
         !read_exact(audio->fd, helper_error, sizeof(helper_error))) {
         copy_error(error, error_size,
-                   "ZXTune helper did not respond; check that xmp-zx-helper is beside modulez-player");
+                   "Audio helper did not respond; check that the decoder is beside modulez-player");
         zx_audio_close(audio);
         return NULL;
     }
     helper_error[sizeof(helper_error) - 1] = '\0';
     if (response.result != 1) {
         copy_error(error, error_size,
-                   helper_error[0] ? helper_error : "ZXTune rejected this module");
+                   helper_error[0] ? helper_error : "Decoder rejected this file");
         zx_audio_close(audio);
         return NULL;
     }

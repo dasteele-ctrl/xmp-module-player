@@ -1,4 +1,11 @@
-# Modulez Player 1.8.6
+# Modulez Player 1.8.7
+
+**The RMF Update** adds direct Beatnik RMF playback with the Beatnik Standard
+v1.1.1 Uncompressed bank. Browse WebTV and SoundMusicSys tracks, or open a
+Headspace album to play a song, queue it, or save its ZIP to Downloads.
+
+[Download the 1.8.7 Linux AppImage](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.8.7/Modulez-Player-v1.8.7-x86_64.AppImage)
+
 
 **Formerly XMP Module Player.** Version **1.8.6** improves keyboard control and fullscreen viewing for local video.
 
@@ -355,6 +362,14 @@ libbencodetools are required; development and testing used **UADE 3.05**.
 See [UADE integration notes](UADE_INTEGRATION.md) for runtime overrides
 and diagnostic commands.
 
+### Beatnik RMF playback
+
+Open a local `.rmf` song, add it to a playlist, or import its folder. NeoBAE
+renders stereo audio directly using the bundled Beatnik Standard v1.1.1 Uncompressed bank. To use
+your own Beatnik bank, set `MODULEZ_RMF_BANK` to its full path before launching.
+The default Linux build uses Git and CMake to build the pinned engine on the
+first build. The AppImage includes the decoder and runs offline.
+
 ### 10-Band Equalizer (introduced in version 1.3)
 
 The integrated **Equalizer** tab provides ten adjustable bands (31 Hz to
@@ -435,7 +450,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.8.6**
+**Current source version: 1.8.7**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and

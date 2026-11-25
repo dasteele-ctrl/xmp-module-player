@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Modulez Player v1.8.6 AppImage: WebKit runtime, bundled visualizer assets, UADE and SoundFont.
+# Modulez Player v1.8.7 AppImage: WebKit runtime, bundled visualizer assets, UADE and SoundFont.
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,8 +13,8 @@ if [[ ! -x "$project_dir/modulez-player" ]]; then
     echo "Missing modulez-player. Build the native player with: make -j4" >&2
     exit 1
 fi
-if ! grep -aFq 'Modulez Player 1.8.6' "$project_dir/modulez-player"; then
-    echo "The compiled player does not report version 1.8.6. Run make -j4 modulez-player first." >&2
+if ! grep -aFq 'Modulez Player 1.8.7' "$project_dir/modulez-player"; then
+    echo "The compiled player does not report version 1.8.7. Run make -j4 modulez-player first." >&2
     exit 1
 fi
 if [[ ! -x "$project_dir/xmp-zx-helper" ]]; then
@@ -132,7 +132,7 @@ fi
 mkdir -p -- "$dist_dir"
 build_root="$(mktemp -d /tmp/xmp-appimage.XXXXXXXX)"
 appdir="$build_root/Modulez_Player.AppDir"
-output_name="Modulez-Player-v1.8.6-x86_64.AppImage"
+output_name="Modulez-Player-v1.8.7-x86_64.AppImage"
 
 cleanup() {
     if [[ -n "${build_root:-}" && -d "$build_root" &&
@@ -152,6 +152,7 @@ fi
     LDAI_OUTPUT="$output_name" "$linuxdeploy" \
         --appdir "$appdir" \
         --executable "$project_dir/modulez-player" \
+        --executable "$project_dir/modulez-rmf-helper" \
         --executable "$project_dir/xmp-zx-helper" \
         --executable "$uade_core" \
         --library "$pipewire_library" \
@@ -201,6 +202,9 @@ for data_dir in /usr/share/webkitgtk-4.1 /usr/share/webkit2gtk-4.1; do
     if [[ -d "$data_dir" ]]; then mkdir -p -- "$appdir${data_dir%/*}"; cp -aL -- "$data_dir" "$appdir${data_dir%/*}/"; fi
 done
 python3 "$script_dir/relocate-webkit.py" "$appdir" --source-dir "$webkit_helper_dir"
+for notice in LICENSE LICENSE.BSD NOTICE; do
+    install -Dm644 "$project_dir/build/rmf/NeoBAE/$notice" "$appdir/usr/share/doc/neobae/$notice"
+done
 install -D -m 0644 /dev/null "$appdir/usr/share/modulez-player/webkit-helper-dir"
 printf '%s\n' "$webkit_helper_dir" > "$appdir/usr/share/modulez-player/webkit-helper-dir"
 [[ -e "$appdir/AppRun" ]] || { echo "linuxdeploy did not create AppRun" >&2; exit 1; }
@@ -217,7 +221,7 @@ done
 verify_bundle() {
     local bundle="$1"
     local asset library
-    for asset in usr/bin/modulez-player usr/bin/xmp-zx-helper usr/bin/uadecore \
+    for asset in usr/bin/modulez-rmf-helper usr/bin/modulez-player usr/bin/xmp-zx-helper usr/bin/uadecore \
         usr/share/applications/modulez-player.desktop \
         usr/share/uade/score usr/share/uade/uaerc usr/share/uade/uade.conf \
         usr/share/uade/eagleplayer.conf; do

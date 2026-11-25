@@ -30,7 +30,7 @@ xmp-export-test: $(EXPORT_TEST_OBJECTS) xmp-zx-helper Makefile
 	$(CXX) -o $@ $(EXPORT_TEST_OBJECTS) $(LDLIBS) -ldl -lpthread -lz
 
 main_export.o: main.c video_window.h about_tribute.h player_config.h uade_audio.h adlib_audio.h ffmpeg_audio.h sid_audio.h midi_audio.h equalizer.h zx_audio.h batch_export.h export_encoder.h export_wav.h xmp_irc_widget.h tray_icon.h visualizer.h visualizer_pcm.h
-	$(CC) $(CFLAGS) -DENABLE_ZXTUNE_NATIVE -DENABLE_WAV_EXPORT -c -o $@ main.c
+	$(CC) $(CFLAGS) -DENABLE_RMF -DENABLE_ZXTUNE_NATIVE -DENABLE_WAV_EXPORT -c -o $@ main.c
 
 export_encoder.o: export_encoder.c export_encoder.h
 	$(CC) $(CFLAGS) -c -o $@ export_encoder.c
@@ -111,7 +111,7 @@ xmp-resources.c: xmp.gresource.xml icons/modulez-player.png
 	glib-compile-resources --generate-source --target=$@ $<
 
 clean:
-	rm -f about_tribute.o modulez-player xmp-uade-test xmp-linux xmp-zx-native xmp-zx-wav xmp-zx-sid-test xmp-zx-isolated-test xmp-zx-helper xmp-export-test main_export.o export_encoder.o batch_export.o export_wav.o main_zx_native.o zx_audio.o zx_audio_proxy.o zx_helper.o hvsc_download.o player_config.o main.o xmp-resources.o ffmpeg_audio.o midi_audio.o uade_audio.o equalizer.o sid_audio.o sid_audio_zx.o tray_icon.o xmp-resources.c $(IRC_OBJECTS) $(VIS_OBJECTS) visualizer-resources.c
+	rm -f rmf_audio.o rmf_bank.o modulez-rmf-helper about_tribute.o modulez-player xmp-uade-test xmp-linux xmp-zx-native xmp-zx-wav xmp-zx-sid-test xmp-zx-isolated-test xmp-zx-helper xmp-export-test main_export.o export_encoder.o batch_export.o export_wav.o main_zx_native.o zx_audio.o zx_audio_proxy.o zx_helper.o hvsc_download.o player_config.o main.o xmp-resources.o ffmpeg_audio.o midi_audio.o uade_audio.o equalizer.o sid_audio.o sid_audio_zx.o tray_icon.o xmp-resources.c $(IRC_OBJECTS) $(VIS_OBJECTS) visualizer-resources.c
 
 .PHONY: all clean
 
@@ -191,3 +191,19 @@ check-about-tribute:
 		-o /tmp/modulez-check-about-tribute test_about_tribute.c \
 		$(shell pkg-config --libs gtk+-3.0) -lm
 	/tmp/modulez-check-about-tribute
+
+RMF_ENGINE = build/rmf/obj/libneobae.a
+RMF_SRC = build/rmf/NeoBAE/neobae/src
+$(RMF_ENGINE): packaging/rmf/build-engine.sh
+	packaging/rmf/build-engine.sh
+rmf_audio.o: rmf_audio.c zx_audio.h $(RMF_ENGINE)
+	$(CC) -O2 -DX_PLATFORM=X_DUMMY -I$(RMF_SRC)/BAE_Source/Common -I$(RMF_SRC)/BAE_Source/Platform -c -o $@ $<
+rmf_bank.o: rmf_bank.S $(RMF_ENGINE)
+	$(CC) -Wa,-I$(RMF_SRC)/banks/patches111 -c -o $@ $<
+modulez-rmf-helper: zx_helper.o rmf_audio.o rmf_bank.o $(RMF_ENGINE)
+	$(CXX) -o $@ $^ -lm -lpthread
+modulez-player xmp-linux xmp-zx-isolated-test xmp-export-test: modulez-rmf-helper
+
+# Headspace album ZIP support
+LDLIBS += -larchive
+main_export.o main_zx_native.o main.o: headspace_browser.h
