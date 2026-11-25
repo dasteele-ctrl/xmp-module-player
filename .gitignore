@@ -19,3 +19,6 @@ xmp-linux
 # Generated embedded visualization assets
 /visualizer-resources.c
 __pycache__/
+
+/build/rmf/
+/modulez-rmf-helper
