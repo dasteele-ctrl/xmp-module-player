@@ -16,3 +16,9 @@ The listener starts on the address you select, on TCP port 48788. Pairing codes 
 Build the Linux player with the repository’s normal `make` command and its v1.8.8 development dependencies. To package it with the matching release runtime, run `remote/package-linux.sh /path/to/Modulez-Player-v1.8.8-x86_64.AppImage` on a compatible x86_64 Mint build host with squashfs-tools, binutils, Python 3 and glib-networking installed. The preview uses its own GApplication ID and player configuration directory. Its AppImage omits release update metadata.
 
 With JDK 17 or later, Android SDK Platform 35, and Android Build Tools 35.0.0, set `ANDROID_HOME` and run `remote/android/build.sh`. The resulting test APK and local test keystore appear under `remote/android/build/`. Reuse the same test keystore when installing updates over an earlier APK from your own build.
+
+### Preview 2
+
+On Android, **Radio stations** opens the Dell preview’s built-in retro stations, favorites, custom stations and currently loaded World Radio results. Tap a station to start it on the Dell. The launcher uses the Modulez Player artwork.
+
+Enter **Fullscreen Vis** to see a track caption in the lower-left corner. It appears again on a track change, stays for four seconds and fades out. It uses the displayed title as a fallback, local audio title and artist tags when available, and SID author metadata. Radio streams can supply live titles.

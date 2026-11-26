@@ -148,13 +148,41 @@ public class RemoteActivity extends Activity {
                 public void onStopTrackingTouch(SeekBar bar) { dragging=false; refresh("/volume",bar.getProgress()); }
                 public void onProgressChanged(SeekBar bar,int n,boolean user) { volumeText.setText("Dell volume  " + n + "%"); }
             });
-            label(root,"Playlist",20); ListView list = new ListView(this);
+            LinearLayout browse = new LinearLayout(this);
+            browse.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            root.addView(browse);
+            label(browse,"Playlist",20).setLayoutParams(new LinearLayout.LayoutParams(0,-2,1));
+            button(browse,"Radio stations",this::chooseStation);
+            ListView list = new ListView(this);
             root.addView(list,new LinearLayout.LayoutParams(-1,0,1));
             tracks = new ArrayAdapter<>(this,android.R.layout.simple_list_item_1,new ArrayList<>());
             list.setAdapter(tracks); list.setOnItemClickListener((a,v,i,id) -> refresh("/select",i));
             status = label(root,"Connecting to " + session.host,14);
             button(root,"Forget Dell",this::forget);
         }
+    }
+    private void chooseStation() {
+        final Session target=session;
+        worker.execute(() -> {
+            try {
+                JSONArray list=call(target,"/stations","GET",null,-1,-1).getJSONArray("stations");
+                String[] names=new String[list.length()], ids=new String[list.length()];
+                for (int i=0;i<names.length;i++) {
+                    JSONObject station=list.getJSONObject(i);
+                    names[i]=station.getString("group")+"  ·  "+station.getString("name");
+                    ids[i]=station.getString("id");
+                }
+                ui.post(() -> {
+                    if (!foreground || session!=target || isDestroyed()) return;
+                    new android.app.AlertDialog.Builder(this).setTitle("Radio stations")
+                        .setItems(names,(dialog,index) -> refresh("/station/"+ids[index],-1))
+                        .setNegativeButton("Close",null).show();
+                });
+            } catch (Exception ex) { ui.post(() -> {
+                if (foreground && session==target && !isDestroyed())
+                    Toast.makeText(this,"Couldn’t load stations. "+message(ex),Toast.LENGTH_LONG).show();
+            }); }
+        });
     }
     private void forget() {
         ui.removeCallbacks(poll); session=null; revision=-1; busy=false;

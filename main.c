@@ -149,6 +149,7 @@ static unsigned int audio_ring_write_pos;
 static SDL_Thread *decoder_thread;
 static SDL_atomic_t decoder_stop;
 static FfmpegAudio *ffmpeg_audio;
+static gchar *file_tag_title, *file_tag_artist;
 static VideoWindow *video;
 static AdlibAudio *adlib_audio;
 /* Radio worker owns its FFmpeg context. Shared text is protected by a mutex. */
@@ -1280,6 +1281,11 @@ static int open_file_audio(const char *filename)
     SDL_AtomicSet(&ffmpeg_decode_finished, 0);
     SDL_AtomicSet(&ffmpeg_decode_error, 0);
 
+    /* Copy tags before ownership of the FFmpeg context passes to the decoder. */
+    g_free(file_tag_title);
+    g_free(file_tag_artist);
+    file_tag_title = ffmpeg_audio ? g_strdup(ffmpeg_audio_tag(ffmpeg_audio, "title")) : NULL;
+    file_tag_artist = ffmpeg_audio ? g_strdup(ffmpeg_audio_tag(ffmpeg_audio, "artist")) : NULL;
     decoder_thread = SDL_CreateThread(decoder_thread_fn,
                                       "ffmpeg-decoder", NULL);
     if (!decoder_thread) {
@@ -6163,6 +6169,19 @@ static void update_pattern_browser(void)
 static gboolean update_display(gpointer data)
 {
     (void)data;
+
+    if (modulez_visualizer_is_fullscreen()) {
+        const char *title = playback_mode == PLAYBACK_NONE ? NULL : gtk_label_get_text(GTK_LABEL(title_label));
+        const char *artist = NULL;
+        if (playback_mode == PLAYBACK_FFMPEG) {
+            if (file_tag_title && *file_tag_title) title = file_tag_title;
+            artist = file_tag_artist;
+        } else if (playback_mode == PLAYBACK_SID && sid_audio) {
+            artist = sid_audio_author(sid_audio);
+        }
+        modulez_visualizer_show_track(playback_mode == PLAYBACK_RADIO ? radio_url : current_file,
+                                      title, artist);
+    }
 
     update_pattern_browser();
     if (preview_button_active) {

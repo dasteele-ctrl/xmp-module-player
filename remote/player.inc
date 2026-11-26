@@ -40,6 +40,51 @@ static void remote_json(SoupServerMessage *msg, JsonNode *node)
     json_node_unref(node);
 }
 
+/* Generate identifiers on the Dell. Only an entry currently in its station
+ * catalog can be played, even if a saved list changed after the phone read it. */
+static gboolean remote_station(JsonArray *rows, const char *wanted, const char *group,
+                               const char *key, const char *name)
+{
+    if (!key || !*key || !name || !*name) return FALSE;
+    g_autofree gchar *identity = g_strconcat(group, "/", key, NULL);
+    g_autofree gchar *id = g_compute_checksum_for_string(G_CHECKSUM_SHA256, identity, -1);
+    if (rows) {
+        JsonObject *row = json_object_new();
+        json_object_set_string_member(row, "id", id);
+        json_object_set_string_member(row, "name", name);
+        json_object_set_string_member(row, "group", group);
+        json_array_add_object_element(rows, row);
+    }
+    return g_strcmp0(wanted, id) == 0;
+}
+
+static gboolean remote_station_catalog(JsonArray *rows, const char *wanted)
+{
+    for (guint i = 0; i < G_N_ELEMENTS(radio_stations); ++i) {
+        if (remote_station(rows, wanted, "Retro", radio_stations[i].url, radio_stations[i].name)) {
+            start_radio_station(i);
+            return TRUE;
+        }
+    }
+    GtkListStore *stores[] = {saved_stores[0], saved_stores[1], world_store};
+    const char *groups[] = {"Favorites", "Custom", "World radio"};
+    for (guint i = 0; i < G_N_ELEMENTS(stores); i++) {
+        if (!stores[i]) continue;
+        GtkTreeModel *model = GTK_TREE_MODEL(stores[i]);
+        GtkTreeIter iter;
+        for (gboolean more = gtk_tree_model_get_iter_first(model, &iter); more;
+             more = gtk_tree_model_iter_next(model, &iter)) {
+            g_autofree gchar *uuid = NULL, *name = NULL;
+            gtk_tree_model_get(model, &iter, WORLD_UUID, &uuid, WORLD_NAME, &name, -1);
+            if (remote_station(rows, wanted, groups[i], uuid, name)) {
+                saved_play_iter(model, &iter);
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
 static void remote_request(SoupServer *server, SoupServerMessage *msg,
                            const char *path, GHashTable *query, gpointer data)
 {
@@ -72,6 +117,21 @@ static void remote_request(SoupServer *server, SoupServerMessage *msg,
     }
     if (!remote_token[0] || g_strcmp0(soup_message_headers_get_one(headers, "X-Remote-Token"), remote_token)) {
         soup_server_message_set_status(msg, 401, NULL);
+        return;
+    }
+    if (!strcmp(method, "GET") && !strcmp(path, "/stations")) {
+        JsonArray *rows = json_array_new();
+        remote_station_catalog(rows, NULL);
+        JsonObject *obj = json_object_new();
+        json_object_set_array_member(obj, "stations", rows);
+        JsonNode *reply = json_node_new(JSON_NODE_OBJECT);
+        json_node_take_object(reply, obj);
+        remote_json(msg, reply);
+        return;
+    }
+    if (!strcmp(method, "POST") && g_str_has_prefix(path, "/station/")) {
+        gboolean found = remote_station_catalog(NULL, path + strlen("/station/"));
+        soup_server_message_set_status(msg, found ? 204 : 404, NULL);
         return;
     }
     if (!strcmp(method, "GET") && !strcmp(path, "/state")) {

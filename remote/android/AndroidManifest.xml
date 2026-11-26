@@ -1,8 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="org.modulez.remote.preview" android:versionCode="1" android:versionName="1.8.8-preview1">
+    package="org.modulez.remote.preview" android:versionCode="2" android:versionName="1.8.8-preview2">
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="35"/>
     <uses-permission android:name="android.permission.INTERNET"/>
-    <application android:label="Modulez Remote" android:allowBackup="false"
+    <application android:icon="@mipmap/modulez_player" android:label="Modulez Remote" android:allowBackup="false"
         android:usesCleartextTraffic="false" android:theme="@android:style/Theme.Material.NoActionBar">
         <activity android:name=".RemoteActivity" android:exported="true" android:windowSoftInputMode="adjustResize">
             <intent-filter><action android:name="android.intent.action.MAIN"/>

@@ -8,6 +8,9 @@
 typedef struct {
     guint refs, timer;
     GtkWidget *page, *message, *fullscreen, *fullscreen_button;
+    GtkWidget *tag, *tag_label;
+    gchar *track_identity, *track_title, *track_artist;
+    gint64 hide_tag_at;
     WebKitWebView *web;
     SoupServer *server;
     GCancellable *cancel;
@@ -54,6 +57,9 @@ static void vis_unref(Visualizer *v)
 {
     if (--v->refs) return;
     g_clear_object(&v->cancel);
+    g_free(v->track_identity);
+    g_free(v->track_title);
+    g_free(v->track_artist);
     g_free(v->base);
     g_free(v);
 }
@@ -494,6 +500,67 @@ static gboolean fullscreen_delete(GtkWidget *widget, GdkEvent *event, gpointer d
     if (v->fullscreen) toggle_fullscreen(v);
     return TRUE;
 }
+gboolean modulez_visualizer_is_fullscreen(void)
+{
+    return active_visualizer && active_visualizer->fullscreen;
+}
+
+void modulez_visualizer_show_track(const char *identity, const char *title, const char *artist)
+{
+    Visualizer *v = active_visualizer;
+    if (!v || !v->fullscreen || !v->tag) return;
+    if (g_strcmp0(identity, v->track_identity) || g_strcmp0(title, v->track_title) ||
+        g_strcmp0(artist, v->track_artist)) {
+        g_free(v->track_identity); v->track_identity = g_strdup(identity);
+        g_free(v->track_title); v->track_title = g_strdup(title);
+        g_free(v->track_artist); v->track_artist = g_strdup(artist);
+        if (title && *title) {
+            g_autofree gchar *valid_title = g_utf8_make_valid(title, -1);
+            g_autofree gchar *valid_artist = g_utf8_make_valid(artist ? artist : "", -1);
+            g_autofree gchar *markup = g_markup_printf_escaped(
+                "<span size='x-large' weight='bold'>%s</span>%s%s",
+                valid_title, *valid_artist ? "\n" : "", valid_artist);
+            gtk_label_set_markup(GTK_LABEL(v->tag_label), markup);
+            gtk_revealer_set_reveal_child(GTK_REVEALER(v->tag), TRUE);
+            v->hide_tag_at = g_get_monotonic_time() + 4 * G_USEC_PER_SEC;
+        } else {
+            gtk_revealer_set_reveal_child(GTK_REVEALER(v->tag), FALSE);
+            v->hide_tag_at = 0;
+        }
+    }
+    if (v->hide_tag_at && g_get_monotonic_time() >= v->hide_tag_at) {
+        gtk_revealer_set_reveal_child(GTK_REVEALER(v->tag), FALSE);
+        v->hide_tag_at = 0;
+    }
+}
+
+static GtkWidget *fullscreen_overlay(Visualizer *v, GtkWidget *view)
+{
+    GtkWidget *overlay = gtk_overlay_new();
+    gtk_container_add(GTK_CONTAINER(overlay), view);
+    v->tag = gtk_revealer_new();
+    gtk_revealer_set_transition_type(GTK_REVEALER(v->tag), GTK_REVEALER_TRANSITION_TYPE_CROSSFADE);
+    gtk_revealer_set_transition_duration(GTK_REVEALER(v->tag), 600);
+    gtk_widget_set_halign(v->tag, GTK_ALIGN_START);
+    gtk_widget_set_valign(v->tag, GTK_ALIGN_END);
+    gtk_widget_set_margin_start(v->tag, 24);
+    gtk_widget_set_margin_bottom(v->tag, 24);
+    v->tag_label = gtk_label_new(NULL);
+    gtk_label_set_xalign(GTK_LABEL(v->tag_label), 0);
+    gtk_label_set_max_width_chars(GTK_LABEL(v->tag_label), 40);
+    gtk_label_set_ellipsize(GTK_LABEL(v->tag_label), PANGO_ELLIPSIZE_END);
+    GtkCssProvider *css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(css, "label {background:rgba(12,16,18,0.87);color:#f2f5f5;"
+                                   "border-radius:8px;padding:12px 18px;}", -1, NULL);
+    gtk_style_context_add_provider(gtk_widget_get_style_context(v->tag_label),
+        GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+    g_object_unref(css);
+    gtk_container_add(GTK_CONTAINER(v->tag), v->tag_label);
+    gtk_overlay_add_overlay(GTK_OVERLAY(overlay), v->tag);
+    gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(overlay), v->tag, TRUE);
+    return overlay;
+}
+
 static void toggle_fullscreen(Visualizer *v)
 {
     if (!v || v->destroyed || !v->web) return;
@@ -517,7 +584,8 @@ static void toggle_fullscreen(Visualizer *v)
         gtk_window_set_default_size(GTK_WINDOW(fullscreen), 960, 600);
         g_signal_connect(fullscreen, "delete-event", G_CALLBACK(fullscreen_delete), v);
         g_signal_connect(fullscreen, "key-press-event", G_CALLBACK(fullscreen_key), v);
-        gtk_container_add(GTK_CONTAINER(fullscreen), view);
+        g_clear_pointer(&v->track_identity, g_free);
+        gtk_container_add(GTK_CONTAINER(fullscreen), fullscreen_overlay(v, view));
         gtk_widget_show_all(fullscreen);
         gtk_window_fullscreen(GTK_WINDOW(fullscreen));
         gtk_button_set_label(GTK_BUTTON(v->fullscreen_button), "Exit Fullscreen");
