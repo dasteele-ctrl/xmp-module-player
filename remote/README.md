@@ -44,3 +44,5 @@ In the computer’s **Pair remote** dialog, use **Shared music folders** to add 
 On the phone, open **Browse music**, enter a shared folder, and tap **Add entire folder** to append its supported tracks and subfolders in sorted order. Hidden entries and symbolic links are skipped. The player scans and appends in short batches while the phone shows progress and the final count. Directory and playlist pages display up to 150 entries. Individual file selection still appends a single track.
 
 On Android 11 and later, if Android records a crash, low-memory termination, or unresponsive process, the remote can show its previous exit reason on the next launch with a **Copy details** button.
+
+The Android pairing screen and Now Playing header show the Modulez Player icon. The charcoal surfaces, aqua accents, rounded transport buttons and playlist panel carry the desktop player's appearance into the remote.

@@ -4,7 +4,10 @@ import android.app.Activity;
 import android.os.Bundle;
 import android.os.Handler;
 import android.content.SharedPreferences;
-import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
+import android.content.res.ColorStateList;
 import android.widget.*;
 import org.json.*;
 import java.io.*;
@@ -137,22 +140,67 @@ public class RemoteActivity extends Activity {
     }
 
     private int dp(int n) { return (int)(n * getResources().getDisplayMetrics().density + .5f); }
+    private static final int BACKGROUND=0xff101619, PANEL=0xff192428, BUTTON=0xff213338;
+    private static final int LINE=0xff395057, INK=0xffe5eef0, MUTED=0xffb5c7ca, AQUA=0xff79d9d0;
+
+    private GradientDrawable surface(int fill,int border,int radius) {
+        GradientDrawable shape=new GradientDrawable();
+        shape.setColor(fill); shape.setCornerRadius(dp(radius)); shape.setStroke(dp(1),border);
+        return shape;
+    }
+
+    private void styleButton(Button b,boolean primary) {
+        int fill=primary ? 0xff244b4c : BUTTON;
+        b.setBackground(new RippleDrawable(ColorStateList.valueOf(0x446ee4d8),
+                surface(fill,primary?AQUA:LINE,12),null));
+        b.setTextColor(new ColorStateList(new int[][]{{-android.R.attr.state_enabled},{}},
+                new int[]{0xff829397,primary?0xffabf4ed:INK}));
+        b.setPadding(dp(10),0,dp(10),0);
+        b.setMinimumWidth(0); b.setMinWidth(0);
+        b.setMinHeight(dp(46)); b.setMinimumHeight(dp(46));
+    }
+
+    private LinearLayout brandHeader() {
+        LinearLayout panel=new LinearLayout(this);
+        panel.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        panel.setPadding(dp(12),dp(8),dp(12),dp(8));
+        panel.setBackground(surface(PANEL,LINE,16));
+        LinearLayout.LayoutParams layout=new LinearLayout.LayoutParams(-1,-2);
+        layout.bottomMargin=dp(6); root.addView(panel,layout);
+        ImageView logo=new ImageView(this);
+        logo.setImageResource(getApplicationInfo().icon);
+        logo.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        logo.setImportantForAccessibility(android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        LinearLayout.LayoutParams art=new LinearLayout.LayoutParams(dp(48),dp(48));
+        art.rightMargin=dp(12); panel.addView(logo,art);
+        LinearLayout words=new LinearLayout(this); words.setOrientation(LinearLayout.VERTICAL);
+        panel.addView(words,new LinearLayout.LayoutParams(0,-2,1));
+        return words;
+    }
+
     private TextView label(LinearLayout box, String text, int size) {
-        TextView v = new TextView(this); v.setTextColor(Color.rgb(228,235,235));
+        TextView v = new TextView(this); v.setTextColor(INK);
         v.setTextSize(size); v.setText(text); box.addView(v); return v;
     }
     private Button button(LinearLayout box, String text, Runnable action) {
         Button b = new Button(this); b.setText(text); b.setAllCaps(false);
-        b.setOnClickListener(v -> action.run()); box.addView(b); return b;
+        styleButton(b,false);
+        LinearLayout.LayoutParams layout=new LinearLayout.LayoutParams(
+                box.getOrientation()==LinearLayout.VERTICAL ? -1 : -2,-2);
+        layout.setMargins(dp(2),dp(2),dp(2),dp(2));
+        b.setOnClickListener(v -> action.run()); box.addView(b,layout); return b;
     }
     private EditText input(String hint) {
         EditText field = new EditText(this); field.setSingleLine(true); field.setHint(hint);
         field.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        root.addView(field); return field;
+        field.setBackground(surface(PANEL,LINE,10)); field.setTextColor(INK); field.setHintTextColor(MUTED);
+        field.setPadding(dp(12),dp(8),dp(12),dp(8));
+        LinearLayout.LayoutParams layout=new LinearLayout.LayoutParams(-1,-2);
+        layout.setMargins(0,dp(3),0,dp(3)); root.addView(field,layout); return field;
     }
     private void render() {
         root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.rgb(17,21,23));
+        root.setBackgroundColor(BACKGROUND);
         root.setPadding(dp(16),dp(12),dp(16),dp(8));
         root.setOnApplyWindowInsetsListener((v,i) -> {
             v.setPadding(dp(16)+i.getSystemWindowInsetLeft(), dp(12)+i.getSystemWindowInsetTop(),
@@ -161,21 +209,32 @@ public class RemoteActivity extends Activity {
         });
         setContentView(root);
         if (session == null) {
-            label(root,"Modulez Remote",28);
+            TextView brand=label(brandHeader(),"Modulez Remote",24);
+            brand.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
             label(root,"Choose Pair remote in Modulez Player, then scan the QR code or enter the details below.",16);
             scan = button(root,"Scan QR code",() -> startActivityForResult(
                     new android.content.Intent(this, ScanActivity.class), 41));
+            styleButton(scan,true);
             address = input("Player address"); address.setText(prefs.getString("host",""));
             code = input("Pairing code");
             pair = button(root,"Pair with player",this::pair);
             status = label(root,"",15);
         } else {
-            label(root,"Now Playing",16); title = label(root,"Connecting…",24);
-            title.setMaxLines(2); format = label(root,"",16); format.setMaxLines(2);
+            LinearLayout header=brandHeader();
+            label(header,"Now Playing",14).setTextColor(AQUA);
+            title=label(header,"Connecting…",22);
+            title.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
+            title.setMaxLines(2); title.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            format=label(header,"",14); format.setTextColor(MUTED); format.setMaxLines(1);
             LinearLayout row = new LinearLayout(this); root.addView(row);
             button(row,"Previous",() -> refresh("/previous",-1));
             toggle = button(row,"Play",() -> refresh("/toggle",-1));
             button(row,"Next",() -> refresh("/next",-1));
+            styleButton(toggle,true);
+            for (int i=0;i<row.getChildCount();i++) {
+                LinearLayout.LayoutParams key=(LinearLayout.LayoutParams)row.getChildAt(i).getLayoutParams();
+                key.width=0; key.weight=1;
+            }
             volumeText = label(root,"Volume",16); volume = new SeekBar(this); root.addView(volume);
             volume.setMax(100);
             volume.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
@@ -198,6 +257,8 @@ public class RemoteActivity extends Activity {
             later=button(queueNav,"Next page",() -> changeQueuePage(150));
             queueNav.setVisibility(android.view.View.GONE);
             ListView list = new ListView(this);
+            list.setBackground(surface(PANEL,LINE,14)); list.setClipToOutline(true);
+            list.setDivider(new android.graphics.drawable.ColorDrawable(LINE)); list.setDividerHeight(dp(1));
             root.addView(list,new LinearLayout.LayoutParams(-1,0,1));
             tracks = new ArrayAdapter<>(this,android.R.layout.simple_list_item_1,new ArrayList<>());
             list.setAdapter(tracks); list.setOnItemClickListener((a,v,i,id) -> refresh("/select",queueOffset+i));

@@ -17,6 +17,7 @@ else
 fi
 "$tools/d8" --min-api 24 --lib "$platform" --output "$out/dex" "$zxing" "$out"/classes/org/modulez/remote/preview/*.class
 mkdir -p "$out/res/mipmap-xxxhdpi"
+cp -R res/. "$out/res/"
 cp ../../icons/modulez-player.png "$out/res/mipmap-xxxhdpi/modulez_player.png"
 "$tools/aapt" package -f -A assets -S "$out/res" -M AndroidManifest.xml -I "$platform" -F "$out/unsigned.apk"
 (cd "$out/dex" && zip -q "$out/unsigned.apk" classes.dex)

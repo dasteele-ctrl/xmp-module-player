@@ -1,0 +1,11 @@
+<resources>
+    <style name="ModulezRemote" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#101619</item>
+        <item name="android:colorBackground">#101619</item>
+        <item name="android:colorAccent">#79D9D0</item>
+        <item name="android:colorControlActivated">#79D9D0</item>
+        <item name="android:statusBarColor">#101619</item>
+        <item name="android:navigationBarColor">#101619</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
