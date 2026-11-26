@@ -4,7 +4,7 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 base=$(realpath "${1:?Supply the v1.8.8 x86_64 AppImage}")
-output=$(realpath -m "${2:-Modulez-Player-Remote-Preview-x86_64.AppImage}")
+output=$(realpath -m "${2:-Modulez-Player-v2.0-x86_64.AppImage}")
 plugin=${GIO_TLS_PLUGIN:-/usr/lib/x86_64-linux-gnu/gio/modules/libgiognutls.so}
 notice=${GIO_TLS_NOTICE:-/usr/share/doc/glib-networking/copyright}
 tmp=$(mktemp -d)
@@ -18,9 +18,9 @@ install -Dm644 "$notice" "$app/usr/share/doc/modulez-remote-preview/glib-network
 sed -i '/^    export APPDIR=/a\    export GIO_EXTRA_MODULES="$appdir/usr/lib/modulez-gio${GIO_EXTRA_MODULES:+:$GIO_EXTRA_MODULES}"' "$app/AppRun"
 desktop=modulez-remote-preview.desktop
 mv "$app/usr/share/applications/modulez-player.desktop" "$app/usr/share/applications/$desktop"
-sed -i -e 's/^Name=.*/Name=Modulez Player Remote Preview/' \
-    -e 's/^X-AppImage-Name=.*/X-AppImage-Name=Modulez Player Remote Preview/' \
-    -e 's/^X-AppImage-Version=.*/X-AppImage-Version=1.8.8-remote-preview/' "$app/usr/share/applications/$desktop"
+sed -i -e 's/^Name=.*/Name=Modulez Player/' \
+    -e 's/^X-AppImage-Name=.*/X-AppImage-Name=Modulez Player/' \
+    -e 's/^X-AppImage-Version=.*/X-AppImage-Version=2.0/' "$app/usr/share/applications/$desktop"
 rm "$app/modulez-player.desktop"
 ln -s "usr/share/applications/$desktop" "$app/$desktop"
 head -c "$("$base" --appimage-offset)" "$base" > runtime

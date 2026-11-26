@@ -27,6 +27,6 @@ if [[ ! -e "$key" ]]; then
     keytool -genkeypair -keystore "$key" -alias preview -storepass android -keypass android \
         -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=Modulez Remote Preview"
 fi
-apk="$out/Modulez-Remote-Preview.apk"
+apk="$out/Modulez-Remote-2.0.apk"
 "$tools/apksigner" sign --ks "$key" --ks-pass pass:android --out "$apk" "$out/aligned.apk"
 "$tools/apksigner" verify --verbose "$apk"

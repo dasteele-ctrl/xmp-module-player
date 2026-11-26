@@ -1,21 +1,21 @@
-# Modulez Remote preview
+# Modulez Remote 2.0
 
 This branch starts at tag `v1.8.8`. The Android app sends playback commands over HTTPS to the desktop player. Decoding and audio output run on the Linux computer.
 
-## Try the preview
+## Pair with Modulez Player 2.0
 
-1. On Linux Mint, make the preview AppImage executable and launch it. Add tracks or load an M3U playlist.
+1. On Linux Mint, make the 2.0 AppImage executable and launch it. Add tracks or load an M3U playlist.
 2. Choose **Pair remote**, select the computer’s home-network IPv4 address, and click **Start pairing**.
-3. Install the test APK on Android 7.0 or later. Connect to the same home network, open **Modulez Remote**, and tap **Scan QR code**. Allow camera access and point the phone at the code. You can also enter the address and code displayed on the computer.
+3. Install the 2.0 APK on Android 7.0 or later. Connect to the same home network, open **Modulez Remote**, and tap **Scan QR code**. Allow camera access and point the phone at the code. You can also enter the address and code displayed on the computer.
 4. Tap a playlist row to play it. The phone shows the current track and format, transport controls, and the player’s volume. It refreshes while the app is open. For radio, the transport uses the player’s existing stop/start behavior.
 
 The listener starts on the address you select, on TCP port 48788. Pairing codes are single-use and expire after five minutes or five unsuccessful guesses. The first part checks the certificate shown by the computer. The phone stores the full certificate fingerprint and a session token after pairing. Click the remote button again on the computer to stop listening and revoke the token. After restarting the player, tap **Forget player** on the phone and pair again. If the connection times out, check that the router allows devices to reach each other and that the computer’s firewall allows the phone to reach TCP 48788.
 
 ## Build
 
-Build the Linux player with the repository’s normal `make` command and its v1.8.8 development dependencies. To package it with the matching release runtime, run `remote/package-linux.sh /path/to/Modulez-Player-v1.8.8-x86_64.AppImage` on a compatible x86_64 Mint build host with squashfs-tools, binutils, Python 3 and glib-networking installed. The preview uses its own GApplication ID and player configuration directory. Its AppImage omits release update metadata.
+Build the Linux player with the repository’s normal `make` command and its v1.8.8 development dependencies. To package it with the matching release runtime, run `remote/package-linux.sh /path/to/Modulez-Player-v1.8.8-x86_64.AppImage` on a compatible x86_64 Mint build host with squashfs-tools, binutils, Python 3 and glib-networking installed. The 2.0 package retains the preview’s GApplication ID and player configuration directory. Its AppImage omits release update metadata.
 
-With JDK 17 or later, Android SDK Platform 35, and Android Build Tools 35.0.0, set `ANDROID_HOME` and run `remote/android/build.sh`. The resulting test APK and local test keystore appear under `remote/android/build/`. Reuse the same test keystore when installing updates over an earlier APK from your own build.
+With JDK 17 or later, Android SDK Platform 35, and Android Build Tools 35.0.0, set `ANDROID_HOME` and run `remote/android/build.sh`. The resulting test APK and local test keystore appear under `remote/android/build/`. Set PREVIEW_KEYSTORE to the existing signing keystore to build an APK that upgrades the previous installation. The distributed 2.0 APK uses the Preview 9 signer. Tap **About** on the pairing or Now Playing screen to see the installed version.
 
 ### Preview 2
 

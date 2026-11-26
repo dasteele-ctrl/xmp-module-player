@@ -1,4 +1,8 @@
-# Modulez Player 1.8.7
+# Modulez Player 2.0
+
+Pair **Modulez Remote 2.0** on Android with the Linux player to control music, playlists, radio, volume and visualizers from your phone. Audio plays on the computer. See the [pairing and build guide](remote/README.md).
+
+## Earlier releases
 
 **The RMF Update** adds direct Beatnik RMF playback with the Beatnik Standard
 v1.1.1 Uncompressed bank. Browse WebTV and SoundMusicSys tracks, or open a

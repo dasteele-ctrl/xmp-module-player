@@ -177,7 +177,25 @@ public class RemoteActivity extends Activity {
         art.rightMargin=dp(12); panel.addView(logo,art);
         LinearLayout words=new LinearLayout(this); words.setOrientation(LinearLayout.VERTICAL);
         panel.addView(words,new LinearLayout.LayoutParams(0,-2,1));
+        button(panel,"About",this::showAbout);
         return words;
+    }
+
+    private void showAbout() {
+        String appName = getApplicationInfo().loadLabel(getPackageManager()).toString();
+        String title = appName;
+        try {
+            String version = getPackageManager().getPackageInfo(getPackageName(),0).versionName;
+            title = appName + " " + version;
+        } catch (android.content.pm.PackageManager.NameNotFoundException ignored) {
+            // The app name still identifies this installation.
+        }
+        new android.app.AlertDialog.Builder(this)
+                .setTitle(title)
+                .setIcon(getApplicationInfo().icon)
+                .setMessage("Control Modulez Player over your home network. Audio plays on the computer.\n\nDeveloped by David (DaSteele) Harryman.")
+                .setPositiveButton("Close",null)
+                .show();
     }
 
     private TextView label(LinearLayout box, String text, int size) {
