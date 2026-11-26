@@ -119,6 +119,57 @@ static void remote_request(SoupServer *server, SoupServerMessage *msg,
         soup_server_message_set_status(msg, 401, NULL);
         return;
     }
+    if (!strcmp(path, "/world") && (!strcmp(method, "GET") || !strcmp(method, "POST"))) {
+        gboolean start = !strcmp(method, "POST");
+        const char *number = query ? g_hash_table_lookup(query, start ? "page" : "generation") : NULL;
+        guint64 value;
+        if (!number || !g_ascii_string_to_unsigned(number, 10, 0,
+                start ? G_MAXUINT / WORLD_LIMIT : G_MAXUINT, &value, NULL)) {
+            soup_server_message_set_status(msg, 400, NULL);
+            return;
+        }
+        if (start) {
+            const char *keys[] = {"name", "country", "tag"};
+            GtkWidget *entries[] = {world_name, world_country, world_tag};
+            for (guint i = 0; i < G_N_ELEMENTS(keys); ++i) {
+                const char *field = g_hash_table_lookup(query, keys[i]);
+                if (field && (!g_utf8_validate(field, -1, NULL) || strlen(field) > 512)) {
+                    soup_server_message_set_status(msg, 400, NULL);
+                    return;
+                }
+            }
+            for (guint i = 0; i < G_N_ELEMENTS(keys); ++i) {
+                const char *field = g_hash_table_lookup(query, keys[i]);
+                gtk_entry_set_text(GTK_ENTRY(entries[i]), field ? field : "");
+            }
+            world_search_page((guint)value * WORLD_LIMIT);
+        } else if (value != world_generation) {
+            soup_server_message_set_status(msg, 409, NULL);
+            return;
+        }
+        JsonObject *obj = json_object_new();
+        json_object_set_int_member(obj, "generation", world_generation);
+        json_object_set_boolean_member(obj, "busy", world_cancel != NULL);
+        json_object_set_boolean_member(obj, "next", gtk_widget_get_sensitive(world_next));
+        json_object_set_string_member(obj, "status", gtk_label_get_text(GTK_LABEL(world_status)));
+        if (!world_cancel) {
+            JsonArray *rows = json_array_new();
+            GtkTreeModel *model = GTK_TREE_MODEL(world_store);
+            GtkTreeIter iter;
+            for (gboolean more = gtk_tree_model_get_iter_first(model, &iter); more;
+                 more = gtk_tree_model_iter_next(model, &iter)) {
+                g_autofree gchar *uuid = NULL, *name = NULL, *country = NULL;
+                gtk_tree_model_get(model, &iter, WORLD_UUID, &uuid, WORLD_NAME, &name, WORLD_COUNTRY, &country, -1);
+                g_autofree gchar *label = country && *country ? g_strdup_printf("%s · %s", name, country) : g_strdup(name);
+                remote_station(rows, NULL, "World radio", uuid, label);
+            }
+            json_object_set_array_member(obj, "stations", rows);
+        }
+        JsonNode *reply = json_node_new(JSON_NODE_OBJECT);
+        json_node_take_object(reply, obj);
+        remote_json(msg, reply);
+        return;
+    }
     if (!strcmp(method, "GET") && !strcmp(path, "/stations")) {
         JsonArray *rows = json_array_new();
         remote_station_catalog(rows, NULL);

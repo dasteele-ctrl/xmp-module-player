@@ -188,7 +188,7 @@ static GtkWidget *world_view, *world_name, *world_country, *world_tag;
 static GtkWidget *world_status, *world_play, *world_website, *world_next, *world_prev;
 static GCancellable *world_cancel;
 static gboolean world_closing;
-static guint world_offset;
+static guint world_offset, world_generation;
 static gchar *world_params;
 #define WORLD_LIMIT 100
 enum { RADIO_ID, RADIO_NAME, RADIO_GENRE, RADIO_QUALITY, RADIO_STATE, RADIO_COLS };
@@ -1608,6 +1608,7 @@ done:
 
 static void world_request(void)
 {
+    ++world_generation;
     if (world_cancel) g_cancellable_cancel(world_cancel);
     g_clear_object(&world_cancel);
     world_cancel = g_cancellable_new();
@@ -1623,9 +1624,8 @@ static void world_request(void)
     g_object_unref(task);
 }
 
-static void on_world_search(GtkWidget *widget, gpointer data)
+static void world_search_page(guint offset)
 {
-    (void)widget; (void)data;
     gchar *name = g_uri_escape_string(gtk_entry_get_text(GTK_ENTRY(world_name)), NULL, FALSE);
     gchar *country = g_ascii_strup(gtk_entry_get_text(GTK_ENTRY(world_country)), -1);
     g_strstrip(country);
@@ -1636,8 +1636,14 @@ static void on_world_search(GtkWidget *widget, gpointer data)
         *name ? "&name=" : "", name, *cc ? "&countrycode=" : "", cc,
         *tag ? "&tag=" : "", tag);
     g_free(name); g_free(country); g_free(cc); g_free(tag);
-    world_offset = 0;
+    world_offset = offset;
     world_request();
+}
+
+static void on_world_search(GtkWidget *widget, gpointer data)
+{
+    (void)widget; (void)data;
+    world_search_page(0);
 }
 
 static void on_world_page(GtkButton *button, gpointer data)

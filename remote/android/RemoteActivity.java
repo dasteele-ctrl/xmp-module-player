@@ -152,7 +152,8 @@ public class RemoteActivity extends Activity {
             browse.setGravity(android.view.Gravity.CENTER_VERTICAL);
             root.addView(browse);
             label(browse,"Playlist",20).setLayoutParams(new LinearLayout.LayoutParams(0,-2,1));
-            button(browse,"Radio stations",this::chooseStation);
+            button(browse,"Stations",this::chooseStation);
+            button(browse,"World Radio",() -> new WorldRadio(session).open());
             ListView list = new ListView(this);
             root.addView(list,new LinearLayout.LayoutParams(-1,0,1));
             tracks = new ArrayAdapter<>(this,android.R.layout.simple_list_item_1,new ArrayList<>());
@@ -176,6 +177,7 @@ public class RemoteActivity extends Activity {
                     if (!foreground || session!=target || isDestroyed()) return;
                     new android.app.AlertDialog.Builder(this).setTitle("Radio stations")
                         .setItems(names,(dialog,index) -> refresh("/station/"+ids[index],-1))
+                        .setPositiveButton("World Radio…",(dialog,which) -> new WorldRadio(target).open())
                         .setNegativeButton("Close",null).show();
                 });
             } catch (Exception ex) { ui.post(() -> {
@@ -183,6 +185,107 @@ public class RemoteActivity extends Activity {
                     Toast.makeText(this,"Couldn’t load stations. "+message(ex),Toast.LENGTH_LONG).show();
             }); }
         });
+    }
+    private class WorldRadio {
+        final Session target;
+        EditText filter;
+        Spinner kind;
+        Button prev, next;
+        TextView summary;
+        ArrayAdapter<String> names;
+        final ArrayList<String> ids = new ArrayList<>();
+        android.app.AlertDialog dialog;
+        String criteria = "";
+        int page, request;
+
+        WorldRadio(Session paired) { target=paired; }
+
+        void open() {
+            LinearLayout box=new LinearLayout(RemoteActivity.this);
+            box.setOrientation(LinearLayout.VERTICAL);
+            box.setPadding(dp(12),0,dp(12),0);
+            kind=new Spinner(RemoteActivity.this);
+            kind.setAdapter(new ArrayAdapter<>(RemoteActivity.this,android.R.layout.simple_spinner_dropdown_item,
+                    new String[]{"Station name","Genre or tag","Country code (e.g. US)"}));
+            box.addView(kind);
+            filter=new EditText(RemoteActivity.this); filter.setSingleLine();
+            filter.setHint("Leave blank for popular stations"); box.addView(filter);
+            LinearLayout nav=new LinearLayout(RemoteActivity.this); box.addView(nav);
+            button(nav,"Search",this::search);
+            prev=button(nav,"Previous",() -> load(page-1));
+            next=button(nav,"Next",() -> load(page+1));
+            summary=label(box,"",14);
+            ListView list=new ListView(RemoteActivity.this);
+            box.addView(list,new LinearLayout.LayoutParams(-1,0,1));
+            names=new ArrayAdapter<>(RemoteActivity.this,android.R.layout.simple_list_item_1,new ArrayList<>());
+            list.setAdapter(names);
+            list.setOnItemClickListener((parent,view,index,id) -> {
+                String station=ids.get(index);
+                dialog.dismiss(); refresh("/station/"+station,-1);
+            });
+            dialog=new android.app.AlertDialog.Builder(RemoteActivity.this).setTitle("World Radio")
+                    .setView(box).setNegativeButton("Close",null).create();
+            dialog.setOnDismissListener(d -> request++);
+            dialog.show();
+            dialog.getWindow().setLayout(-1,-1);
+            dialog.getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+                    | android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+            filter.setOnEditorActionListener((v,action,event) -> { search(); return true; });
+            load(0);
+        }
+
+        void search() {
+            String value=filter.getText().toString().trim();
+            int selected=kind.getSelectedItemPosition();
+            if (selected==2 && !value.isEmpty() && !value.matches("[a-zA-Z]{2}")) {
+                filter.setError("Use a two-letter country code"); return;
+            }
+            criteria="&"+new String[]{"name","tag","country"}[selected]+"="+android.net.Uri.encode(value);
+            android.view.inputmethod.InputMethodManager keyboard=(android.view.inputmethod.InputMethodManager)
+                    getSystemService(INPUT_METHOD_SERVICE);
+            keyboard.hideSoftInputFromWindow(filter.getWindowToken(),0);
+            load(0);
+        }
+
+        void load(int newPage) {
+            page=newPage; prev.setEnabled(false); next.setEnabled(false);
+            ids.clear(); names.clear(); summary.setText("Searching Radio Browser…");
+            fetch(++request,"/world?page="+page+criteria,true);
+        }
+
+        boolean current(int id) {
+            return id==request && session==target && !isDestroyed() && dialog.isShowing();
+        }
+
+        void fetch(int id,String path,boolean start) {
+            if (!current(id)) return;
+            if (!foreground) { ui.postDelayed(() -> fetch(id,path,start),1000); return; }
+            worker.execute(() -> {
+                try {
+                    JSONObject data=call(target,path,start?"POST":"GET",null,-1,-1);
+                    ui.post(() -> {
+                        if (!current(id)) return;
+                        if (data.optBoolean("busy")) {
+                            String pending="/world?generation="+data.optLong("generation");
+                            ui.postDelayed(() -> fetch(id,pending,false),650); return;
+                        }
+                        JSONArray rows=data.optJSONArray("stations");
+                        if (rows!=null) for (int i=0;i<rows.length();i++) {
+                            JSONObject station=rows.optJSONObject(i);
+                            ids.add(station.optString("id")); names.add(station.optString("name"));
+                        }
+                        prev.setEnabled(page>0); next.setEnabled(data.optBoolean("next"));
+                        summary.setText(data.optString("status"));
+                    });
+                } catch (Exception ex) { ui.post(() -> {
+                    if (current(id)) {
+                        prev.setEnabled(page>0);
+                        summary.setText(ex instanceof HttpError && ((HttpError)ex).status==409 ?
+                                "Search changed on the Dell. Tap Search to reload." : "World Radio: "+message(ex));
+                    }
+                }); }
+            });
+        }
     }
     private void forget() {
         ui.removeCallbacks(poll); session=null; revision=-1; busy=false;

@@ -22,3 +22,7 @@ With JDK 17 or later, Android SDK Platform 35, and Android Build Tools 35.0.0, s
 On Android, **Radio stations** opens the Dell preview’s built-in retro stations, favorites, custom stations and currently loaded World Radio results. Tap a station to start it on the Dell. The launcher uses the Modulez Player artwork.
 
 Enter **Fullscreen Vis** to see a track caption in the lower-left corner. It appears again on a track change, stays for four seconds and fades out. It uses the displayed title as a fallback, local audio title and artist tags when available, and SID author metadata. Radio streams can supply live titles.
+
+### Preview 3
+
+Tap **World Radio** beside **Stations** on the paired phone. The Dell queries Radio Browser and returns a page of popular stations immediately on opening the directory. Use the dropdown to search by station name, genre/tag, or two-letter country code. Previous and Next browse pages of up to 100 stations. Tap a result to start playback on the Dell. The desktop World Radio tab shares the current search and results.
