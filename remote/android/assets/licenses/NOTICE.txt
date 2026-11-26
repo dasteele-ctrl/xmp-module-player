@@ -1,0 +1,1 @@
+The in-app QR scanner uses ZXing Core 3.3.3, Copyright ZXing authors, licensed under Apache License 2.0.

@@ -1,5 +1,6 @@
 /* Included after the tray callbacks so local and remote actions share the GTK
  * main loop, audio backends, playlist selection and volume handling. */
+#include "qr/qrcodegen.h"
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -40,7 +41,7 @@ static void remote_json(SoupServerMessage *msg, JsonNode *node)
     json_node_unref(node);
 }
 
-/* Generate identifiers on the Dell. Only an entry currently in its station
+/* Generate identifiers on the player. Only an entry currently in its station
  * catalog can be played, even if a saved list changed after the phone read it. */
 static gboolean remote_station(JsonArray *rows, const char *wanted, const char *group,
                                const char *key, const char *name)
@@ -277,6 +278,30 @@ static GTlsCertificate *remote_certificate(GError **error)
     return cert;
 }
 
+static GdkPixbuf *remote_pairing_qr(const char *ip, const char *fingerprint, const char *secret)
+{
+    g_autofree char *payload = g_strdup_printf("MODULEZ1|%s|%s|%s", ip, fingerprint, secret);
+    uint8_t scratch[qrcodegen_BUFFER_LEN_FOR_VERSION(8)], qr[sizeof(scratch)];
+    if (!qrcodegen_encodeText(payload, scratch, qr, qrcodegen_Ecc_MEDIUM,
+                              1, 8, qrcodegen_Mask_AUTO, true)) return NULL;
+    int size = qrcodegen_getSize(qr);
+    const int border = 4, scale = 5;
+    int width = (size + 2 * border) * scale;
+    GdkPixbuf *image = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, width, width);
+    gdk_pixbuf_fill(image, 0xffffffff);
+    int stride = gdk_pixbuf_get_rowstride(image);
+    guchar *pixels = gdk_pixbuf_get_pixels(image);
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            if (!qrcodegen_getModule(qr, x, y)) continue;
+            for (int dy = 0; dy < scale; dy++)
+                memset(pixels + ((border + y) * scale + dy) * stride +
+                       (border + x) * scale * 3, 0, scale * 3);
+        }
+    }
+    return image;
+}
+
 static void remote_dialog(GtkButton *button, gpointer data)
 {
     (void)data;
@@ -291,7 +316,7 @@ static void remote_dialog(GtkButton *button, gpointer data)
     theme_dialog(dialog);
     GtkWidget *box = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     gtk_container_set_border_width(GTK_CONTAINER(box), 14);
-    gtk_box_pack_start(GTK_BOX(box), gtk_label_new("Choose the Dell’s home-network address"), FALSE, FALSE, 8);
+    gtk_box_pack_start(GTK_BOX(box), gtk_label_new("Choose this computer’s home-network address"), FALSE, FALSE, 8);
     GtkWidget *combo = gtk_combo_box_text_new_with_entry();
     struct ifaddrs *all = NULL;
     if (getifaddrs(&all) == 0) {
@@ -306,7 +331,7 @@ static void remote_dialog(GtkButton *button, gpointer data)
     }
     gtk_box_pack_start(GTK_BOX(box), combo, FALSE, FALSE, 4);
     gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
-    gtk_entry_set_placeholder_text(GTK_ENTRY(gtk_bin_get_child(GTK_BIN(combo))), "Dell IPv4 address");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(gtk_bin_get_child(GTK_BIN(combo))), "Computer IPv4 address");
     gtk_widget_show_all(dialog);
     int answer = gtk_dialog_run(GTK_DIALOG(dialog));
     gchar *ip = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(combo));
@@ -315,7 +340,7 @@ static void remote_dialog(GtkButton *button, gpointer data)
     g_strstrip(ip);
     struct in_addr parsed;
     if (inet_pton(AF_INET, ip, &parsed) != 1 || parsed.s_addr == INADDR_ANY) {
-        set_status("Enter the IPv4 address of the Dell on your home network");
+        set_status("Enter the IPv4 address of this computer on your home network");
         g_free(ip); return;
     }
     GError *error = NULL;
@@ -342,8 +367,15 @@ static void remote_dialog(GtkButton *button, gpointer data)
         dialog = gtk_message_dialog_new(GTK_WINDOW(window), GTK_DIALOG_DESTROY_WITH_PARENT,
             GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE, "Pair Modulez Remote");
         theme_dialog(dialog);
+        g_autoptr(GdkPixbuf) qr = remote_pairing_qr(ip, hash, remote_secret);
+        if (qr) {
+            GtkWidget *image = gtk_image_new_from_pixbuf(qr);
+            GtkWidget *area = gtk_message_dialog_get_message_area(GTK_MESSAGE_DIALOG(dialog));
+            gtk_box_pack_end(GTK_BOX(area), image, FALSE, FALSE, 4);
+            gtk_widget_show(image);
+        }
         gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog),
-            "On your Android phone, enter\n\nDell address   %s\nPairing code   %.8s-%s\n\nThe code is valid for five minutes and one phone.\nClick the remote button again to disconnect.", ip, hash, remote_secret);
+            "In Modulez Remote, tap Scan QR code, or enter\n\nPlayer address   %s\nPairing code   %.8s-%s\n\nThe code is valid for five minutes and one phone.\nClick the remote button again to disconnect.", ip, hash, remote_secret);
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
         g_free(hash); g_byte_array_unref(der);

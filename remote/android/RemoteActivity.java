@@ -21,7 +21,7 @@ public class RemoteActivity extends Activity {
     private LinearLayout root;
     private EditText address, code;
     private TextView status, title, format, volumeText;
-    private Button pair, toggle;
+    private Button pair, scan, toggle;
     private SeekBar volume;
     private ArrayAdapter<String> tracks;
     private SharedPreferences prefs;
@@ -39,7 +39,7 @@ public class RemoteActivity extends Activity {
 
     private static class HttpError extends IOException {
         final int status;
-        HttpError(int status) { super("Dell returned " + status); this.status = status; }
+        HttpError(int status) { super("Player returned " + status); this.status = status; }
     }
 
     private static String digest(X509Certificate certificate) throws CertificateException {
@@ -72,7 +72,7 @@ public class RemoteActivity extends Activity {
                 .openConnection(Proxy.NO_PROXY);
         try {
             c.setSSLSocketFactory(tls.getSocketFactory());
-            // The code on the Dell authenticates its self-signed certificate.
+            // The code on the player authenticates its self-signed certificate.
             c.setHostnameVerifier((host, ssl) -> host.equals(s.host));
             c.setInstanceFollowRedirects(false);
             c.setConnectTimeout(3500); c.setReadTimeout(5000);
@@ -129,10 +129,12 @@ public class RemoteActivity extends Activity {
         setContentView(root);
         if (session == null) {
             label(root,"Modulez Remote",28);
-            label(root,"Open Pair remote on your Dell, then enter the address and code shown there.",16);
-            address = input("Dell address"); address.setText(prefs.getString("host",""));
+            label(root,"Choose Pair remote in Modulez Player, then scan the QR code or enter the details below.",16);
+            scan = button(root,"Scan QR code",() -> startActivityForResult(
+                    new android.content.Intent(this, ScanActivity.class), 41));
+            address = input("Player address"); address.setText(prefs.getString("host",""));
             code = input("Pairing code");
-            pair = button(root,"Pair with Dell",this::pair);
+            pair = button(root,"Pair with player",this::pair);
             status = label(root,"",15);
         } else {
             label(root,"Now Playing",16); title = label(root,"Connecting…",24);
@@ -146,7 +148,7 @@ public class RemoteActivity extends Activity {
             volume.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
                 public void onStartTrackingTouch(SeekBar bar) { dragging=true; }
                 public void onStopTrackingTouch(SeekBar bar) { dragging=false; refresh("/volume",bar.getProgress()); }
-                public void onProgressChanged(SeekBar bar,int n,boolean user) { volumeText.setText("Dell volume  " + n + "%"); }
+                public void onProgressChanged(SeekBar bar,int n,boolean user) { volumeText.setText("Player volume  " + n + "%"); }
             });
             LinearLayout browse = new LinearLayout(this);
             browse.setGravity(android.view.Gravity.CENTER_VERTICAL);
@@ -159,7 +161,7 @@ public class RemoteActivity extends Activity {
             tracks = new ArrayAdapter<>(this,android.R.layout.simple_list_item_1,new ArrayList<>());
             list.setAdapter(tracks); list.setOnItemClickListener((a,v,i,id) -> refresh("/select",i));
             status = label(root,"Connecting to " + session.host,14);
-            button(root,"Forget Dell",this::forget);
+            button(root,"Forget player",this::forget);
         }
     }
     private void chooseStation() {
@@ -281,7 +283,7 @@ public class RemoteActivity extends Activity {
                     if (current(id)) {
                         prev.setEnabled(page>0);
                         summary.setText(ex instanceof HttpError && ((HttpError)ex).status==409 ?
-                                "Search changed on the Dell. Tap Search to reload." : "World Radio: "+message(ex));
+                                "Search changed on the player. Tap Search to reload." : "World Radio: "+message(ex));
                     }
                 }); }
             });
@@ -291,18 +293,37 @@ public class RemoteActivity extends Activity {
         ui.removeCallbacks(poll); session=null; revision=-1; busy=false;
         prefs.edit().remove("pin").remove("token").apply(); render();
     }
+    @Override protected void onActivityResult(int request, int result, android.content.Intent data) {
+        super.onActivityResult(request,result,data);
+        if (request!=41 || session!=null || data==null) return;
+        if (result!=RESULT_OK) {
+            status.setText(data.getStringExtra("message"));
+            return;
+        }
+        String[] fields=ScanActivity.parsePairing(data.getStringExtra("payload"));
+        if (fields==null) { status.setText("Invalid Modulez pairing QR code."); return; }
+        address.setText(fields[1]);
+        code.setText(fields[2].substring(0,8)+"-"+fields[3]);
+        pairWith(fields[1],fields[2],fields[3]);
+    }
+
     private void pair() {
         String host = address.getText().toString().trim();
         String entered = code.getText().toString().toLowerCase(Locale.US).replaceAll("[-\\s]","");
         if (!android.util.Patterns.IP_ADDRESS.matcher(host).matches() || host.contains(":") ||
                 !entered.matches("[0-9a-f]{14}")) {
-            status.setText("Enter the Dell’s IPv4 address and the complete pairing code."); return;
+            status.setText("Enter the player’s IPv4 address and the complete pairing code."); return;
         }
-        Session candidate = new Session(host, entered.substring(0,8), "");
+        pairWith(host,entered.substring(0,8),entered.substring(8));
+    }
+
+    private void pairWith(String host,String fingerprint,String secret) {
+        Session candidate = new Session(host,fingerprint,"");
+        scan.setEnabled(false);
         pair.setEnabled(false); status.setText("Pairing…");
         worker.execute(() -> {
             try {
-                JSONObject reply = call(candidate,"/pair","POST",entered.substring(8),-1,-1);
+                JSONObject reply = call(candidate,"/pair","POST",secret,-1,-1);
                 Session paired = new Session(host,reply.getString("pin"),reply.getString("token"));
                 ui.post(() -> {
                     if (isDestroyed()) return;
@@ -311,13 +332,13 @@ public class RemoteActivity extends Activity {
                     render(); refresh(null,-1);
                 });
             } catch (Exception ex) { ui.post(() -> {
-                if (!isDestroyed()) { pair.setEnabled(true); status.setText("Pairing failed. Check Wi-Fi, address and code. " + message(ex)); }
+                if (!isDestroyed()) { scan.setEnabled(true); pair.setEnabled(true); status.setText("Pairing failed. Check Wi-Fi, address and code. " + message(ex)); }
             }); }
         });
     }
     private String message(Exception ex) {
-        if (ex instanceof SSLException) return "Check the pairing code. Pair again if the Dell restarted.";
-        if (ex instanceof HttpError && ((HttpError)ex).status==410) return "Start a new pairing session on the Dell.";
+        if (ex instanceof SSLException) return "Check the pairing code. Pair again if the player restarted.";
+        if (ex instanceof HttpError && ((HttpError)ex).status==410) return "Start a new pairing session on the player.";
         return ex.getLocalizedMessage();
     }
     private void refresh(String action, int value) {
@@ -333,7 +354,7 @@ public class RemoteActivity extends Activity {
                     if (session!=target || isDestroyed()) return;
                     title.setText(state.optString("title")); format.setText(state.optString("format"));
                     toggle.setText(state.optBoolean("playing") ? (state.optBoolean("radio") ? "Stop" : "Pause") : "Play");
-                    if (!dragging) { volume.setProgress(state.optInt("volume")); volumeText.setText("Dell volume  " + state.optInt("volume") + "%"); }
+                    if (!dragging) { volume.setProgress(state.optInt("volume")); volumeText.setText("Player volume  " + state.optInt("volume") + "%"); }
                     if (queue != null) {
                         revision=queue.optLong("revision"); JSONArray rows=queue.optJSONArray("tracks");
                         tracks.setNotifyOnChange(false); tracks.clear();

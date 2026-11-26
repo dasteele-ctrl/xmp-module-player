@@ -5,11 +5,11 @@ This branch starts at tag `v1.8.8`. The Android app sends playback commands over
 ## Try the preview
 
 1. On Linux Mint, make the preview AppImage executable and launch it. Add tracks or load an M3U playlist.
-2. Choose **Pair remote**, select the Dell’s home-network IPv4 address, and click **Start pairing**.
-3. Install the test APK on Android 7.0 or later. Connect to the same home network, open **Modulez Remote**, and enter the address and code displayed on the Dell.
-4. Tap a playlist row to play it. The phone shows the current track and format, transport controls, and the Dell player’s volume. It refreshes while the app is open. For radio, the transport uses the player’s existing stop/start behavior.
+2. Choose **Pair remote**, select the computer’s home-network IPv4 address, and click **Start pairing**.
+3. Install the test APK on Android 7.0 or later. Connect to the same home network, open **Modulez Remote**, and tap **Scan QR code**. Allow camera access and point the phone at the code. You can also enter the address and code displayed on the computer.
+4. Tap a playlist row to play it. The phone shows the current track and format, transport controls, and the player’s volume. It refreshes while the app is open. For radio, the transport uses the player’s existing stop/start behavior.
 
-The listener starts on the address you select, on TCP port 48788. Pairing codes are single-use and expire after five minutes or five unsuccessful guesses. The first part checks the certificate shown by the Dell. The phone stores the full certificate fingerprint and a session token after pairing. Click the remote button again on the Dell to stop listening and revoke the token. After restarting the player, tap **Forget Dell** on the phone and pair again. If the connection times out, check that the router allows devices to reach each other and that Mint’s firewall allows the phone to reach TCP 48788.
+The listener starts on the address you select, on TCP port 48788. Pairing codes are single-use and expire after five minutes or five unsuccessful guesses. The first part checks the certificate shown by the computer. The phone stores the full certificate fingerprint and a session token after pairing. Click the remote button again on the computer to stop listening and revoke the token. After restarting the player, tap **Forget player** on the phone and pair again. If the connection times out, check that the router allows devices to reach each other and that the computer’s firewall allows the phone to reach TCP 48788.
 
 ## Build
 
@@ -19,10 +19,16 @@ With JDK 17 or later, Android SDK Platform 35, and Android Build Tools 35.0.0, s
 
 ### Preview 2
 
-On Android, **Radio stations** opens the Dell preview’s built-in retro stations, favorites, custom stations and currently loaded World Radio results. Tap a station to start it on the Dell. The launcher uses the Modulez Player artwork.
+On Android, **Radio stations** opens the desktop preview’s built-in retro stations, favorites, custom stations and currently loaded World Radio results. Tap a station to start it on the computer. The launcher uses the Modulez Player artwork.
 
 Enter **Fullscreen Vis** to see a track caption in the lower-left corner. It appears again on a track change, stays for four seconds and fades out. It uses the displayed title as a fallback, local audio title and artist tags when available, and SID author metadata. Radio streams can supply live titles.
 
 ### Preview 3
 
-Tap **World Radio** beside **Stations** on the paired phone. The Dell queries Radio Browser and returns a page of popular stations immediately on opening the directory. Use the dropdown to search by station name, genre/tag, or two-letter country code. Previous and Next browse pages of up to 100 stations. Tap a result to start playback on the Dell. The desktop World Radio tab shares the current search and results.
+Tap **World Radio** beside **Stations** on the paired phone. The player queries Radio Browser and returns a page of popular stations immediately on opening the directory. Use the dropdown to search by station name, genre/tag, or two-letter country code. Previous and Next browse pages of up to 100 stations. Tap a result to start playback on the computer. The desktop World Radio tab shares the current search and results.
+
+### Preview 4
+
+On the computer choose **Pair remote** and **Start pairing**. In the Android app tap **Scan QR code** and point the camera at the pairing dialog. The QR code carries the player’s address, full SHA-256 certificate fingerprint and the single-use code. Scanning and decoding happen on the phone. Camera permission is optional for manual pairing. To pair again after restarting the player, tap **Forget player** first.
+
+The desktop encoder uses Project Nayuki’s QR Code generator v1.8.0 (MIT). The Android build downloads and verifies ZXing Core 3.3.3 (Apache 2.0); the scanner runs offline after installation.

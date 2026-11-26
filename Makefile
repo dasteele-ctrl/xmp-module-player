@@ -12,7 +12,7 @@ all: modulez-player
 ZX_ROOT ?= $(HOME)/zxtune
 ZX_INCLUDE = -I$(ZX_ROOT) -I$(ZX_ROOT)/include -I$(ZX_ROOT)/src
 ZX_LIBRARIES = $(wildcard $(ZX_ROOT)/lib/linux/release/*.a)
-VIS_OBJECTS = visualizer.o visualizer_pcm.o visualizer-resources.o
+VIS_OBJECTS = remote/qr/qrcodegen.o visualizer.o visualizer_pcm.o visualizer-resources.o
 IRC_OBJECTS = xmp_irc_widget.o irc_client.o irc_protocol.o
 ZX_NATIVE_OBJECTS = about_tribute.o player_config.o main_zx_native.o zx_audio.o xmp-resources.o adlib_audio.o video_window.o ffmpeg_audio.o sid_audio.o midi_audio.o uade_audio.o equalizer.o hvsc_download.o tray_icon.o $(IRC_OBJECTS) $(VIS_OBJECTS)
 ZX_ISOLATED_OBJECTS = $(filter-out zx_audio.o main_zx_native.o,$(ZX_NATIVE_OBJECTS)) zx_audio_proxy.o main_export.o export_encoder.o batch_export.o export_wav.o
@@ -207,4 +207,5 @@ modulez-player xmp-linux xmp-zx-isolated-test xmp-export-test: modulez-rmf-helpe
 # Headspace album ZIP support
 LDLIBS += -larchive
 main_export.o main_zx_native.o main.o: headspace_browser.h
-main_export.o main_zx_native.o main.o: remote/player.inc
+main_export.o main_zx_native.o main.o: remote/player.inc remote/qr/qrcodegen.h
+remote/qr/qrcodegen.o: remote/qr/qrcodegen.c remote/qr/qrcodegen.h
