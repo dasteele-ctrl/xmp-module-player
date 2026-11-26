@@ -54,12 +54,20 @@ static void music_row(JsonArray *items,const char *name,const char *key,gboolean
     json_array_add_object_element(items,row);
 }
 
-static void remote_music(SoupServerMessage *msg,GHashTable *query,gboolean add)
+#include "folder-import.inc"
+
+static void remote_music(SoupServerMessage *msg,GHashTable *query,gboolean add,gboolean whole_folder)
 {
     const char *id=query ? g_hash_table_lookup(query,"root") : NULL;
     const char *rel=query ? g_hash_table_lookup(query,"path") : NULL;
     const char *root=NULL;
     if (!rel) rel="";
+    const char *offset_text=query ? g_hash_table_lookup(query,"offset") : NULL;
+    guint64 offset=0;
+    if (offset_text && !g_ascii_string_to_unsigned(offset_text,10,0,G_MAXUINT,&offset,NULL)) {
+        soup_server_message_set_status(msg,400,NULL); return;
+    }
+    gboolean more=FALSE;
     load_shared_music();
     g_autoptr(JsonArray) rows=json_array_new();
     for (guint i=0; shared_music_roots && shared_music_roots[i]; ++i) {
@@ -77,6 +85,7 @@ static void remote_music(SoupServerMessage *msg,GHashTable *query,gboolean add)
         g_autofree char *path=*rel ? g_build_filename(root,rel,NULL) : g_strdup(root);
         g_autofree char *canonical=realpath(path,NULL);
         if (!canonical || strcmp(path,canonical)) { soup_server_message_set_status(msg,404,NULL); return; }
+        if (whole_folder) { start_folder_import(msg,path); return; }
         if (add) {
             g_autofree char *name=g_path_get_basename(path);
             if (!g_file_test(path,G_FILE_TEST_IS_REGULAR) || !playlist_is_audio_filename(name)) {
@@ -100,9 +109,12 @@ static void remote_music(SoupServerMessage *msg,GHashTable *query,gboolean add)
             else if (S_ISREG(st.st_mode) && playlist_is_audio_filename(name)) g_ptr_array_add(tracks,g_strdup(name));
         }
         GPtrArray *groups[]={folders,tracks};
+        guint64 position=0;
         for (unsigned group=0;group<2;group++) {
             g_ptr_array_sort(groups[group],playlist_compare_paths);
             for (guint i=0;i<groups[group]->len;i++) {
+                if (offset_text && position++ < offset) continue;
+                if (offset_text && json_array_get_length(rows)>=150) { more=TRUE; break; }
                 const char *entry=g_ptr_array_index(groups[group],i);
                 g_autofree char *child=*rel ? g_build_filename(rel,entry,NULL) : g_strdup(entry);
                 music_row(rows,entry,child,group==0);
@@ -110,6 +122,7 @@ static void remote_music(SoupServerMessage *msg,GHashTable *query,gboolean add)
         }
     }
     JsonObject *result=json_object_new();
+    json_object_set_boolean_member(result,"more",more);
     json_object_set_array_member(result,"items",g_steal_pointer(&rows));
     JsonNode *node=json_node_new(JSON_NODE_OBJECT);
     json_node_take_object(node,result);

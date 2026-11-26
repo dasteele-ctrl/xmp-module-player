@@ -27,6 +27,10 @@ public class RemoteActivity extends Activity {
     private SharedPreferences prefs;
     private Session session;
     private long revision = -1;
+    private int queueOffset, wantedOffset;
+    private Button earlier, later;
+    private TextView range;
+    private LinearLayout queueNav;
     private boolean foreground, busy, dragging;
     private final Runnable poll = () -> refresh(null, -1);
 
@@ -102,6 +106,34 @@ public class RemoteActivity extends Activity {
         if (prefs.contains("token")) session = new Session(prefs.getString("host",""),
                 prefs.getString("pin",""), prefs.getString("token",""));
         render();
+        if (android.os.Build.VERSION.SDK_INT>=30 && saved==null) showLastCrash();
+    }
+
+    @android.annotation.TargetApi(30)
+    private void showLastCrash() {
+        android.app.ActivityManager manager=(android.app.ActivityManager)getSystemService(ACTIVITY_SERVICE);
+        if (manager==null) return;
+        java.util.List<android.app.ApplicationExitInfo> exits=manager.getHistoricalProcessExitReasons(getPackageName(),0,1);
+        if (exits.isEmpty()) return;
+        android.app.ApplicationExitInfo exit=exits.get(0);
+        if (exit.getTimestamp()<=prefs.getLong("lastExitShown",0)) return;
+        String reason;
+        switch (exit.getReason()) {
+            case android.app.ApplicationExitInfo.REASON_CRASH: reason="App crash"; break;
+            case android.app.ApplicationExitInfo.REASON_CRASH_NATIVE: reason="Native crash"; break;
+            case android.app.ApplicationExitInfo.REASON_LOW_MEMORY: reason="Low memory"; break;
+            case android.app.ApplicationExitInfo.REASON_ANR: reason="App stopped responding"; break;
+            default: return;
+        }
+        prefs.edit().putLong("lastExitShown",exit.getTimestamp()).apply();
+        String details=reason+" · "+java.text.DateFormat.getDateTimeInstance().format(new Date(exit.getTimestamp()));
+        if (exit.getDescription()!=null) details+="\n"+exit.getDescription();
+        final String report=details;
+        new android.app.AlertDialog.Builder(this).setTitle("Previous Android exit").setMessage(report)
+            .setNegativeButton("Close",null).setPositiveButton("Copy details",(d,w) -> {
+                android.content.ClipboardManager clipboard=(android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
+                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Modulez Remote",report));
+            }).show();
     }
 
     private int dp(int n) { return (int)(n * getResources().getDisplayMetrics().density + .5f); }
@@ -160,10 +192,15 @@ public class RemoteActivity extends Activity {
             label(browse,"Playlist",20).setLayoutParams(new LinearLayout.LayoutParams(0,-2,1));
             button(browse,"Stations",this::chooseStation);
             button(browse,"World Radio",() -> new WorldRadio(session).open());
+            queueNav=new LinearLayout(this); root.addView(queueNav);
+            earlier=button(queueNav,"Previous page",() -> changeQueuePage(-150));
+            range=label(queueNav,"",14);
+            later=button(queueNav,"Next page",() -> changeQueuePage(150));
+            queueNav.setVisibility(android.view.View.GONE);
             ListView list = new ListView(this);
             root.addView(list,new LinearLayout.LayoutParams(-1,0,1));
             tracks = new ArrayAdapter<>(this,android.R.layout.simple_list_item_1,new ArrayList<>());
-            list.setAdapter(tracks); list.setOnItemClickListener((a,v,i,id) -> refresh("/select",i));
+            list.setAdapter(tracks); list.setOnItemClickListener((a,v,i,id) -> refresh("/select",queueOffset+i));
             status = label(root,"Connecting to " + session.host,14);
             button(root,"Forget player",this::forget);
         }
@@ -177,7 +214,7 @@ public class RemoteActivity extends Activity {
             try {
                 JSONObject result=call(target,path,method,null,-1,-1);
                 ui.post(() -> {
-                    if (target!=session || !foreground || isDestroyed()) return;
+                    if (target!=session || !foreground || isFinishing() || isDestroyed()) return;
                     try { reply.show(result); }
                     catch (Exception ex) { notice("Could not read the player's response."); }
                 });
@@ -193,12 +230,19 @@ public class RemoteActivity extends Activity {
     }
 
     private void music(String rootId,String path,String heading) {
-        playerRequest("/music"+musicQuery(rootId,path),"GET",data -> {
+        music(rootId,path,heading,0);
+    }
+    private void music(String rootId,String path,String heading,int offset) {
+        String query=musicQuery(rootId,path)+(rootId==null?"?":"&")+"offset="+offset;
+        playerRequest("/music"+query,"GET",data -> {
             JSONArray rows=data.getJSONArray("items");
-            String[] names=new String[rows.length()];
-            for (int i=0;i<names.length;i++) {
+            int prev=offset>0?1:0;
+            String[] names=new String[prev+rows.length()+(data.optBoolean("more")?1:0)];
+            if (prev==1) names[0]="‹ Previous files";
+            if (data.optBoolean("more")) names[names.length-1]="Next files ›";
+            for (int i=0;i<rows.length();i++) {
                 JSONObject row=rows.getJSONObject(i);
-                names[i]=row.getString("name")+(row.getBoolean("folder")?" /":"");
+                names[i+prev]=row.getString("name")+(row.getBoolean("folder")?" /":"");
             }
             android.app.AlertDialog.Builder box=new android.app.AlertDialog.Builder(this)
                 .setTitle(heading).setNegativeButton("Close",null);
@@ -210,15 +254,20 @@ public class RemoteActivity extends Activity {
                     music(rootId,parent,parent.isEmpty()?"Add to playlist":parent);
                 }
             });
-            if (rows.length()==0) box.setMessage(rootId==null ?
+            if (rootId!=null) box.setPositiveButton("Add entire folder",(d,w) ->
+                playerRequest("/music/folder"+musicQuery(rootId,path),"POST",done ->
+                    notice("Adding this folder and its subfolders to the playlist")));
+            if (names.length==0) box.setMessage(rootId==null ?
                     "Choose shared music folders in the computer’s pairing dialog." : "No music or subfolders here.");
             else box.setItems(names,(d,index) -> {
-                JSONObject row=rows.optJSONObject(index);
+                if (index<prev) { music(rootId,path,heading,Math.max(0,offset-150)); return; }
+                if (index-prev>=rows.length()) { music(rootId,path,heading,offset+rows.length()); return; }
+                JSONObject row=rows.optJSONObject(index-prev);
                 String child=row.optString("key"), name=row.optString("name");
                 if (rootId==null) music(child,"","Add to playlist · "+name);
                 else if (row.optBoolean("folder")) music(rootId,child,"Add to playlist · "+name);
                 else playerRequest("/music/add"+musicQuery(rootId,child),"POST",added -> {
-                    notice("Added "+name); music(rootId,path,heading);
+                    notice("Added "+name); music(rootId,path,heading,offset);
                 });
             });
             box.show();
@@ -395,7 +444,7 @@ public class RemoteActivity extends Activity {
         }
     }
     private void forget() {
-        ui.removeCallbacks(poll); session=null; revision=-1; busy=false;
+        ui.removeCallbacks(poll); session=null; queueOffset=wantedOffset=0; revision=-1; busy=false;
         prefs.edit().remove("pin").remove("token").apply(); render();
     }
     @Override protected void onActivityResult(int request, int result, android.content.Intent data) {
@@ -442,31 +491,43 @@ public class RemoteActivity extends Activity {
         });
     }
     private String message(Exception ex) {
+        if (ex instanceof HttpError && ((HttpError)ex).status==409) return "The player is busy or the selection changed. Try again.";
         if (ex instanceof SSLException) return "Check the pairing code. Pair again if the player restarted.";
         if (ex instanceof HttpError && ((HttpError)ex).status==410) return "Start a new pairing session on the player.";
         return ex.getLocalizedMessage();
     }
+    private void changeQueuePage(int delta) {
+        wantedOffset=Math.max(0,queueOffset+delta);
+        refresh(null,-1);
+    }
     private void refresh(String action, int value) {
         if (session == null || !foreground || (action == null && busy)) return;
         ui.removeCallbacks(poll);
-        final Session target=session; final long seen=revision; busy=true;
+        final Session target=session; final long seen=revision; final int page=wantedOffset, displayed=queueOffset; busy=true;
         worker.execute(() -> {
             try {
                 if (action != null) call(target,action,"POST",null,value,seen);
                 JSONObject state=call(target,"/state","GET",null,-1,-1);
-                JSONObject queue=state.getLong("revision")==seen ? null : call(target,"/playlist","GET",null,-1,-1);
+                JSONObject queue=state.optBoolean("importing") || (state.getLong("revision")==seen && page==displayed) ? null : call(target,"/playlist?offset="+page,"GET",null,-1,-1);
                 ui.post(() -> {
                     if (session!=target || isDestroyed()) return;
                     title.setText(state.optString("title")); format.setText(state.optString("format"));
                     toggle.setText(state.optBoolean("playing") ? (state.optBoolean("radio") ? "Stop" : "Pause") : "Play");
                     if (!dragging) { volume.setProgress(state.optInt("volume")); volumeText.setText("Player volume  " + state.optInt("volume") + "%"); }
-                    if (queue != null) {
+                    if (queue != null && page==wantedOffset) {
                         revision=queue.optLong("revision"); JSONArray rows=queue.optJSONArray("tracks");
                         tracks.setNotifyOnChange(false); tracks.clear();
                         for (int i=0;i<rows.length();i++) tracks.add(rows.optString(i));
                         tracks.notifyDataSetChanged();
+                        queueOffset=wantedOffset=queue.optInt("offset");
+                        int total=queue.optInt("total",rows.length());
+                        queueNav.setVisibility(total>150?android.view.View.VISIBLE:android.view.View.GONE);
+                        earlier.setEnabled(queueOffset>0);
+                        later.setEnabled(queueOffset+rows.length()<total);
+                        range.setText(" "+(queueOffset+1)+"–"+(queueOffset+rows.length())+" / "+total+" ");
                     }
-                    status.setText("Connected to " + target.host); schedule();
+                    String batch=state.optString("importStatus");
+                    status.setText(batch.isEmpty()?"Connected to " + target.host:batch); schedule();
                 });
             } catch (Exception ex) { ui.post(() -> {
                 if (session!=target || isDestroyed()) return;

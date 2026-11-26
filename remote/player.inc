@@ -125,8 +125,8 @@ static void remote_request(SoupServer *server, SoupServerMessage *msg,
         return;
     }
     gboolean get=!strcmp(method,"GET"), post=!strcmp(method,"POST");
-    if ((get && !strcmp(path,"/music")) || (post && !strcmp(path,"/music/add"))) {
-        remote_music(msg,query,post);
+    if ((get && !strcmp(path,"/music")) || (post && (!strcmp(path,"/music/add") || !strcmp(path,"/music/folder")))) {
+        remote_music(msg,query,post,!strcmp(path,"/music/folder"));
         return;
     }
     if (((get || post) && !strcmp(path,"/vis")) || (post && !strcmp(path,"/vis/fullscreen"))) {
@@ -218,6 +218,8 @@ static void remote_request(SoupServer *server, SoupServerMessage *msg,
     }
     if (!strcmp(method, "GET") && !strcmp(path, "/state")) {
         JsonObject *obj = json_object_new();
+        json_object_set_boolean_member(obj,"importing",import_source!=0);
+        json_object_set_string_member(obj,"importStatus",import_status?import_status:"");
         json_object_set_string_member(obj, "title", gtk_label_get_text(GTK_LABEL(title_label)));
         json_object_set_string_member(obj, "format", gtk_label_get_text(GTK_LABEL(format_label)));
         json_object_set_boolean_member(obj, "playing", playing);
@@ -232,15 +234,25 @@ static void remote_request(SoupServer *server, SoupServerMessage *msg,
     if (!strcmp(method, "GET") && !strcmp(path, "/playlist")) {
         GtkTreeModel *model = GTK_TREE_MODEL(playlist_store);
         GtkTreeIter iter;
-        JsonArray *rows = json_array_new();
-        for (gboolean more = gtk_tree_model_get_iter_first(model, &iter); more;
-             more = gtk_tree_model_iter_next(model, &iter)) {
-            gchar *label = NULL;
-            gtk_tree_model_get(model, &iter, 0, &label, -1);
-            json_array_add_string_element(rows, label ? label : "");
-            g_free(label);
+        const char *start=query ? g_hash_table_lookup(query,"offset") : NULL;
+        guint64 offset=0;
+        if (start && !g_ascii_string_to_unsigned(start,10,0,G_MAXINT,&offset,NULL)) {
+            soup_server_message_set_status(msg,400,NULL); return;
         }
-        JsonObject *obj = json_object_new();
+        guint total=gtk_tree_model_iter_n_children(model,NULL);
+        if (offset>=total) offset=0;
+        JsonArray *rows = json_array_new();
+        for (gboolean more=gtk_tree_model_iter_nth_child(model,&iter,NULL,(gint)offset);
+             more && (!start || json_array_get_length(rows)<150);
+             more=gtk_tree_model_iter_next(model,&iter)) {
+            g_autofree gchar *label=NULL;
+            gtk_tree_model_get(model,&iter,0,&label,-1);
+            g_autofree gchar *valid=g_utf8_make_valid(label ? label : "",-1);
+            json_array_add_string_element(rows,valid);
+        }
+        JsonObject *obj=json_object_new();
+        json_object_set_int_member(obj,"offset",offset);
+        json_object_set_int_member(obj,"total",total);
         json_object_set_array_member(obj, "tracks", rows);
         json_object_set_int_member(obj, "revision", playlist_revision);
         JsonNode *reply = json_node_new(JSON_NODE_OBJECT);
@@ -282,6 +294,8 @@ static void remote_request(SoupServer *server, SoupServerMessage *msg,
 
 static void remote_stop(void)
 {
+    if (import_source) g_source_remove(import_source);
+    g_clear_pointer(&import_status,g_free);
     if (remote_server) soup_server_disconnect(remote_server);
     g_clear_object(&remote_server);
     remote_secret[0] = remote_token[0] = 0;

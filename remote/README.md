@@ -38,3 +38,9 @@ The desktop encoder uses Project Nayuki’s QR Code generator v1.8.0 (MIT). The 
 In the computer’s **Pair remote** dialog, use **Shared music folders** to add one or more folders. The selection persists across launches. Use **Clear sharing** there to remove all shared folders. After pairing once, **Browse music** on the phone opens those folders. Tap a track to append it to the playlist. The computer keeps playing its current track.
 
 **Visualizer** opens the desktop Vis page. Choose a Wavescope mode, a projectM preset (including imported presets), or enter/exit fullscreen. These actions use the same connection as radio, playback and player volume. This preview keeps the Android package ID. Moving from Preview 4 to the newly signed Preview 5 requires uninstalling the previous APK and pairing once.
+
+### Preview 6
+
+On the phone, open **Browse music**, enter a shared folder, and tap **Add entire folder** to append its supported tracks and subfolders in sorted order. Hidden entries and symbolic links are skipped. The player scans and appends in short batches while the phone shows progress and the final count. Directory and playlist pages display up to 150 entries. Individual file selection still appends a single track.
+
+On Android 11 and later, if Android records a crash, low-memory termination, or unresponsive process, the remote can show its previous exit reason on the next launch with a **Copy details** button.
