@@ -4,6 +4,8 @@
 #include <string.h>
 #ifdef GDK_WINDOWING_X11
 #include <gdk/gdkx.h>
+#include <GL/glx.h>
+#include <mpv/render_gl.h>
 #endif
 
 struct VideoWindow {
@@ -13,7 +15,11 @@ struct VideoWindow {
     GtkEventController *motion;
     gint64 last_activity;
     GtkButton *play_button;
-    GtkRange *timeline;
+    GtkRange *timeline, *main_timeline;
+    GtkWidget *scrub_owner;
+    GdkDevice *scrub_device;
+    guint scrub_timer;
+    gint64 last_preview;
     gboolean fullscreen, maximized;
     mpv_handle *mpv;
     mpv_render_context *renderer;
@@ -94,6 +100,66 @@ static gboolean snap_near_parent(GtkWidget *w, GdkEventConfigure *event, gpointe
     }
     return FALSE;
 }
+
+#ifdef GDK_WINDOWING_X11
+static void *gl_proc(void *unused, const char *name)
+{
+    (void)unused;
+    return (void *)glXGetProcAddressARB((const GLubyte *)name);
+}
+
+static gboolean render_gl(GtkGLArea *area, GdkGLContext *context, gpointer data)
+{
+    VideoWindow *v = data;
+    GtkWidget *widget = GTK_WIDGET(area);
+    int scale = gtk_widget_get_scale_factor(widget);
+    GLint framebuffer;
+    (void)context;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
+    mpv_opengl_fbo target = {
+        .fbo = framebuffer,
+        .w = gtk_widget_get_allocated_width(widget) * scale,
+        .h = gtk_widget_get_allocated_height(widget) * scale
+    };
+    int flip = 1, block = 0;
+    mpv_render_param params[] = {
+        {MPV_RENDER_PARAM_OPENGL_FBO, &target}, {MPV_RENDER_PARAM_FLIP_Y, &flip},
+        {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &block}, {0, NULL}
+    };
+    mpv_render_context_render(v->renderer, params);
+    gtk_gl_area_attach_buffers(area);
+    return TRUE;
+}
+
+static gboolean try_gl(VideoWindow *v)
+{
+    GtkWidget *area = gtk_gl_area_new();
+    gtk_container_add(GTK_CONTAINER(v->overlay), area);
+    gtk_widget_realize(area);
+    gtk_gl_area_make_current(GTK_GL_AREA(area));
+    const GError *error = gtk_gl_area_get_error(GTK_GL_AREA(area));
+    mpv_opengl_init_params gl = {.get_proc_address = gl_proc};
+    mpv_render_param init[] = {
+        {MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_OPENGL},
+        {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl}, {0, NULL}
+    };
+    /* Keep interactive scaling inexpensive on integrated graphics. */
+    mpv_set_option_string(v->mpv, "scale", "bilinear");
+    mpv_set_option_string(v->mpv, "dscale", "bilinear");
+    mpv_set_option_string(v->mpv, "cscale", "bilinear");
+    int rc = error ? MPV_ERROR_UNSUPPORTED : mpv_render_context_create(&v->renderer, v->mpv, init);
+    if (rc < 0) {
+        g_printerr("Modulez OpenGL unavailable: %s\n", error ? error->message : mpv_error_string(rc));
+        gtk_widget_destroy(area);
+        return FALSE;
+    }
+    v->area = area;
+    gtk_gl_area_set_auto_render(GTK_GL_AREA(area), FALSE);
+    g_signal_connect(area, "render", G_CALLBACK(render_gl), v);
+    g_printerr("Modulez video: OpenGL (%s)\n", (const char *)glGetString(GL_RENDERER));
+    return TRUE;
+}
+#endif
 
 static gboolean draw_picture(GtkWidget *area, cairo_t *cr, gpointer data)
 {
@@ -229,8 +295,12 @@ static gboolean tick_picture(GtkWidget *area, GdkFrameClock *clock, gpointer dat
         else if (fade_elapsed > 0)
             gtk_widget_set_opacity(v->controls, 1.0 - fade_elapsed / 250000.0);
     }
-    if (mpv_render_context_update(v->renderer) & MPV_RENDER_UPDATE_FRAME)
-        gtk_widget_queue_draw(area);
+    gboolean gl = GTK_IS_GL_AREA(area);
+    if (gl) gtk_gl_area_make_current(GTK_GL_AREA(area));
+    if (mpv_render_context_update(v->renderer) & MPV_RENDER_UPDATE_FRAME) {
+        if (gl) gtk_gl_area_queue_render(GTK_GL_AREA(area));
+        else gtk_widget_queue_draw(area);
+    }
     return G_SOURCE_CONTINUE;
 }
 
@@ -284,9 +354,9 @@ static gboolean video_key(GtkWidget *widget, GdkEventKey *event, gpointer data)
         case GDK_KEY_Left:
         case GDK_KEY_Right:
             if (gtk_widget_is_sensitive(GTK_WIDGET(v->timeline))) {
-                double position_ms = gtk_range_get_value(v->timeline);
-                double offset_ms = event->keyval == GDK_KEY_Left ? -5000.0 : 5000.0;
-                gtk_range_set_value(v->timeline, position_ms + offset_ms);
+                const char *offset = event->keyval == GDK_KEY_Left ? "-5" : "5";
+                const char *args[] = {"seek", offset, "relative+keyframes", NULL};
+                mpv_command(v->mpv, args);
             }
             return TRUE;
         }
@@ -303,6 +373,41 @@ static gboolean stop_on_video_close(GtkWidget *window, GdkEvent *event, gpointer
     (void)event;
     gtk_button_clicked(GTK_BUTTON(data));
     return TRUE;
+}
+
+/* GtkRange can consume the release during its implicit pointer grab. */
+static gboolean finish_scrub(gpointer data)
+{
+    VideoWindow *v = data;
+    GdkModifierType state = 0;
+    GdkWindow *window = gtk_widget_get_window(v->scrub_owner);
+    if (window) {
+        gdk_window_get_device_position(window, v->scrub_device, NULL, NULL, &state);
+        if (state & GDK_BUTTON1_MASK)
+            return G_SOURCE_CONTINUE;
+    }
+
+    v->scrub_timer = 0;
+    v->scrub_owner = NULL;
+    g_clear_object(&v->scrub_device);
+    if (window)
+        video_seek(v, gtk_range_get_value(v->timeline) / 1000.0);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean timeline_press(GtkWidget *widget, GdkEvent *event, gpointer data)
+{
+    VideoWindow *v = data;
+    if (event->type == GDK_BUTTON_PRESS && event->button.button == 1 && !v->scrub_timer) {
+        GdkDevice *device = gdk_event_get_device(event);
+        if (device) {
+            v->scrub_owner = widget;
+            v->scrub_device = g_object_ref(device);
+            v->last_preview = 0;
+            v->scrub_timer = g_timeout_add(30, finish_scrub, v);
+        }
+    }
+    return FALSE;
 }
 
 void video_add_controls(VideoWindow *v, GtkButton *play, GtkButton *stop,
@@ -324,6 +429,9 @@ void video_add_controls(VideoWindow *v, GtkButton *play, GtkButton *stop,
     GtkWidget *timeline = gtk_scale_new(GTK_ORIENTATION_HORIZONTAL, gtk_range_get_adjustment(seek));
     v->play_button = play;
     v->timeline = GTK_RANGE(timeline);
+    v->main_timeline = g_object_ref(seek);
+    g_signal_connect(seek, "event", G_CALLBACK(timeline_press), v);
+    g_signal_connect(timeline, "event", G_CALLBACK(timeline_press), v);
     g_signal_connect(v->window, "key-press-event", G_CALLBACK(video_key), v);
     gtk_scale_set_draw_value(GTK_SCALE(timeline), FALSE);
     gtk_widget_set_tooltip_text(timeline, "Seek");
@@ -365,10 +473,19 @@ void video_add_controls(VideoWindow *v, GtkButton *play, GtkButton *stop,
 void video_close(VideoWindow *v)
 {
     if (!v) return;
+    if (v->scrub_timer) g_source_remove(v->scrub_timer);
+    g_clear_object(&v->scrub_device);
+    if (v->main_timeline) {
+        g_signal_handlers_disconnect_by_data(v->main_timeline, v);
+        g_clear_object(&v->main_timeline);
+    }
     g_clear_object(&v->motion);
     if (v->parent_configure) g_signal_handler_disconnect(v->parent, v->parent_configure);
+    if (v->renderer) {
+        if (GTK_IS_GL_AREA(v->area)) gtk_gl_area_make_current(GTK_GL_AREA(v->area));
+        mpv_render_context_free(v->renderer);
+    }
     if (v->window) gtk_widget_destroy(v->window);
-    if (v->renderer) mpv_render_context_free(v->renderer);
     if (v->mpv) mpv_terminate_destroy(v->mpv);
     g_clear_pointer(&v->surface, cairo_surface_destroy);
     g_free(v);
@@ -388,14 +505,6 @@ VideoWindow *video_open(GtkWindow *parent, const char *path, int volume, GError 
     mpv_set_option_string(v->mpv, "pause", "yes");
     rc = mpv_initialize(v->mpv);
     if (rc < 0) goto fail;
-    mpv_render_param init[] = {{MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_SW}, {0, NULL}};
-    rc = mpv_render_context_create(&v->renderer, v->mpv, init);
-    if (rc < 0) goto fail;
-    video_volume(v, volume);
-    const char *load[] = {"loadfile", path, NULL};
-    rc = mpv_command(v->mpv, load);
-    if (rc < 0) goto fail;
-
     v->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_group_add_window(gtk_window_get_group(parent), GTK_WINDOW(v->window));
     gtk_window_set_title(GTK_WINDOW(v->window), "Modulez Video");
@@ -412,16 +521,32 @@ VideoWindow *video_open(GtkWindow *parent, const char *path, int volume, GError 
     gtk_style_context_add_class(gtk_widget_get_style_context(v->window), "modulez-modern-dialog");
     gtk_style_context_add_class(gtk_widget_get_style_context(bar), "modulez-dialog-titlebar");
     gtk_window_set_default_size(GTK_WINDOW(v->window), 480, 300);
-    v->area = gtk_drawing_area_new();
     v->layout = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(v->window), v->layout);
     v->overlay = gtk_overlay_new();
-    gtk_container_add(GTK_CONTAINER(v->overlay), v->area);
     gtk_box_pack_start(GTK_BOX(v->layout), v->overlay, TRUE, TRUE, 0);
+#ifdef GDK_WINDOWING_X11
+    if (GDK_IS_X11_DISPLAY(gtk_widget_get_display(v->window)) &&
+        g_strcmp0(g_getenv("MODULEZ_VIDEO_RENDERER"), "software") != 0)
+        try_gl(v);
+#endif
+    if (!v->area) {
+        mpv_render_param init[] = {{MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_SW}, {0, NULL}};
+        rc = mpv_render_context_create(&v->renderer, v->mpv, init);
+        if (rc < 0) goto fail;
+        v->area = gtk_drawing_area_new();
+        gtk_container_add(GTK_CONTAINER(v->overlay), v->area);
+        g_signal_connect(v->area, "draw", G_CALLBACK(draw_picture), v);
+        g_printerr("Modulez video: software renderer\n");
+    }
+    video_volume(v, volume);
+    const char *load[] = {"loadfile", path, NULL};
+    rc = mpv_command(v->mpv, load);
+    if (rc < 0) goto fail;
+
     gtk_widget_add_events(v->area, GDK_BUTTON_PRESS_MASK);
     g_signal_connect(v->area, "button-press-event", G_CALLBACK(picture_click), v);
     g_signal_connect(v->window, "window-state-event", G_CALLBACK(window_state), v);
-    g_signal_connect(v->area, "draw", G_CALLBACK(draw_picture), v);
     gtk_widget_add_tick_callback(v->area, tick_picture, v, NULL);
 #ifdef GDK_WINDOWING_X11
     if (GDK_IS_X11_DISPLAY(gtk_widget_get_display(v->window))) {
@@ -502,7 +627,15 @@ void video_volume(VideoWindow *v, int volume)
 void video_seek(VideoWindow *v, double seconds)
 {
     char value[G_ASCII_DTOSTR_BUF_SIZE];
-    const char *args[] = {"seek", g_ascii_dtostr(value, sizeof(value), seconds), "absolute+exact", NULL};
+    const char *mode = "absolute+exact";
+    if (v->scrub_owner) {
+        gint64 now = g_get_monotonic_time();
+        if (v->last_preview && now - v->last_preview < 120 * G_TIME_SPAN_MILLISECOND)
+            return;
+        v->last_preview = now;
+        mode = "absolute+keyframes";
+    }
+    const char *args[] = {"seek", g_ascii_dtostr(value, sizeof(value), seconds), mode, NULL};
     mpv_command(v->mpv, args);
 }
 
@@ -516,7 +649,10 @@ gboolean video_position(VideoWindow *v, double *seconds, double *duration, const
             if (*error || end->reason == MPV_END_FILE_REASON_EOF) return TRUE;
         }
     }
-    mpv_get_property(v->mpv, "time-pos", MPV_FORMAT_DOUBLE, seconds);
+    if (v->scrub_owner)
+        *seconds = gtk_range_get_value(v->timeline) / 1000.0;
+    else
+        mpv_get_property(v->mpv, "time-pos", MPV_FORMAT_DOUBLE, seconds);
     mpv_get_property(v->mpv, "duration", MPV_FORMAT_DOUBLE, duration);
     return FALSE;
 }
