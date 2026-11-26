@@ -237,7 +237,19 @@ public class RemoteActivity extends Activity {
                 LinearLayout.LayoutParams key=(LinearLayout.LayoutParams)row.getChildAt(i).getLayoutParams();
                 key.width=0; key.weight=1;
             }
-            volumeText = label(root,"Volume",16); volume = new SeekBar(this); root.addView(volume);
+            volumeText = label(root,"Volume",16);
+            volume = new SeekBar(this);
+            volume.setContentDescription("Player volume");
+            volume.setPadding(dp(16),0,dp(16),0);
+            volume.setSplitTrack(false);
+            android.graphics.drawable.Drawable track = getDrawable(
+                    getResources().getIdentifier("volume_track","drawable",getPackageName()));
+            volume.setProgressDrawable(track);
+            GradientDrawable thumb = surface(AQUA,INK,14);
+            thumb.setSize(dp(28),dp(28));
+            volume.setThumb(thumb);
+            volume.setThumbOffset(dp(14));
+            root.addView(volume,new LinearLayout.LayoutParams(-1,dp(56)));
             volume.setMax(100);
             volume.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
                 public void onStartTrackingTouch(SeekBar bar) { dragging=true; }

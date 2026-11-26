@@ -54,3 +54,9 @@ Press and hold a playlist row and choose **Remove from playlist** to remove that
 ### Preview 8
 
 In **Visualizer → Wavescope modes**, tap a **Color** entry to apply the desktop palette while keeping your Wavescope mode. The menu marks the current color. This works with the Preview 7 Android remote and its existing pairing.
+
+### Preview 9
+
+The Android volume slider has a 56 dp touch area, a 28 dp thumb and a 10 dp track. Drag left or right and release to set the player volume.
+
+On Linux, **Pair remote** lists each IPv4 address with its interface name and type. Active physical links take priority over tunnels. Among otherwise comparable links, the lower-metric default route comes first. You can still select another address or enter one manually.

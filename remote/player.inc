@@ -372,6 +372,8 @@ static GdkPixbuf *remote_pairing_qr(const char *ip, const char *fingerprint, con
     return image;
 }
 
+#include "network.inc"
+
 static void remote_dialog(GtkButton *button, gpointer data)
 {
     (void)data;
@@ -388,17 +390,7 @@ static void remote_dialog(GtkButton *button, gpointer data)
     gtk_container_set_border_width(GTK_CONTAINER(box), 14);
     gtk_box_pack_start(GTK_BOX(box), gtk_label_new("Choose this computer’s home-network address"), FALSE, FALSE, 8);
     GtkWidget *combo = gtk_combo_box_text_new_with_entry();
-    struct ifaddrs *all = NULL;
-    if (getifaddrs(&all) == 0) {
-        for (struct ifaddrs *it = all; it; it = it->ifa_next) {
-            if (!it->ifa_addr || it->ifa_addr->sa_family != AF_INET ||
-                !(it->ifa_flags & IFF_UP) || (it->ifa_flags & IFF_LOOPBACK)) continue;
-            char ip[INET_ADDRSTRLEN];
-            if (inet_ntop(AF_INET, &((struct sockaddr_in *)it->ifa_addr)->sin_addr, ip, sizeof(ip)))
-                gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo), ip);
-        }
-        freeifaddrs(all);
-    }
+    remote_address_choices(GTK_COMBO_BOX_TEXT(combo));
     gtk_box_pack_start(GTK_BOX(box), combo, FALSE, FALSE, 4);
     gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
     gtk_entry_set_placeholder_text(GTK_ENTRY(gtk_bin_get_child(GTK_BIN(combo))), "Computer IPv4 address");
@@ -409,7 +401,8 @@ static void remote_dialog(GtkButton *button, gpointer data)
     gtk_box_pack_start(GTK_BOX(box),folders,FALSE,FALSE,4);
     gtk_widget_show_all(dialog);
     int answer = gtk_dialog_run(GTK_DIALOG(dialog));
-    gchar *ip = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(combo));
+    const char *selected = gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
+    gchar *ip = selected ? g_strdup(selected) : gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(combo));
     gtk_widget_destroy(dialog);
     if (answer != GTK_RESPONSE_OK || !ip) { g_free(ip); return; }
     g_strstrip(ip);

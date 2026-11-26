@@ -1,0 +1,10 @@
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@android:id/background" android:height="10dp" android:gravity="fill_horizontal|center_vertical">
+        <shape><corners android:radius="5dp"/><solid android:color="#466068"/></shape>
+    </item>
+    <item android:id="@android:id/progress" android:height="10dp" android:gravity="fill_horizontal|center_vertical">
+        <clip android:gravity="start" android:clipOrientation="horizontal">
+            <shape><corners android:radius="5dp"/><solid android:color="#79D9D0"/></shape>
+        </clip>
+    </item>
+</layer-list>
