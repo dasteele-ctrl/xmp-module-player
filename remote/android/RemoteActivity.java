@@ -91,6 +91,7 @@ public class RemoteActivity extends Activity {
             }
             JSONObject obj = new JSONObject(bytes.toString("UTF-8"));
             if (secret != null) obj.put("pin", fullPin[0]);
+            if (c.getHeaderField("X-Fullscreen")!=null) obj.put("fullscreen","1".equals(c.getHeaderField("X-Fullscreen")));
             return obj;
         } finally { c.disconnect(); }
     }
@@ -150,6 +151,9 @@ public class RemoteActivity extends Activity {
                 public void onStopTrackingTouch(SeekBar bar) { dragging=false; refresh("/volume",bar.getProgress()); }
                 public void onProgressChanged(SeekBar bar,int n,boolean user) { volumeText.setText("Player volume  " + n + "%"); }
             });
+            LinearLayout tools=new LinearLayout(this); root.addView(tools);
+            button(tools,"Browse music",() -> music(null,"","Shared music folders"));
+            button(tools,"Visualizer",() -> visualizers(0));
             LinearLayout browse = new LinearLayout(this);
             browse.setGravity(android.view.Gravity.CENTER_VERTICAL);
             root.addView(browse);
@@ -164,6 +168,107 @@ public class RemoteActivity extends Activity {
             button(root,"Forget player",this::forget);
         }
     }
+    private interface Reply { void show(JSONObject result) throws Exception; }
+
+    private void playerRequest(String path,String method,Reply reply) {
+        final Session target=session;
+        if (target==null) return;
+        worker.execute(() -> {
+            try {
+                JSONObject result=call(target,path,method,null,-1,-1);
+                ui.post(() -> {
+                    if (target!=session || !foreground || isDestroyed()) return;
+                    try { reply.show(result); }
+                    catch (Exception ex) { notice("Could not read the player's response."); }
+                });
+            } catch (Exception ex) { ui.post(() -> {
+                if (target==session && foreground && !isDestroyed()) notice(message(ex));
+            }); }
+        });
+    }
+
+    private void notice(String text) { Toast.makeText(this,text,Toast.LENGTH_LONG).show(); }
+    private String musicQuery(String rootId,String path) {
+        return rootId==null ? "" : "?root="+android.net.Uri.encode(rootId)+"&path="+android.net.Uri.encode(path);
+    }
+
+    private void music(String rootId,String path,String heading) {
+        playerRequest("/music"+musicQuery(rootId,path),"GET",data -> {
+            JSONArray rows=data.getJSONArray("items");
+            String[] names=new String[rows.length()];
+            for (int i=0;i<names.length;i++) {
+                JSONObject row=rows.getJSONObject(i);
+                names[i]=row.getString("name")+(row.getBoolean("folder")?" /":"");
+            }
+            android.app.AlertDialog.Builder box=new android.app.AlertDialog.Builder(this)
+                .setTitle(heading).setNegativeButton("Close",null);
+            if (rootId!=null) box.setNeutralButton("Up",(d,w) -> {
+                if (path.isEmpty()) music(null,"","Shared music folders");
+                else {
+                    int slash=path.lastIndexOf('/');
+                    String parent=slash<0 ? "" : path.substring(0,slash);
+                    music(rootId,parent,parent.isEmpty()?"Add to playlist":parent);
+                }
+            });
+            if (rows.length()==0) box.setMessage(rootId==null ?
+                    "Choose shared music folders in the computer’s pairing dialog." : "No music or subfolders here.");
+            else box.setItems(names,(d,index) -> {
+                JSONObject row=rows.optJSONObject(index);
+                String child=row.optString("key"), name=row.optString("name");
+                if (rootId==null) music(child,"","Add to playlist · "+name);
+                else if (row.optBoolean("folder")) music(rootId,child,"Add to playlist · "+name);
+                else playerRequest("/music/add"+musicQuery(rootId,child),"POST",added -> {
+                    notice("Added "+name); music(rootId,path,heading);
+                });
+            });
+            box.show();
+        });
+    }
+
+    private int visRequest;
+    private void visualizers(int attempt) {
+        final int ticket=++visRequest;
+        final Session target=session;
+        playerRequest("/vis","GET",data -> {
+            if (ticket!=visRequest) return;
+            if (!data.optBoolean("ready")) {
+                if (attempt==0) notice("Opening the desktop visualizer…");
+                if (attempt<15) ui.postDelayed(() -> {
+                    if (foreground && target==session && ticket==visRequest) visualizers(attempt+1);
+                },650);
+                else notice("Check the Vis page on the computer and try again.");
+                return;
+            }
+            boolean full=data.optBoolean("fullscreen");
+            new android.app.AlertDialog.Builder(this).setTitle("Desktop visualizer")
+                .setItems(new String[]{"Wavescope modes","projectM presets",full?"Exit fullscreen":"Enter fullscreen"},(d,i) -> {
+                    if (i==2) playerRequest("/vis/fullscreen?on="+(full?"0":"1"),"POST",result -> {});
+                    else visChoices(data,i==0?"standard":"projectm");
+                }).setNegativeButton("Close",null).show();
+        });
+    }
+    private void visChoices(JSONObject data,String group) {
+        JSONArray rows=data.optJSONArray(group);
+        if (rows==null || rows.length()==0) { notice("No choices available."); return; }
+        String[] names=new String[rows.length()];
+        int selected=-1;
+        for (int i=0;i<names.length;i++) {
+            JSONObject item=rows.optJSONObject(i);
+            names[i]=item.optString("name");
+            if (group.equals(data.optString("engine")) && item.optString("key").equals(data.optString("selected"))) selected=i;
+        }
+        new android.app.AlertDialog.Builder(this).setTitle(group.equals("standard")?"Wavescope modes":"projectM presets")
+            .setSingleChoiceItems(names,selected,(d,i) -> {
+                d.dismiss();
+                String key=rows.optJSONObject(i).optString("key");
+                playerRequest("/vis?group="+group+"&choice="+android.net.Uri.encode(key),"POST",result -> {
+                    if (!result.optBoolean("ready") || !key.equals(result.optString("selected")))
+                        notice("The player could not switch to that visualizer.");
+                    else notice(names[i]);
+                });
+            }).setNegativeButton("Close",null).show();
+    }
+
     private void chooseStation() {
         final Session target=session;
         worker.execute(() -> {

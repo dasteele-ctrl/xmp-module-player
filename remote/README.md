@@ -32,3 +32,9 @@ Tap **World Radio** beside **Stations** on the paired phone. The player queries 
 On the computer choose **Pair remote** and **Start pairing**. In the Android app tap **Scan QR code** and point the camera at the pairing dialog. The QR code carries the player’s address, full SHA-256 certificate fingerprint and the single-use code. Scanning and decoding happen on the phone. Camera permission is optional for manual pairing. To pair again after restarting the player, tap **Forget player** first.
 
 The desktop encoder uses Project Nayuki’s QR Code generator v1.8.0 (MIT). The Android build downloads and verifies ZXing Core 3.3.3 (Apache 2.0); the scanner runs offline after installation.
+
+### Preview 5
+
+In the computer’s **Pair remote** dialog, use **Shared music folders** to add one or more folders. The selection persists across launches. Use **Clear sharing** there to remove all shared folders. After pairing once, **Browse music** on the phone opens those folders. Tap a track to append it to the playlist. The computer keeps playing its current track.
+
+**Visualizer** opens the desktop Vis page. Choose a Wavescope mode, a projectM preset (including imported presets), or enter/exit fullscreen. These actions use the same connection as radio, playback and player volume. This preview keeps the Android package ID. Moving from Preview 4 to the newly signed Preview 5 requires uninstalling the previous APK and pairing once.

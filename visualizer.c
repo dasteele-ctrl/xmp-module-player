@@ -500,6 +500,39 @@ static gboolean fullscreen_delete(GtkWidget *widget, GdkEvent *event, gpointer d
     if (v->fullscreen) toggle_fullscreen(v);
     return TRUE;
 }
+static void vis_remote_done(GObject *source,GAsyncResult *result,gpointer data)
+{
+    SoupServerMessage *msg=data;
+    g_autoptr(JSCValue) value=webkit_web_view_call_async_javascript_function_finish(WEBKIT_WEB_VIEW(source),result,NULL);
+    if (value && jsc_value_is_string(value)) {
+        gchar *json=jsc_value_to_string(value);
+        soup_server_message_set_response(msg,"application/json",SOUP_MEMORY_TAKE,json,strlen(json));
+        soup_server_message_set_status(msg,200,NULL);
+    } else soup_server_message_set_status(msg,409,NULL);
+    soup_server_message_unpause(msg);
+    g_object_unref(msg);
+}
+
+void modulez_visualizer_remote(SoupServerMessage *msg,const char *group,const char *choice)
+{
+    Visualizer *v=active_visualizer;
+    if (!v || !v->ready || !v->web) {
+        const char *json="{\"ready\":false}";
+        soup_server_message_set_response(msg,"application/json",SOUP_MEMORY_COPY,json,strlen(json));
+        soup_server_message_set_status(msg,200,NULL);
+        return;
+    }
+    GVariantDict args;
+    g_variant_dict_init(&args,NULL);
+    g_variant_dict_insert(&args,"group","s",group?group:"");
+    g_variant_dict_insert(&args,"choice","s",choice?choice:"");
+    g_autoptr(GVariant) arguments=g_variant_ref_sink(g_variant_dict_end(&args));
+    soup_server_message_pause(msg);
+    webkit_web_view_call_async_javascript_function(v->web,
+        "return window.modulezRemoteVis ? await window.modulezRemoteVis(group,choice) : JSON.stringify({ready:false})",
+        -1,arguments,NULL,NULL,v->cancel,vis_remote_done,g_object_ref(msg));
+}
+
 gboolean modulez_visualizer_is_fullscreen(void)
 {
     return active_visualizer && active_visualizer->fullscreen;

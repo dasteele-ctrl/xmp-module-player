@@ -9418,6 +9418,8 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_stack_add_named(GTK_STACK(page_stack), archives, "archives");
     g_signal_connect(archives, "map", G_CALLBACK(build_archive_browser), NULL);
     g_object_set_data(G_OBJECT(page_stack), "archive-placeholder", archive_placeholder);
+    remote_notebook=GTK_NOTEBOOK(notebook);
+    remote_vis_page=vis_placeholder;
     g_object_set_data(G_OBJECT(page_stack), "vis-placeholder", vis_placeholder);
     g_signal_connect(notebook, "switch-page", G_CALLBACK(visualizer_page_switch), page_stack);
     gtk_box_pack_start(GTK_BOX(body), page_stack, TRUE, TRUE, 0);

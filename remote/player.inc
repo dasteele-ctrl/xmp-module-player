@@ -41,6 +41,10 @@ static void remote_json(SoupServerMessage *msg, JsonNode *node)
     json_node_unref(node);
 }
 
+#include "music.inc"
+static GtkNotebook *remote_notebook;
+static GtkWidget *remote_vis_page;
+
 /* Generate identifiers on the player. Only an entry currently in its station
  * catalog can be played, even if a saved list changed after the phone read it. */
 static gboolean remote_station(JsonArray *rows, const char *wanted, const char *group,
@@ -118,6 +122,32 @@ static void remote_request(SoupServer *server, SoupServerMessage *msg,
     }
     if (!remote_token[0] || g_strcmp0(soup_message_headers_get_one(headers, "X-Remote-Token"), remote_token)) {
         soup_server_message_set_status(msg, 401, NULL);
+        return;
+    }
+    gboolean get=!strcmp(method,"GET"), post=!strcmp(method,"POST");
+    if ((get && !strcmp(path,"/music")) || (post && !strcmp(path,"/music/add"))) {
+        remote_music(msg,query,post);
+        return;
+    }
+    if (((get || post) && !strcmp(path,"/vis")) || (post && !strcmp(path,"/vis/fullscreen"))) {
+        if (!modulez_visualizer_is_fullscreen()) {
+            gtk_widget_show(window);
+            gtk_notebook_set_current_page(remote_notebook,gtk_notebook_page_num(remote_notebook,remote_vis_page));
+        }
+        if (!strcmp(path,"/vis/fullscreen")) {
+            const char *on=query?g_hash_table_lookup(query,"on"):NULL;
+            if (!on || (strcmp(on,"1") && strcmp(on,"0"))) { soup_server_message_set_status(msg,400,NULL); return; }
+            gboolean ok=(*on=='1')==modulez_visualizer_is_fullscreen() || modulez_visualizer_toggle_fullscreen();
+            soup_server_message_set_status(msg,ok?204:409,NULL); return;
+        }
+        const char *group=post && query?g_hash_table_lookup(query,"group"):NULL;
+        const char *choice=post && query?g_hash_table_lookup(query,"choice"):NULL;
+        if (post && (!group || !choice || !g_utf8_validate(choice,-1,NULL) || strlen(choice)>256 ||
+                (strcmp(group,"standard") && strcmp(group,"projectm")))) {
+            soup_server_message_set_status(msg,400,NULL); return;
+        }
+        soup_message_headers_append(soup_server_message_get_response_headers(msg),"X-Fullscreen",modulez_visualizer_is_fullscreen()?"1":"0");
+        modulez_visualizer_remote(msg,group,choice);
         return;
     }
     if (!strcmp(path, "/world") && (!strcmp(method, "GET") || !strcmp(method, "POST"))) {
@@ -332,6 +362,11 @@ static void remote_dialog(GtkButton *button, gpointer data)
     gtk_box_pack_start(GTK_BOX(box), combo, FALSE, FALSE, 4);
     gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
     gtk_entry_set_placeholder_text(GTK_ENTRY(gtk_bin_get_child(GTK_BIN(combo))), "Computer IPv4 address");
+    load_shared_music();
+    g_autofree char *label=g_strdup_printf("Shared music folders (%u)…",shared_music_roots?g_strv_length(shared_music_roots):0);
+    GtkWidget *folders=gtk_button_new_with_label(label);
+    g_signal_connect(folders,"clicked",G_CALLBACK(choose_shared_music),dialog);
+    gtk_box_pack_start(GTK_BOX(box),folders,FALSE,FALSE,4);
     gtk_widget_show_all(dialog);
     int answer = gtk_dialog_run(GTK_DIALOG(dialog));
     gchar *ip = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(combo));
