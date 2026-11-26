@@ -1,8 +1,8 @@
 CC ?= cc
 CXX ?= c++
-CFLAGS += -O2 -Wall -Wextra $(shell pkg-config --cflags gtk+-3.0 webkit2gtk-4.1 gio-2.0 libsoup-3.0 json-glib-1.0 sdl2 libxmp libuade libavformat libavcodec libavutil libswresample fluidsynth mpv)
+CFLAGS += -O2 -Wall -Wextra $(shell pkg-config --cflags gtk+-3.0 webkit2gtk-4.1 gio-2.0 libsoup-3.0 json-glib-1.0 sdl2 libxmp libuade libavformat libavcodec libavutil libswresample fluidsynth mpv gl)
 CXXFLAGS += -O2 -Wall -Wextra -std=c++11 $(shell pkg-config --cflags libsidplayfp)
-LDLIBS += $(shell pkg-config --libs gtk+-3.0 gio-2.0 sdl2 libxmp libuade libavformat libavcodec libavutil libswresample fluidsynth mpv) $(shell pkg-config --libs libsidplayfp) -lm $(shell pkg-config --libs webkit2gtk-4.1 libsoup-3.0 json-glib-1.0)
+LDLIBS += $(shell pkg-config --libs gtk+-3.0 gio-2.0 sdl2 libxmp libuade libavformat libavcodec libavutil libswresample fluidsynth mpv gl) $(shell pkg-config --libs libsidplayfp) -lm $(shell pkg-config --libs webkit2gtk-4.1 libsoup-3.0 json-glib-1.0)
 
 all: modulez-player
 
