@@ -50,3 +50,7 @@ The Android pairing screen and Now Playing header show the Modulez Player icon. 
 ### Preview 7
 
 Press and hold a playlist row and choose **Remove from playlist** to remove that occurrence. **Clear playlist** shows the total number of tracks across all pages before clearing. Both actions edit only the queue. Files stay on the computer and the current track keeps playing. If the queue changes while a menu is open, reopen the action on the refreshed list.
+
+### Preview 8
+
+In **Visualizer → Wavescope modes**, tap a **Color** entry to apply the desktop palette while keeping your Wavescope mode. The menu marks the current color. This works with the Preview 7 Android remote and its existing pairing.

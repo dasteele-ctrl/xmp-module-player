@@ -179,17 +179,24 @@ report('projectM controls ready • select projectM / MilkDrop to test');
 // Use the live toolbar choices, including the user's imported presets.
 window.modulezRemoteVis=async function(group,choice) {
  const mode=document.getElementById('mode');
+ const colorPrefix='palette:';
+ const isColor=group==='standard' && choice.startsWith(colorPrefix);
+ const value=isColor?choice.slice(colorPrefix.length):choice;
  if(group) {
   if(engineSelect.disabled)throw Error('Engine is loading');
-  const select=group==='standard'?mode:group==='projectm'?presetSelect:null;
-  if(!select||!Array.from(select.options).some(o=>o.value===choice))throw Error('Unknown choice');
-  select.value=choice;
+  const select=isColor?paletteControl:group==='standard'?mode:group==='projectm'?presetSelect:null;
+  if(!select||!Array.from(select.options).some(o=>o.value===value))throw Error('Unknown choice');
+  select.value=value;
   if(engineSelect.value!==group){engineSelect.value=group;await engineSelect.onchange();}
   if(engineSelect.value!==group)throw Error('Engine unavailable');
   await select.onchange();
-  if(select.value!==choice)throw Error('Preset unavailable');
+  if(select.value!==value)throw Error('Preset unavailable');
  }
  const options=select=>Array.from(select.options,o=>({name:o.text,key:o.value}));
- return JSON.stringify({ready:true,standard:options(mode),projectm:options(presetSelect),
-  engine:engineSelect.value,selected:engineSelect.value==='standard'?mode.value:presetSelect.value});
+ const colors=options(paletteControl).map(({name,key})=>({
+  name:'Color · '+name+(key===paletteControl.value?' (current)':''),
+  key:colorPrefix+key
+ }));
+ return JSON.stringify({ready:true,standard:[...colors,...options(mode)],projectm:options(presetSelect),
+  engine:engineSelect.value,selected:isColor?choice:engineSelect.value==='standard'?mode.value:presetSelect.value});
 };
