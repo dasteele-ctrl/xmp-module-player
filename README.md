@@ -1,10 +1,12 @@
-# Modulez Player 1.8.7
+# Modulez Player 1.8.8
 
-**The RMF Update** adds direct Beatnik RMF playback with the Beatnik Standard
+Version **1.8.8** fixes OpenGL video playback. The Linux AppImage played video smoothly on Linux Mint with Intel HD Graphics 4600.
+
+**The 1.8.7 RMF Update** adds direct Beatnik RMF playback with the Beatnik Standard
 v1.1.1 Uncompressed bank. Browse WebTV and SoundMusicSys tracks, or open a
 Headspace album to play a song, queue it, or save its ZIP to Downloads.
 
-[Download the 1.8.7 Linux AppImage](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.8.7/Modulez-Player-v1.8.7-x86_64.AppImage)
+[Download the 1.8.8 Linux AppImage](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.8.8/Modulez-Player-v1.8.8-x86_64.AppImage)
 
 
 **Formerly XMP Module Player.** Version **1.8.6** improves keyboard control and fullscreen viewing for local video.
@@ -41,7 +43,7 @@ The video window shares play/pause, stop, seek, and volume with the main player.
 
 ## Features
 
-Download the [1.8.6 Linux AppImage](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.8.6) or read the [1.8.6 release notes](RELEASE_NOTES_1.8.6.md).
+See the [1.8.8 release notes and downloads](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v1.8.8).
 
 See the [1.8.2 release notes](RELEASE_NOTES_1.8.2.md) for batch export settings and supported formats.
 
@@ -196,13 +198,13 @@ See [all releases](../../releases) for earlier versions.
 
 ### Running the AppImage
 
-1. Download the versioned `Modulez-Player-v1.8.6-x86_64.AppImage` file from Release v1.8.6.
+1. Download the versioned `Modulez-Player-v1.8.8-x86_64.AppImage` file from Release v1.8.8.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x Modulez-Player-v1.8.6-x86_64.AppImage
-   ./Modulez-Player-v1.8.6-x86_64.AppImage
+   chmod +x Modulez-Player-v1.8.8-x86_64.AppImage
+   ./Modulez-Player-v1.8.8-x86_64.AppImage
    ```
 
 ### Running on Windows with WSL
@@ -450,7 +452,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current source version: 1.8.7**
+**Current release: 1.8.8**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and
