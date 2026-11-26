@@ -264,6 +264,32 @@ static void remote_request(SoupServer *server, SoupServerMessage *msg,
         soup_server_message_set_status(msg, 405, NULL);
         return;
     }
+    if (!strcmp(path,"/queue/remove") || !strcmp(path,"/queue/clear")) {
+        gchar revision[16];
+        g_snprintf(revision,sizeof(revision),"%u",playlist_revision);
+        if (import_source || g_strcmp0(revision,soup_message_headers_get_one(headers,"X-Revision"))) {
+            soup_server_message_set_status(msg,409,NULL);
+            return;
+        }
+        if (!strcmp(path,"/queue/clear")) {
+            on_playlist_clear(NULL,NULL);
+        } else {
+            const char *value=soup_message_headers_get_one(headers,"X-Value");
+            guint64 index;
+            GtkTreeIter iter;
+            if (!value || !g_ascii_string_to_unsigned(value,10,0,G_MAXINT,&index,NULL)) {
+                soup_server_message_set_status(msg,400,NULL);
+                return;
+            }
+            if (!gtk_tree_model_iter_nth_child(GTK_TREE_MODEL(playlist_store),&iter,NULL,(gint)index)) {
+                soup_server_message_set_status(msg,409,NULL);
+                return;
+            }
+            gtk_list_store_remove(playlist_store,&iter);
+        }
+        soup_server_message_set_status(msg,204,NULL);
+        return;
+    }
     if (!strcmp(path, "/toggle")) on_tray_play_pause(NULL);
     else if (!strcmp(path, "/previous")) on_tray_previous(NULL);
     else if (!strcmp(path, "/next")) on_tray_next(NULL);

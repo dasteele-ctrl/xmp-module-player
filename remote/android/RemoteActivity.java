@@ -30,7 +30,9 @@ public class RemoteActivity extends Activity {
     private SharedPreferences prefs;
     private Session session;
     private long revision = -1;
-    private int queueOffset, wantedOffset;
+    private int queueOffset, wantedOffset, queueTotal;
+    private Button clearQueue;
+    private boolean importing;
     private Button earlier, later;
     private TextView range;
     private LinearLayout queueNav;
@@ -262,8 +264,21 @@ public class RemoteActivity extends Activity {
             root.addView(list,new LinearLayout.LayoutParams(-1,0,1));
             tracks = new ArrayAdapter<>(this,android.R.layout.simple_list_item_1,new ArrayList<>());
             list.setAdapter(tracks); list.setOnItemClickListener((a,v,i,id) -> refresh("/select",queueOffset+i));
+            list.setOnItemLongClickListener((parent,view,index,id) -> {
+                if (importing) { notice("Folder import in progress."); return true; }
+                final int selected=queueOffset+index;
+                final long snapshot=revision;
+                new android.app.AlertDialog.Builder(this).setTitle(tracks.getItem(index))
+                    .setItems(new String[]{"Remove from playlist"},(dialog,which) ->
+                        refresh("/queue/remove",selected,snapshot))
+                    .setNegativeButton("Cancel",null).show();
+                return true;
+            });
             status = label(root,"Connecting to " + session.host,14);
-            button(root,"Forget player",this::forget);
+            LinearLayout footer=new LinearLayout(this); root.addView(footer);
+            clearQueue=button(footer,"Clear playlist",this::confirmClear);
+            clearQueue.setEnabled(false);
+            button(footer,"Forget player",this::forget);
         }
     }
     private interface Reply { void show(JSONObject result) throws Exception; }
@@ -505,7 +520,7 @@ public class RemoteActivity extends Activity {
         }
     }
     private void forget() {
-        ui.removeCallbacks(poll); session=null; queueOffset=wantedOffset=0; revision=-1; busy=false;
+        ui.removeCallbacks(poll); session=null; queueOffset=wantedOffset=queueTotal=0; importing=false; revision=-1; busy=false;
         prefs.edit().remove("pin").remove("token").apply(); render();
     }
     @Override protected void onActivityResult(int request, int result, android.content.Intent data) {
@@ -557,17 +572,28 @@ public class RemoteActivity extends Activity {
         if (ex instanceof HttpError && ((HttpError)ex).status==410) return "Start a new pairing session on the player.";
         return ex.getLocalizedMessage();
     }
+    private void confirmClear() {
+        final long snapshot=revision;
+        String question=queueTotal==1 ? "Remove 1 track from the playlist?" :
+                "Remove all "+queueTotal+" tracks from the playlist?";
+        new android.app.AlertDialog.Builder(this).setTitle("Clear playlist?")
+            .setMessage(question).setNegativeButton("Cancel",null)
+            .setPositiveButton("Clear playlist",(d,w) -> refresh("/queue/clear",-1,snapshot)).show();
+    }
     private void changeQueuePage(int delta) {
         wantedOffset=Math.max(0,queueOffset+delta);
         refresh(null,-1);
     }
     private void refresh(String action, int value) {
+        refresh(action,value,revision);
+    }
+    private void refresh(String action,int value,long actionRevision) {
         if (session == null || !foreground || (action == null && busy)) return;
         ui.removeCallbacks(poll);
         final Session target=session; final long seen=revision; final int page=wantedOffset, displayed=queueOffset; busy=true;
         worker.execute(() -> {
             try {
-                if (action != null) call(target,action,"POST",null,value,seen);
+                if (action != null) call(target,action,"POST",null,value,actionRevision);
                 JSONObject state=call(target,"/state","GET",null,-1,-1);
                 JSONObject queue=state.optBoolean("importing") || (state.getLong("revision")==seen && page==displayed) ? null : call(target,"/playlist?offset="+page,"GET",null,-1,-1);
                 ui.post(() -> {
@@ -582,11 +608,14 @@ public class RemoteActivity extends Activity {
                         tracks.notifyDataSetChanged();
                         queueOffset=wantedOffset=queue.optInt("offset");
                         int total=queue.optInt("total",rows.length());
+                        queueTotal=total;
                         queueNav.setVisibility(total>150?android.view.View.VISIBLE:android.view.View.GONE);
                         earlier.setEnabled(queueOffset>0);
                         later.setEnabled(queueOffset+rows.length()<total);
                         range.setText(" "+(queueOffset+1)+"–"+(queueOffset+rows.length())+" / "+total+" ");
                     }
+                    importing=state.optBoolean("importing");
+                    clearQueue.setEnabled(queueTotal>0 && !importing);
                     String batch=state.optString("importStatus");
                     status.setText(batch.isEmpty()?"Connected to " + target.host:batch); schedule();
                 });

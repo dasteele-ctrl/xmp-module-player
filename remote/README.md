@@ -46,3 +46,7 @@ On the phone, open **Browse music**, enter a shared folder, and tap **Add entire
 On Android 11 and later, if Android records a crash, low-memory termination, or unresponsive process, the remote can show its previous exit reason on the next launch with a **Copy details** button.
 
 The Android pairing screen and Now Playing header show the Modulez Player icon. The charcoal surfaces, aqua accents, rounded transport buttons and playlist panel carry the desktop player's appearance into the remote.
+
+### Preview 7
+
+Press and hold a playlist row and choose **Remove from playlist** to remove that occurrence. **Clear playlist** shows the total number of tracks across all pages before clearing. Both actions edit only the queue. Files stay on the computer and the current track keeps playing. If the queue changes while a menu is open, reopen the action on the refreshed list.
