@@ -38,7 +38,7 @@ static gboolean on_visualizer_shortcut(GtkWidget *widget, GdkEventKey *event, gp
 #include "zx_audio.h"
 #endif
 
-#define MODULEZ_VERSION "1.8.7"
+#define MODULEZ_VERSION "1.8.8 Remote Preview"
 #define MODULEZ_RELEASE_REVISION "0"
 #define RELEASES_URL "https://github.com/dasteele-ctrl/xmp-module-player/releases"
 #define CHECK_LINK "<a href=\"check\">Check for a new version</a>"
@@ -7375,8 +7375,11 @@ static void on_tray_quit(gpointer data)
     g_idle_add(destroy_window_from_idle, NULL);
 }
 
+#include "remote/player.inc"
+
 static void on_destroy(GtkWidget *widget, gpointer data)
 {
+    remote_stop();
     (void)widget;
     (void)data;
     world_closing = TRUE;
@@ -8485,6 +8488,8 @@ static int create_player(void)
         make_button("Open File", G_CALLBACK(on_open)), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(file_controls),
         make_button("Open URL", G_CALLBACK(on_open_url)), FALSE, FALSE, 0);
+    remote_button = make_button("Pair remote", G_CALLBACK(remote_dialog));
+    gtk_box_pack_start(GTK_BOX(file_controls), remote_button, FALSE, FALSE, 0);
     GtkWidget *file_spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_size_request(file_spacer, 12, -1);
     gtk_box_pack_start(GTK_BOX(file_controls), file_spacer, FALSE, FALSE, 0);
@@ -8572,6 +8577,9 @@ static int create_player(void)
         make_button("Export selected…", G_CALLBACK(on_batch_export)), FALSE, FALSE, 0);
 #endif
     playlist_store = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_STRING);
+    const gchar *queue_signals[] = {"row-inserted", "row-changed", "row-deleted", "rows-reordered"};
+    for (guint i = 0; i < G_N_ELEMENTS(queue_signals); ++i)
+        g_signal_connect_swapped(playlist_store, queue_signals[i], G_CALLBACK(remote_queue_changed), NULL);
     playlist_filter = GTK_TREE_MODEL_FILTER(
         gtk_tree_model_filter_new(GTK_TREE_MODEL(playlist_store), NULL));
     gtk_tree_model_filter_set_visible_func(playlist_filter, playlist_row_matches, NULL, NULL);
@@ -9291,7 +9299,7 @@ gtk_box_pack_start(GTK_BOX(pattern_box), pattern_scroll,
     gtk_widget_set_halign(version_row, GTK_ALIGN_CENTER);
     gtk_box_pack_start(GTK_BOX(version_row), about_title, FALSE, FALSE, 0);
     GtkWidget *updates = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(updates), CHECK_LINK);
+    gtk_label_set_text(GTK_LABEL(updates), "Android remote preview");
     g_signal_connect(updates, "activate-link", G_CALLBACK(about_update_link), NULL);
     gtk_box_pack_start(GTK_BOX(version_row), updates, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(about_page), version_row, FALSE, FALSE, 0);
@@ -9443,7 +9451,7 @@ int main(int argc, char **argv)
     /* GTK adopts the desktop locale. libmpv requires C numeric formatting. */
     setlocale(LC_NUMERIC, "C");
 
-    GApplication *app = g_application_new("org.modulez.Player",
+    GApplication *app = g_application_new("org.modulez.Player.RemotePreview",
                                           G_APPLICATION_HANDLES_COMMAND_LINE);
     g_signal_connect(app, "command-line", G_CALLBACK(on_launch), NULL);
     int status = g_application_run(app, argc, argv);

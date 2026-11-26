@@ -9,7 +9,7 @@
 
 gchar *player_config_path(const gchar *name)
 {
-    return g_build_filename(g_get_user_config_dir(), "modulez-player", name, NULL);
+    return g_build_filename(g_get_user_config_dir(), "modulez-remote-preview", name, NULL);
 }
 
 static gboolean file_error(const gchar *path, GError **error)

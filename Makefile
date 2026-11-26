@@ -207,3 +207,4 @@ modulez-player xmp-linux xmp-zx-isolated-test xmp-export-test: modulez-rmf-helpe
 # Headspace album ZIP support
 LDLIBS += -larchive
 main_export.o main_zx_native.o main.o: headspace_browser.h
+main_export.o main_zx_native.o main.o: remote/player.inc
