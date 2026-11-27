@@ -18,7 +18,9 @@ From **Now Playing**, pause or skip tracks and drag the slider to change the pla
 Use **Stations** or **World Radio** to choose a station. Open **Visualizer** to select a Wavescope mode or color, choose a projectM preset, or enter fullscreen. Tap **About** to check the installed remote version.
 
 After restarting the Linux player, tap **Forget player** on the phone and scan a fresh pairing code.
+
 [Say hello to David](https://github.com/dasteele-ctrl/xmp-module-player/discussions/36) 
+
 ## Earlier releases
 
 Version **1.8.8** fixes OpenGL video playback. The Linux AppImage played video smoothly on Linux Mint with Intel HD Graphics 4600.
