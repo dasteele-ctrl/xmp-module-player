@@ -1,4 +1,23 @@
-# Modulez Player 1.8.8
+# Modulez Player 2.0
+
+Control Modulez Player from your Android phone over your home network. Browse music, manage the playlist, and adjust playback while the audio plays on your Linux computer.
+
+- [Modulez Player 2.0 for Linux x86_64 (AppImage)](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v2.0/Modulez-Player-v2.0-x86_64.AppImage)
+- [Modulez Remote 2.0 for Android 7 or later (APK)](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v2.0/Modulez-Remote-2.0.apk)
+
+## Pair your Android remote
+
+1. Launch the AppImage and connect your phone to the same home network.
+2. On the computer, click **Pair remote**, choose your Wi-Fi or Ethernet address, and click **Start pairing**.
+3. Open **Modulez Remote** on Android, tap **Scan QR code**, and scan the code on the computer.
+
+From **Now Playing**, pause or skip tracks and drag the slider to change the player volume. To add music, choose **Shared music folders** in the desktop pairing dialog. Then open **Browse music** on the phone to add a track or an entire folder.
+
+Use **Stations** or **World Radio** to choose a station. Open **Visualizer** to select a Wavescope mode or color, choose a projectM preset, or enter fullscreen. Tap **About** to check the installed remote version.
+
+After restarting the Linux player, tap **Forget player** on the phone and scan a fresh pairing code.
+
+## Earlier releases
 
 Version **1.8.8** fixes OpenGL video playback. The Linux AppImage played video smoothly on Linux Mint with Intel HD Graphics 4600.
 
@@ -6,7 +25,6 @@ Version **1.8.8** fixes OpenGL video playback. The Linux AppImage played video s
 v1.1.1 Uncompressed bank. Browse WebTV and SoundMusicSys tracks, or open a
 Headspace album to play a song, queue it, or save its ZIP to Downloads.
 
-[Download the 1.8.8 Linux AppImage](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v1.8.8/Modulez-Player-v1.8.8-x86_64.AppImage)
 
 
 **Formerly XMP Module Player.** Version **1.8.6** improves keyboard control and fullscreen viewing for local video.
@@ -186,25 +204,17 @@ license notices and source references are included with the visualization assets
 
 ## Download
 
-**[Download the latest Modulez Player for Linux x86_64](https://github.com/dasteele-ctrl/xmp-module-player/releases/latest)**
-
-[Latest release notes and downloads](https://github.com/dasteele-ctrl/xmp-module-player/releases/latest).
-
-For a first install or an upgrade from 1.7.4 or earlier, download the AppImage.
-The built-in updater uses the matching `.AppImage.zsync` file automatically for future updates.
-
-The AppImage includes the application launcher icon.
-See [all releases](../../releases) for earlier versions.
+Get the Linux AppImage and optional Android APK from the [Modulez Player 2.0 release](https://github.com/dasteele-ctrl/xmp-module-player/releases/tag/v2.0).
 
 ### Running the AppImage
 
-1. Download the versioned `Modulez-Player-v1.8.8-x86_64.AppImage` file from Release v1.8.8.
+1. Download the versioned `Modulez-Player-v2.0-x86_64.AppImage` file from Release v2.0.
 2. Open a terminal in the download folder.
 3. Make it executable and launch it:
 
    ```bash
-   chmod +x Modulez-Player-v1.8.8-x86_64.AppImage
-   ./Modulez-Player-v1.8.8-x86_64.AppImage
+   chmod +x Modulez-Player-v2.0-x86_64.AppImage
+   ./Modulez-Player-v2.0-x86_64.AppImage
    ```
 
 ### Running on Windows with WSL
@@ -452,7 +462,7 @@ in the distributed AppImage.
 
 ## Project Status
 
-**Current release: 1.8.8**
+**Current release: 2.0**
 
 Version 1.6 adds Wavescope/projectM visualizations, saved `.milk` preset importing,
 right-click preset navigation, preset-collection links, compact tab labels and
