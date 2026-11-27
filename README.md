@@ -19,7 +19,7 @@ Use **Stations** or **World Radio** to choose a station. Open **Visualizer** to 
 
 After restarting the Linux player, tap **Forget player** on the phone and scan a fresh pairing code.
 
-[Say hello to David](https://github.com/dasteele-ctrl/xmp-module-player/discussions/36) 
+## [Say hello to David](https://github.com/dasteele-ctrl/xmp-module-player/discussions/36) 
 
 ## Earlier releases
 
