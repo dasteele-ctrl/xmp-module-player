@@ -2,6 +2,8 @@
 
 Control Modulez Player from your Android phone over your home network. Browse music, manage the playlist, and adjust playback while the audio plays on your Linux computer.
 
+Control the visualizer from your Android phone. Choose a Wavescope mode or color, switch projectM presets, or tap Enter fullscreen to fill the Linux display. Tap Exit fullscreen on the phone to return to the player window.
+
 - [Modulez Player 2.0 for Linux x86_64 (AppImage)](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v2.0/Modulez-Player-v2.0-x86_64.AppImage)
 - [Modulez Remote 2.0 for Android 7 or later (APK)](https://github.com/dasteele-ctrl/xmp-module-player/releases/download/v2.0/Modulez-Remote-2.0.apk)
 
